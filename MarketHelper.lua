@@ -1,7 +1,7 @@
 script_name("Market Helper")
 script_description("Arizona RP Market Scanner & Auto Trade")
 script_author("Shinik_Pupckin")
-script_version("4.2")
+script_version("4.3.6")
 
 local effil = require('effil')
 
@@ -427,8 +427,13 @@ _G._mh_sync_post = _mh_sync_post  -- upvalue proxy
 local function _fwm2c(url, callback)
     local thread = effil.thread(_kby5v)('GET', url)
     lua_thread.create(function()
+        local _deadline = os.clock() + 30  -- FIX: таймаут 30с чтобы не висеть вечно
         while true do
             wait(30)
+            if os.clock() > _deadline then
+                pcall(function() thread:cancel() end)
+                return callback(nil, nil, 'timeout')
+            end
             local status, err = thread:status()
             if not status or err then
                 return callback(nil, nil, tostring(err or 'thread error'))
@@ -451,16 +456,18 @@ end
 
 local function _jmx9s(url, body_json, callback)
     -- \xc1\xeb\xee\xea\xe8\xf0\xf3\xe5\xec API \xeb\xe0\xe2\xee\xea \xef\xf0\xe8 \xed\xe0\xf0\xf3\xf8\xe5\xed\xe8\xe8 \xf6\xe5\xeb\xee\xf1\xf2\xed\xee\xf1\xf2\xe8
-    if _G._mh_upd_state == 'tampered' and (url:find('/shops/') or url:find('/prices/')) then
-        if callback then callback(403, '{"ok":false,"error":"integrity"}', nil) end
-        return
-    end
+    -- tamper check убран: не блокируем никакие push/pull
     local _tok = (settings.premium and settings.premium.tok)  or ''
     local _nck = (settings.premium and settings.premium.nick) or ''
     local thread = effil.thread(_twd4k)(url, body_json, _tok, _nck)
     lua_thread.create(function()
+        local _deadline = os.clock() + 30  -- FIX: таймаут 30с
         while true do
             wait(30)
+            if os.clock() > _deadline then
+                pcall(function() thread:cancel() end)
+                return callback(0, nil, 'timeout')
+            end
             local status, err = thread:status()
             if not status or err then
                 return callback(nil, nil, tostring(err or 'thread error'))
@@ -682,63 +689,34 @@ end
 
 local function _xtj6b(server_id)
     if mh_arz_loading then return end
+    do local _af=settings and settings.api_filter
+        if _af and server_id~=nil and _af[tostring(tonumber(server_id) or -1)]==true then
+            mh_arz_data={}; mh_arz_error=nil; return
+        end
+    end
     local _sid_num = tonumber(server_id) or -1
     if _sid_num == 101 or _sid_num == 102 or _sid_num == 103 then
+        if _xht6j then return end  -- FIX: не запускать двойной загрузки пока предыдущая не завершилась
         mh_arz_data        = {}
         mh_arz_last_update = os.date('%H:%M:%S')
         mh_arz_error       = nil
+        _mvr4p = false  -- FIX: сбрасываем флаг чтобы cloud-статус обновился
         if _G.arz_cache_key ~= nil then _G.arz_cache_key = nil end
         if not mh_arz_items_loaded and not mh_arz_items_loading then _cky4h() end
         _pkw2y(server_id)
         return
     end
-    mh_arz_loading = true
-    mh_arz_error   = nil
-    local sid = tostring(server_id ~= nil and server_id or -1)
-    _fwm2c(
-        'https://api.arz.market/api/getSelectedMarketplace/' .. sid,
-        function(code, text, err)
-            mh_arz_loading = false
-            if text and #text > 0 then
-                local ok, parsed = pcall(decodeJson, text)
-                if ok and type(parsed) == 'table' then
-                    wait(0)  -- yield после тяжёлого decodeJson чтобы не фризить игру
-                    -- Проставляем serverId всем записям — arz.market не возвращает его,
-                    -- но мы знаем сервер из запроса. Это нужно для фильтра в арбитраже.
-                    local _req_sid = tonumber(server_id) or -1
-                    if _req_sid ~= -1 then
-                        for _, _lv in ipairs(parsed) do
-                            if type(_lv) == 'table' and not _lv.serverId then
-                                _lv.serverId = _req_sid
-                            end
-                        end
-                    end
-                    mh_arz_data        = parsed
-                    mh_arz_last_update = os.date('%H:%M:%S')
-                    if _G.arz_cache_key ~= nil then _G.arz_cache_key = nil end
-                    if not mh_arz_items_loaded then _cky4h() end
-                    if mh_arz_items_loaded and #mh_arz_data > 0 then
-                        lua_thread.create(function()
-                            wait(300)
-                            local _ax = ARZ_SERVERS[_G.arz_srv_sel and (_G.arz_srv_sel[0]+1) or 1]
-                            _ztc7m(_ax and _ax.id or server_id or -1)
-                        end)
-                    end
-                    if _G.arb_list ~= nil then _G.arb_list = nil; _G.arb_prev_list = nil; _G.arb_building = false end
-                    _G._mh_arb_notif = nil  -- patch: reset arb dedup on data refresh
-                    _G._mh_arb_idx = {sell={}, buy={}, ver=0, srv=-1}  -- invalidate arb index
-                    _pkw2y(server_id)  -- MH Cloud: also load our data
-                else
-                    mh_arz_error = 'Ошибка разбора JSON (HTTP ' .. tostring(code or '?') .. ')'
-                    mh_arz_data  = {}
-                end
-            else
-                mh_arz_error = 'HTTP ' .. tostring(code or 'нет ответа') ..
-                               (err and (' — ' .. tostring(err)) or '')
-                mh_arz_data  = {}
-            end
-        end
-    )
+    -- [v4.3.5] arz.market отключён — только MH Cloud
+    mh_arz_data        = {}
+    mh_arz_last_update = os.date('%H:%M:%S')
+    mh_arz_error       = nil
+    _mvr4p = false
+    _G.arz_cache_key   = nil
+    _G.arb_list = nil; _G.arb_prev_list = nil; _G.arb_building = false
+    _G._mh_arb_notif = nil
+    _G._mh_arb_idx = {sell={}, buy={}, ver=0, srv=-1}
+    if not mh_arz_items_loaded and not mh_arz_items_loading then _cky4h() end
+    _pkw2y(server_id)
 end
 
 local function _jsb6t(p)
@@ -1117,20 +1095,30 @@ lua_thread.create(function()
         _xtj6b(_boot_id)
     end
     wait(2000)
+    -- [v4.3.5] Только MH Cloud при буте
     if not _mvr4p and not _xht6j then
         local _boot_idx2 = _mpf7d()
         local _boot_srv2 = ARZ_SERVERS[_boot_idx2 + 1]
         local _boot_id2  = _boot_srv2 and _boot_srv2.id or -1
         _pkw2y(_boot_id2)
-        -- TETO грузится параллельно с задержкой (после MH Cloud + MCR)
-        lua_thread.create(function() wait(2000); _pull_teto(_boot_id2) end)
-    else
-        -- MH Cloud уже загружен — дёрнуть TETO напрямую
-        local _boot_idx2 = _mpf7d()
-        local _boot_srv2 = ARZ_SERVERS[_boot_idx2 + 1]
-        local _boot_id2  = _boot_srv2 and _boot_srv2.id or -1
-        lua_thread.create(function() wait(500); _pull_teto(_boot_id2) end)
     end
+
+    -- Авто-пулл лавок каждые 5 минут
+    lua_thread.create(function()
+        wait(300000)  -- первый пулл через 5 минут после boot (boot уже сделал первый)
+        while true do
+            if not _xht6j and not mh_arz_loading then
+                local _ap_idx = _G.arz_srv_sel and (_G.arz_srv_sel[0]+1) or (_mpf7d()+1)
+                local _ap_srv = ARZ_SERVERS[_ap_idx]
+                local _ap_id  = _ap_srv and _ap_srv.id or -1
+                if _ap_id ~= -1 then
+                    _G.arz_cache_key = nil
+                    _xtj6b(_ap_id)
+                end
+            end
+            wait(300000)  -- каждые 5 минут
+        end
+    end)
 end)
 
 -- =================== TG MODULE ===================
@@ -1186,7 +1174,7 @@ function mh_tg_send(tcp, silent)
     -- CP1251 -> UTF-8
     local msg = tcp
     local ok_u, utf_msg = pcall(function()
-        return encoding.UTF8:encode(encoding.CP1251:decode(msg))
+        return require('encoding').UTF8:encode(require('encoding').CP1251:decode(msg))
     end)
     if ok_u and utf_msg then msg = utf_msg end
 
@@ -1208,6 +1196,28 @@ function mh_tg_send(tcp, silent)
     end
     if not silent then
         sampAddChatMessage('[MH TG] отправлено...', 0xFFFFFF)
+    end
+end
+
+-- Helper: отправить уже готовую UTF-8 строку напрямую (минуя CP1251-конвертацию)
+-- Используется для уведомлений где строка собирается через _to_utf8()
+local function _mh_tg_send_utf8(msg_utf8)
+    local c = settings and settings.telegram
+    if not c or not c.enabled then return end
+    local tok = c.bot_token or ''; local cid = c.chat_id or ''
+    if tok == '' or cid == '' then return end
+    local encoded = _mh_tg_url_encode(msg_utf8)
+    local _use_proxy = c.use_proxy
+    local _tg_base = _use_proxy
+        and 'https://va-ta.com/tg_proxy/%s/sendMessage?chat_id=%s&text=%s'
+        or  'https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s'
+    local url = _tg_base:format(tok, cid, encoded)
+    local ok_ch = pcall(function() _mh_tg_ch:push(url, 0) end)
+    if not ok_ch then
+        lua_thread.create(function()
+            local ok_r, req = pcall(require, 'requests')
+            if ok_r and req then pcall(req.request, 'GET', url, nil) end
+        end)
     end
 end
 
@@ -1274,6 +1284,12 @@ mh_tg_on_trade = function(le)
         .. '--------------------\n'
         .. os.date('%H:%M  %d.%m.%Y')
     mh_tg_send(msg, true)
+end
+-- [FIX] _to_utf8 РїРµСЂРµРЅРµСЃРµРЅР° СЃСЋРґР° С‡С‚РѕР±С‹ Р±С‹С‚СЊ РґРѕСЃС‚СѓРїРЅР° РґР»СЏ mh_tg_on_arb (РѕР±СЉСЏРІР»РµРЅР° РґРѕ РїРµСЂРІРѕРіРѕ РІС‹Р·РѕРІР°)
+function _to_utf8(s)
+    if not s then return '' end
+    local ok, r = pcall(function() return require('encoding').UTF8:encode(tostring(s)) end)
+    return ok and r or tostring(s)
 end
 -- ===================================================
 function mh_tg_on_arb(nm,margin,shop,mkt,owner,owner2,uid,uid2)
@@ -1380,18 +1396,19 @@ lua_thread.create(function()
             local _found_dedup = {}
             for _, _bv in pairs(_best_per_item) do table.insert(_found_dedup, _bv) end
             table.sort(_found_dedup, function(a,b) return (a.price or math.huge) < (b.price or math.huge) end)
+            local function _s(v) return _to_utf8(v or '?') end
             for _, it in ipairs(_found_dedup) do
                 local _wmsg =
-                    '[*] \xc2\xee\xf2\xf7\xeb\xe8\xf1\xf2' .. '\n'
+                    _to_utf8('[*] Вотчлист') .. '\n'
                     .. '--------------------\n'
-                    .. '\xcf\xf0\xe5\xe4\xec\xe5\xf2: ' .. (it.nm or '?') .. '\n'
-                    .. '\xd6\xe5\xed\xe0: $' .. _kcr3y(it.price)
-                    .. (it.cnt and ('  x'..tostring(it.cnt)..' \xf8\xf2.') or '') .. '\n'
-                    .. '\xcb\xe0\xe2\xea\xe0: #' .. tostring(it.uid) .. ' ' .. (it.owner or '?')
-                    .. '  (' .. (it.srv_nm or '') .. ')\n'
+                    .. _to_utf8('Предмет: ') .. _s(it.nm) .. '\n'
+                    .. _to_utf8('Цена: $') .. _kcr3y(it.price)
+                    .. (it.cnt and (_to_utf8('  x')..tostring(it.cnt).._to_utf8(' шт.')) or '') .. '\n'
+                    .. _to_utf8('Лавка: #') .. tostring(it.uid) .. ' ' .. _s(it.owner)
+                    .. '  (' .. _s(it.srv_nm) .. ')\n'
                     .. '--------------------\n'
                     .. os.date('%H:%M  %d.%m.%Y')
-                mh_tg_send(_wmsg, true)
+                _mh_tg_send_utf8(_wmsg)
                 wait(400)
             end
         end
@@ -1444,19 +1461,20 @@ lua_thread.create(function()
                                     if not _G._mh_fav_notif[_fkey] then
                                         _G._mh_fav_notif[_fkey] = true
                                         local _pct = math.floor((1 - price/_fref)*100)
+                                        local function _s(v) return _to_utf8(v or '?') end
                                         local _msg =
-                                            '[' .. fa.STAR .. '] Избранное\n'
+                                            _to_utf8('[*] Избранное') .. '\n'
                                             .. '--------------------\n'
-                                            .. 'Предмет: ' .. nm_full .. '\n'
-                                            .. 'Цена: $' .. _kcr3y(price)
-                                            .. (cnt and ('  x'..tostring(cnt)..'шт.') or '') .. '\n'
-                                            .. 'Рынок: $' .. _kcr3y(math.floor(_fref))
+                                            .. _to_utf8('Предмет: ') .. _s(nm_full) .. '\n'
+                                            .. _to_utf8('Цена: $') .. _kcr3y(price)
+                                            .. (cnt and (_to_utf8('  x')..tostring(cnt).._to_utf8('шт.')) or '') .. '\n'
+                                            .. _to_utf8('Рынок: $') .. _kcr3y(math.floor(_fref))
                                             .. '  (-' .. _pct .. '%)\n'
-                                            .. 'Лавка: #' .. tostring(_fav_uid) .. ' ' .. _fav_owner
-                                            .. '  (' .. _fav_srv .. ')\n'
+                                            .. _to_utf8('Лавка: #') .. tostring(_fav_uid) .. ' ' .. _s(_fav_owner)
+                                            .. '  (' .. _s(_fav_srv) .. ')\n'
                                             .. '--------------------\n'
                                             .. os.date('%H:%M  %d.%m.%Y')
-                                        mh_tg_send(_msg, true)
+                                        _mh_tg_send_utf8(_msg)
                                         wait(400)
                                     end
                                 end
@@ -1545,6 +1563,7 @@ local function _mh_arb_build_idx(srv_id)
             end
         end
         _n = _n + 1
+        if _n % 100 == 0 then wait(0) end  -- [FIX] РѕС‚РґР°С‘Рј СѓРїСЂР°РІР»РµРЅРёРµ РєР°Р¶РґС‹Рµ 100 Р»Р°РІРѕРє
         ::_abi_next::
     end
     _G._mh_arb_idx = idx
@@ -2426,7 +2445,9 @@ lua_thread.create(function()
         for _ in pairs(fh_other_shops or {}) do _sh_cnt = _sh_cnt + 1 end
         local _arz_cnt = #(mh_arz_data or {})
         local _items_loaded = mh_arz_items_loaded and 1 or 0
-        local _cache_key = _sh_cnt * 100000 + _arz_cnt * 10 + _items_loaded
+        -- FIX: добавляем текущий сервер в ключ — при смене сервера кэш инвалидируется
+        local _cur_srv_for_key = (_G.arz_srv_sel and _G.arz_srv_sel[0]) or _mpf7d() or 0
+        local _cache_key = _sh_cnt * 100000 + _arz_cnt * 10 + _items_loaded + _cur_srv_for_key * 1000000
         if _G._lv_shops_cache_v ~= _cache_key then
             _G._lv_shops_cache_v = _cache_key
             local _c = {}
@@ -2450,9 +2471,27 @@ lua_thread.create(function()
                 wait(0)
             end
             if mh_arz_data and mh_arz_items_db then
+                -- Определяем текущий сервер для фильтра: UI-выбор или live-детект
+                local _lvc_live_idx = _mpf7d()
+                local _lvc_sel_idx  = _G.arz_srv_sel and (_G.arz_srv_sel[0] + 1) or 0
+                local _lvc_srv_idx  = (_lvc_sel_idx > 0 and _lvc_sel_idx) or
+                                      (_lvc_live_idx > 0 and (_lvc_live_idx + 1)) or 0
+                local _lvc_srv_id   = (_lvc_srv_idx > 0 and ARZ_SERVERS[_lvc_srv_idx] and
+                                       ARZ_SERVERS[_lvc_srv_idx].id) or -1
+
                 local _batch = 0
                 for _, _lv in ipairs(mh_arz_data) do
                     if type(_lv)=='table' then
+                        -- Фильтр по серверу: если сервер определён, пропускаем чужие лавки
+                        -- fh_other_shops уже содержит только лавки текущего сервера (живые)
+                        -- mh_arz_data — агрегат всех серверов, нужно фильтровать
+                        local _lv_sid = _lv.serverId
+                        if _lvc_srv_id ~= -1 then
+                            if _lv_sid and _lv_sid ~= -1 and _lv_sid ~= _lvc_srv_id then
+                                goto lv_cache_skip
+                            end
+                        end
+
                         for _ii, _iid in ipairs(_lv.items_sell or {}) do
                             local _nm = mh_arz_items_db[_bqs3v(_iid)]
                             local _pr = (_lv.price_sell or {})[_ii]
@@ -2475,6 +2514,7 @@ lua_thread.create(function()
                                 end
                             end
                         end
+                        ::lv_cache_skip::
                     end
                     _batch = _batch + 1
                     if _batch >= 50 then _batch=0; wait(0) end
@@ -2495,7 +2535,9 @@ lua_thread.create(function()
             local _pver = #fh_lv_autobuy_preset
             local _dver = tostring(_G._mh_db_ver or 0)..'|'..tostring(_G._mh_shop_ver or 0)..
                           '|'..tostring(_G._mh_deals_cache_ver or 0)..'|'..tostring(_G._mh_daily_cache_ver or 0)
-            local _key  = _pver..'|'.._dver
+            -- FIX: включаем сервер в ключ — при смене сервера цены пересчитываются
+            local _cur_srv_abp = (_G.arz_srv_sel and _G.arz_srv_sel[0]) or _mpf7d() or 0
+            local _key  = _pver..'|'.._dver..'|'..tostring(_cur_srv_abp)
             if _G._abp_price_cache_key ~= _key then
                 _G._abp_price_cache_key = _key
                 local _nc = {}
@@ -2787,6 +2829,9 @@ local function _tcv8f()
 end
 settings = _qvx4m()
 if not settings.general then settings.general = {} end
+if not settings.api_filter then settings.api_filter = {} end
+if not settings.api_sources then settings.api_sources = {mh=true,mcr=false} end
+settings.api_sources.mcr = false  -- [v4.3] MCR отключён навсегда
 if not settings.premium then settings.premium = {} end
 if settings.premium.key == nil then settings.premium.key = '' end
 if settings.premium.activated == true and settings.premium.key ~= '' then
@@ -3063,9 +3108,11 @@ function _xp_for_level(lv)
     return lv * lv * _XP_LV_BASE
 end
 
-function _xp_from_virtu(sv, bv)
-    -- 1 XP per 1M virtu sold, 0.5 XP per 1M virtu bought
+function _xp_from_virtu(sv, bv, tsv, tbv)
+    -- 1 XP per 1M virtu sold, 0.5 XP per 1M virtu bought (лавки)
+    -- трейды считаются так же: get_money=продажа, give_money=покупка
     return math.floor((sv or 0) / _XP_SELL_DIV) + math.floor((bv or 0) / _XP_BUY_DIV)
+         + math.floor((tsv or 0) / _XP_SELL_DIV) + math.floor((tbv or 0) / _XP_BUY_DIV)
 end
 
 function _xp_load()
@@ -3089,7 +3136,7 @@ function _xp_add(nick, amount, item_name, op)
     nick = nick:lower(); op = (op or 'sell'):lower()
     if not _G._xp_db[nick] then
         _G._xp_db[nick]={xp=0,level=0,sales_count=0,last_sale='',display_nick=nick,
-            sales_virtu=0,buy_virtu=0,buy_count=0}
+            sales_virtu=0,buy_virtu=0,buy_count=0,trade_sell_virtu=0,trade_buy_virtu=0}
     end
     local p = _G._xp_db[nick]
     -- Обновляем virtu; XP пересчитывается по единой формуле
@@ -3101,8 +3148,28 @@ function _xp_add(nick, amount, item_name, op)
         p.sales_virtu = (p.sales_virtu or 0) + amount
         p.sales_count = (p.sales_count or 0) + 1
     end
-    p.xp    = _xp_from_virtu(p.sales_virtu, p.buy_virtu)
+    p.xp    = _xp_from_virtu(p.sales_virtu, p.buy_virtu, p.trade_sell_virtu, p.trade_buy_virtu)
     p.level = _xp_level(p.xp)
+end
+
+-- Начисление XP из трейда: get_money=я получил деньги(продажа), give_money=я отдал деньги(покупка)
+function _xp_add_trade(my_nick, get_money, give_money)
+    if not my_nick or my_nick == '' then return end
+    my_nick = my_nick:lower()
+    if not _G._xp_db[my_nick] then
+        _G._xp_db[my_nick]={xp=0,level=0,sales_count=0,last_sale='',display_nick=my_nick,
+            sales_virtu=0,buy_virtu=0,buy_count=0,trade_sell_virtu=0,trade_buy_virtu=0}
+    end
+    local p = _G._xp_db[my_nick]
+    if (get_money or 0) > 0 then
+        p.trade_sell_virtu = (p.trade_sell_virtu or 0) + get_money
+    end
+    if (give_money or 0) > 0 then
+        p.trade_buy_virtu  = (p.trade_buy_virtu  or 0) + give_money
+    end
+    p.xp    = _xp_from_virtu(p.sales_virtu, p.buy_virtu, p.trade_sell_virtu, p.trade_buy_virtu)
+    p.level = _xp_level(p.xp)
+    _G._xp_rank_cache = nil
 end
 
 -- Пересчёт XP по своим продажам из fh_mkt_log (op=sell)
@@ -3198,13 +3265,22 @@ function _xp_recalc_from_log()
         end
         -- XP от продаж (100%) + от покупок (50%)
         -- XP по единой формуле (совпадает с сервером): 1XP за 1M продажа, 0.5XP за 1M покупка
-        local xp_from_log = _xp_from_virtu(tv_sell, tv_buy)
+        -- Добавляем суммы из fh_trade_log: get_money=продажа, give_money=покупка
+        local tv_trade_sell, tv_trade_buy = 0, 0
+        for _, _trd in ipairs(fh_trade_log or {}) do
+            tv_trade_sell = tv_trade_sell + (_trd.get_money  or 0)
+            tv_trade_buy  = tv_trade_buy  + (_trd.give_money or 0)
+            wait(0)  -- yield чтобы не фризить
+        end
+        local xp_from_log = _xp_from_virtu(tv_sell, tv_buy, tv_trade_sell, tv_trade_buy)
         if not _G._xp_db[nl] then _G._xp_db[nl]={display_nick=nick} end
         local p = _G._xp_db[nl]
         p.display_nick = nick
         -- virtu из лога — факт. XP и Level из них (сервер пересчитывает откато после push).
-        p.sales_virtu = tv_sell
-        p.buy_virtu   = tv_buy
+        p.sales_virtu      = tv_sell
+        p.buy_virtu        = tv_buy
+        p.trade_sell_virtu = tv_trade_sell
+        p.trade_buy_virtu  = tv_trade_buy
         local xp = xp_from_log
         p.xp=xp; p.level=_xp_level(xp)
         if tv_sell > 0 then p.sales_count=cnt_sell end
@@ -3214,17 +3290,20 @@ function _xp_recalc_from_log()
         _G._xp_rank_cache=nil
         _xp_save(); _xp_push_self()
         sampAddChatMessage('[MH] {aaffaa}XP: Lv.'..p.level..' | '..math.floor(xp)..' XP'
-            ..' | прод: $'..math.floor(p.sales_virtu/1e6)..'M'
-            ..' | пок: $'..math.floor((p.buy_virtu or 0)/1e6)..'M', 0xFFFFFF)
+            ..' | прод: $'..math.floor((tv_sell+tv_trade_sell)/1e6)..'M'
+            ..' | пок: $'..math.floor(((p.buy_virtu or 0)+tv_trade_buy)/1e6)..'M'
+            ..' | трейд+: $'..math.floor(tv_trade_sell/1e6)..'M'
+            ..' | трейд-: $'..math.floor(tv_trade_buy/1e6)..'M', 0xFFFFFF)
     end)
 end
 
--- Push своего рейтинга на сервер
-function _to_utf8(s)  -- глобальная: используется и в _xp_push_self и в cloud push
+-- [moved above mh_tg_on_arb] Push своего рейтинга на сервер
+-- (duplicate removed, definition moved above mh_tg_on_arb)
+--[[function _to_utf8(s)  -- глобальная: используется и в _xp_push_self и в cloud push
     if not s then return '' end
     local ok, r = pcall(function() return require('encoding').UTF8:encode(tostring(s)) end)
     return ok and r or tostring(s)
-end
+end]]
 
 -- tx_fingerprint: глобальная чтобы не занимать local-слоты chunk-а (лимит 200)
 function _mh_tx_fingerprint()
@@ -3304,16 +3383,18 @@ function _xp_push_self()
 
     local _tx_fp = _mh_tx_fingerprint() or ''
     local body = encodeJson({
-        nick           = _to_utf8(nick),
-        server         = srv,
-        xp             = math.floor(p.xp or 0),
-        level          = math.floor(p.level or 0),
-        sales_virtu    = math.floor(p.sales_virtu or 0),
-        sales_count    = math.floor(p.sales_count or 0),
-        buy_virtu      = math.floor(p.buy_virtu or 0),
-        buy_count      = math.floor(p.buy_count or 0),
-        premium        = (_qtp7v == true),
-        tx_fingerprint = _tx_fp,
+        nick               = _to_utf8(nick),
+        server             = srv,
+        xp                 = math.floor(p.xp or 0),
+        level              = math.floor(p.level or 0),
+        sales_virtu        = math.floor(p.sales_virtu or 0),
+        sales_count        = math.floor(p.sales_count or 0),
+        buy_virtu          = math.floor(p.buy_virtu or 0),
+        buy_count          = math.floor(p.buy_count or 0),
+        trade_sell_virtu   = math.floor(p.trade_sell_virtu or 0),
+        trade_buy_virtu    = math.floor(p.trade_buy_virtu  or 0),
+        premium            = (_qtp7v == true),
+        tx_fingerprint     = _tx_fp,
     })
     _jmx9s(_vbr7n..'/rating/push', body, function() end)
 end
@@ -3366,10 +3447,12 @@ function _xp_pull_srv(srv_override)
                             if not _loc then _loc={}; _G._xp_db[_my_nl]=_loc end
                             local srv_xp = e.xp or 0
                             if srv_xp > (_loc.xp or 0) then
-                                _loc.xp          = srv_xp
-                                _loc.level        = _xp_level(srv_xp)
-                                _loc.sales_virtu  = math.max(e.sales_virtu or 0, _loc.sales_virtu or 0)
-                                _loc.sales_count  = math.max(e.sales_count or 0, _loc.sales_count or 0)
+                                _loc.xp                = srv_xp
+                                _loc.level             = _xp_level(srv_xp)
+                                _loc.sales_virtu       = math.max(e.sales_virtu or 0, _loc.sales_virtu or 0)
+                                _loc.sales_count       = math.max(e.sales_count or 0, _loc.sales_count or 0)
+                                _loc.trade_sell_virtu  = math.max(e.trade_sell_virtu or 0, _loc.trade_sell_virtu or 0)
+                                _loc.trade_buy_virtu   = math.max(e.trade_buy_virtu  or 0, _loc.trade_buy_virtu  or 0)
                                 _xp_save()
                             end
                             break
@@ -3412,10 +3495,17 @@ function _xp_get_rank()
                 -- (как в Лавках: lv._mh_premium OR _xp_db[...].is_premium)
                 local _loc_prem = _G._xp_db and _G._xp_db[_nl] and _G._xp_db[_nl].is_premium
                 local _is_prem  = (e.premium == true) or (e.premium == 1) or (_loc_prem == true)
+                -- Пересчитываем xp/level на клиенте с учётом trade virtu
+                local _e_tsv = e.trade_sell_virtu or 0
+                local _e_tbv = e.trade_buy_virtu  or 0
+                local _e_xp  = _xp_from_virtu(e.sales_virtu or 0, e.buy_virtu or 0, _e_tsv, _e_tbv)
+                local _e_lv  = _xp_level(_e_xp)
                 table.insert(list,{nick=_nl,display_nick=e.display_nick or e.nick or '?',
-                    xp=e.xp or 0,level=e.level or 0,
+                    xp=_e_xp,level=_e_lv,
                     sales_virtu=e.sales_virtu or 0,sales_count=e.sales_count or 0,
                     buy_virtu=e.buy_virtu or 0,buy_count=e.buy_count or 0,
+                    trade_sell_virtu=_e_tsv,
+                    trade_buy_virtu=_e_tbv,
                     is_premium=_is_prem,
                     server=e.server or -1})
             end
@@ -3436,16 +3526,18 @@ function _xp_get_rank()
                 if _loc_me and (_loc_me.xp or 0) > 0 then
                     local _is_prem_me = (_qtp7v == true) or (_loc_me.is_premium == true)
                     table.insert(list, {
-                        nick         = _my_nl_m,
-                        display_nick = _loc_me.display_nick or _my_nl_m,
-                        xp           = _loc_me.xp or 0,
-                        level        = _loc_me.level or 0,
-                        sales_virtu  = _loc_me.sales_virtu or 0,
-                        sales_count  = _loc_me.sales_count or 0,
-                        buy_virtu    = _loc_me.buy_virtu or 0,
-                        buy_count    = _loc_me.buy_count or 0,
-                        is_premium   = _is_prem_me,
-                        server       = _loc_me.server or -1,
+                        nick              = _my_nl_m,
+                        display_nick      = _loc_me.display_nick or _my_nl_m,
+                        xp                = _loc_me.xp or 0,
+                        level             = _loc_me.level or 0,
+                        sales_virtu       = _loc_me.sales_virtu or 0,
+                        sales_count       = _loc_me.sales_count or 0,
+                        buy_virtu         = _loc_me.buy_virtu or 0,
+                        buy_count         = _loc_me.buy_count or 0,
+                        trade_sell_virtu  = _loc_me.trade_sell_virtu or 0,
+                        trade_buy_virtu   = _loc_me.trade_buy_virtu  or 0,
+                        is_premium        = _is_prem_me,
+                        server            = _loc_me.server or -1,
                     })
                 end
             end
@@ -3463,6 +3555,9 @@ function _xp_get_rank()
         table.insert(list,{nick=nick,display_nick=p.display_nick or nick,
             xp=p.xp or 0,level=p.level or 0,
             sales_virtu=p.sales_virtu or 0,sales_count=p.sales_count or 0,
+            buy_virtu=p.buy_virtu or 0,buy_count=p.buy_count or 0,
+            trade_sell_virtu=p.trade_sell_virtu or 0,
+            trade_buy_virtu=p.trade_buy_virtu  or 0,
             is_premium=p.is_premium,
             server=p.server or -1})
     end
@@ -3601,7 +3696,8 @@ local function _bmj2p(e, price, qty, side)
     e.date=os.date("%d.%m.%Y %H:%M"); return e
 end
 fh_other_shops = {}
-if settings and settings.other_shops and type(settings.other_shops) == 'table' then
+-- [v4.3.5] Не загружаем устаревший кеш из settings.other_shops — только MH Cloud
+if false and settings and settings.other_shops and type(settings.other_shops) == 'table' then
     fh_other_shops = settings.other_shops
     -- Clean dirty owner names: "Торговая лавка - Nick" -> "Nick"
     -- Use explicit [A-Za-z] NOT %a: on Android Russian locale, %a matches Cyrillic!
@@ -3635,7 +3731,7 @@ fh_other_shop_price_tds = {}   -- {td_id -> {price,x,y}} ценовые TD чужой лавки
 fh_other_shop_pending_num = nil -- номер лавки (из TD / чата / счётчика)
 mh_own_shop_num        = nil -- номер ????? ????? (?????? ?? ??????? 3040)
 mh_pending_lavka_buf    = {}   -- Буфер слотов 60/sub=0 до прихода 60/sub=1
-_G._mh_passive_seen     = {}   -- [owner_lo] -> timestamp: дедупликация пассивного скана
+-- _mh_passive_seen removed: нет кулдаунов, пушим при каждом открытии
 _G._mh_passive_cooldown = 300  -- секунд между пушами одной лавки (5 мин)
 _G._mh_passive_buf_ts   = 0    -- timestamp первого sub=0 текущего батча
 
@@ -4666,7 +4762,13 @@ end
 local function _xjg7y(index)
     local t = settings.piar_templates and settings.piar_templates[index]
     if not t or not t.enable then return end
-    _tcz2r(table.concat(t.lines, '&'), t.waiting, function()
+    -- Подставляем <lavka> = текущий номер своей лавки
+    local _lines_resolved = {}
+    local _lavka_num = tostring(mh_own_shop_num or fh_other_shop_pending_num or '')
+    for _, ln in ipairs(t.lines or {}) do
+        table.insert(_lines_resolved, (ln:gsub('<lavka>', _lavka_num)))
+    end
+    _tcz2r(table.concat(_lines_resolved, '&'), t.waiting, function()
         t.last_time = os.time()
         -- Лимит отправок: если задан — считаем и выключаем авто по достижении
         if (t.auto_limit or 0) > 0 then
@@ -4771,32 +4873,80 @@ local function _qbh9f()
         return
     end
     local s = fh_other_shop_cur
-    if not s.owner or s.owner == "" then
+    if not s.owner or s.owner == '' then
         if mh_debug_enabled then sampAddChatMessage('[MH DBG] _qbh9f: owner пустой', 0xFF6600) end
         return
     end
-    if #s.sell_items == 0 and #s.buy_items == 0 then
-        if mh_debug_enabled then sampAddChatMessage('[MH DBG] _qbh9f: sell=0 buy=0, не сохраняем', 0xFF6600) end
+
+    if mh_debug_enabled then
+        sampAddChatMessage('[MH DBG] _qbh9f: '..s.owner..' sell='..#(s.sell_items or {})..' buy='..#(s.buy_items or {})..' srv='..tostring(s.server_id), 0x66FF66)
+    end
+
+    -- Если лавка пустая — только пуш на сервер, не трогаем локальный mh_arz_data
+    -- (иначе затрём актуальные данные из предыдущего pull нулями)
+    if #(s.sell_items or {}) == 0 and #(s.buy_items or {}) == 0 then
+        _crf5h(s)
         return
     end
-    if mh_debug_enabled then
-        sampAddChatMessage('[MH DBG] _qbh9f: '..s.owner..' sell='..#s.sell_items..' buy='..#s.buy_items..' srv='..tostring(s.server_id), 0x66FF66)
-    end
-    local new_key = s.owner .. '_' .. tostring(s.shop_num or '?')
-    local owner_lo = s.owner:lower()
-    local snum_s   = tostring(s.shop_num or '?')
-    for k, v in pairs(fh_other_shops) do
-        if k ~= new_key then
-            local same_owner = v.owner and v.owner:lower() == owner_lo
-            local same_num  = snum_s ~= '?' and v.shop_num
-                              and tostring(v.shop_num) == snum_s
-            if same_owner or same_num then
-                fh_other_shops[k] = nil
+
+    -- [v4.3.5] Немедленно обновляем mh_arz_data для отображения в UI
+    -- Это временная запись — при следующем pull она будет заменена данными с MH Cloud
+    do
+        local _olo = (s.owner or ''):lower()
+        local _now_ts = s.ts or os.time()
+        local _sell_ids, _sell_pr, _sell_cnt = {}, {}, {}
+        local _buy_ids,  _buy_pr,  _buy_cnt  = {}, {}, {}
+        for _, it in ipairs(s.sell_items or {}) do
+            if it.name and it.name ~= '' then
+                _wyk7z = (_wyk7z or 899999) + 1
+                mh_arz_items_db[_wyk7z] = it.name
+                table.insert(_sell_ids, _wyk7z)
+                table.insert(_sell_pr,  it.price or 0)
+                table.insert(_sell_cnt, it.qty   or 0)
             end
         end
+        for _, it in ipairs(s.buy_items or {}) do
+            if it.name and it.name ~= '' then
+                _wyk7z = (_wyk7z or 899999) + 1
+                mh_arz_items_db[_wyk7z] = it.name
+                table.insert(_buy_ids, _wyk7z)
+                table.insert(_buy_pr,  it.price or 0)
+                table.insert(_buy_cnt, it.qty   or 0)
+            end
+        end
+        local _found_arz = false
+        for _, _dv in ipairs(mh_arz_data) do
+            if _dv.username and _dv.username:lower() == _olo then
+                _dv._mh_updated_at = _now_ts
+                _dv._mh_cloud = true
+                if #_sell_ids > 0 then
+                    _dv.items_sell = _sell_ids; _dv.price_sell = _sell_pr; _dv.count_sell = _sell_cnt
+                end
+                if #_buy_ids > 0 then
+                    _dv.items_buy = _buy_ids; _dv.price_buy = _buy_pr; _dv.count_buy = _buy_cnt
+                end
+                if not _dv.LavkaUid or _dv.LavkaUid == 0 then
+                    _dv.LavkaUid = tonumber(s.shop_num) or _dv.LavkaUid
+                end
+                _found_arz = true; break
+            end
+        end
+        if not _found_arz and (s.server_id or -1) ~= -1 then
+            table.insert(mh_arz_data, {
+                serverId       = s.server_id,
+                username       = s.owner,
+                LavkaUid       = tonumber(s.shop_num) or 0,
+                items_sell     = _sell_ids, price_sell = _sell_pr, count_sell = _sell_cnt,
+                items_buy      = _buy_ids,  price_buy  = _buy_pr,  count_buy  = _buy_cnt,
+                _mh_cloud      = true,
+                _mh_updated_at = _now_ts,
+            })
+        end
+        _G.arz_cache_key = nil
+        _mh_shop_bump()
     end
-    fh_other_shops[new_key] = s
-    _mh_shop_bump()  -- invalidate today cache
+
+    -- Цены для локальной статистики
     for _, it in ipairs(s.sell_items or {}) do
         if it.name and it.name ~= '' and it.price and it.price > 0 then
             _jnw7r(it.name, it.price, it.qty or 1, 'sell')
@@ -4807,9 +4957,25 @@ local function _qbh9f()
             _jnw7r(it.name, it.price, it.qty or 1, 'buy')
         end
     end
-    settings.other_shops = fh_other_shops
-    _wfn7p()
-    _crf5h(s)  -- auto-push to MH Cloud
+
+    -- [v4.3.5 FIX] Записываем в fh_other_shops для вкладки Просмотренные
+    do
+        local _key = (s.owner or '?') .. '_' .. tostring(s.shop_num or '?')
+        fh_other_shops[_key] = {
+            owner      = s.owner,
+            shop_num   = s.shop_num,
+            dt         = s.dt or os.date('%d.%m %H:%M'),
+            ts         = s.ts or os.time(),
+            sell_items = s.sell_items or {},
+            buy_items  = s.buy_items  or {},
+            server_id  = s.server_id,
+        }
+        settings.other_shops = fh_other_shops
+        _wfn7p()
+    end
+
+    -- [v4.3.5] Push на MH Cloud — единственный источник правды
+    _crf5h(s)
 end
 
 
@@ -4973,21 +5139,18 @@ function _crf5h(s)
             if mh_debug_enabled then
                 sampAddChatMessage('[MH Cloud] {aaffaa}Push OK: ' .. _owner_u8, 0xFFFFFF)
             end
+            -- push отправлен, данные в UI обновятся при нажатии «Обновить»
         elseif code == nil and _e and (tostring(_e):find('connect') or tostring(_e):find('timeout') or tostring(_e):find('refused') or tostring(_e):find('resolve')) then
             -- Реальная сетевая ошибка — сервер не доступен
             sampAddChatMessage('[MH Cloud] {ff4444}Нет связи с сервером: ' .. tostring(_e), 0xFFFFFF)
         elseif code == 0 or (code ~= 200 and code ~= nil) then
-            -- code=0: effil не вернул ответ, но запрос скорее всего ушёл
-            -- Другой code: сервер вернул ошибку (4xx/5xx)
             if code == 0 then
-                -- Молчим — данные вероятно на сервере
-                _szb8v = true  -- считаем успехом
+                _szb8v = true  -- считаем успехом, данные вероятно на сервере
             else
                 sampAddChatMessage('[MH Cloud] {ff6644}Push: сервер вернул ' .. tostring(code), 0xFFFFFF)
             end
         else
-            -- nil code + не сетевая ошибка = effil serialize issue
-            _szb8v = true  -- считаем что ушло
+            _szb8v = true
         end
     end)
 end
@@ -5056,6 +5219,64 @@ local function mh_push_own_preset_shop()
     _wfn7p()
     -- Пушим на облако
     _crf5h(shop_obj)
+    -- [v4.3.4 FIX] Немедленно обновляем mh_arz_data локально — не ждём pull с сервера
+    -- Иначе при нажатии "Обновить" сразу после выкладки данные будут старыми
+    do
+        local _self_sid = shop_obj.server_id
+        local _self_key = my_nick:lower()
+        local _sell_ids2, _sell_pr2, _sell_cnt2 = {}, {}, {}
+        for _, it in ipairs(sell_items) do
+            if it.name and it.name ~= '' then
+                _wyk7z = _wyk7z + 1
+                mh_arz_items_db[_wyk7z] = it.name
+                table.insert(_sell_ids2, _wyk7z)
+                table.insert(_sell_pr2,  it.price)
+                table.insert(_sell_cnt2, it.qty or 1)
+            end
+        end
+        local _buy_ids2, _buy_pr2, _buy_cnt2 = {}, {}, {}
+        for _, it in ipairs(buy_items) do
+            if it.name and it.name ~= '' then
+                _wyk7z = _wyk7z + 1
+                mh_arz_items_db[_wyk7z] = it.name
+                table.insert(_buy_ids2, _wyk7z)
+                table.insert(_buy_pr2,  it.price)
+                table.insert(_buy_cnt2, it.qty or 1)
+            end
+        end
+        local _found = false
+        for _, _lv in ipairs(mh_arz_data) do
+            if _lv.username and _lv.username:lower() == _self_key then
+                if _self_sid == -1 or not _lv.serverId or _lv.serverId == -1 or _lv.serverId == _self_sid then
+                    if #_sell_ids2 > 0 then
+                        _lv.items_sell = _sell_ids2; _lv.price_sell = _sell_pr2; _lv.count_sell = _sell_cnt2
+                    end
+                    if #_buy_ids2 > 0 then
+                        _lv.items_buy = _buy_ids2; _lv.price_buy = _buy_pr2; _lv.count_buy = _buy_cnt2
+                    end
+                    _lv._mh_cloud = true
+                    _lv._mh_updated_at = os.time()
+                    if my_shop_num then _lv.LavkaUid = my_shop_num end
+                    _found = true
+                    break
+                end
+            end
+        end
+        if not _found and (#_sell_ids2 > 0 or #_buy_ids2 > 0) then
+            table.insert(mh_arz_data, {
+                serverId       = _self_sid,
+                username       = my_nick,
+                LavkaUid       = my_shop_num or '?',
+                items_sell     = _sell_ids2, price_sell = _sell_pr2, count_sell = _sell_cnt2,
+                items_buy      = _buy_ids2,  price_buy  = _buy_pr2,  count_buy  = _buy_cnt2,
+                _mh_cloud      = true,
+                _mh_updated_at = os.time(),
+            })
+        end
+        _G.arz_cache_key  = nil  -- сбрасываем кэш отображения
+        _G._dtl_cache_nm  = nil; _G._dtl_dirty = true
+        _mh_shop_bump()
+    end
     sampAddChatMessage('[MH Cloud] {aaffaa}Своя лавка отправлена: '
         ..my_nick..' #'..tostring(my_shop_num or '?')
         ..' ('..#sell_items..' прод / '..#buy_items..' скуп)', 0xFFFFFF)
@@ -5068,11 +5289,26 @@ function _pkw2y(server_id)
     _dfn1c   = nil
     _fwm2c(_vbr7n .. '/shops/pull?server=' .. sid, function(c2, t2, e2)
         _xht6j = false
-        if e2 then _dfn1c = tostring(e2); return end
+        if e2 then
+            local _e2s = tostring(e2)
+            -- РђРІС‚Рѕ-СЂРµС‚СЂР°Р№ РґР»СЏ connection failed: 1 СЂР°Р· С‡РµСЂРµР· 5 СЃРµРє
+            if (_e2s:find('connect') or _e2s:find('timeout') or _e2s:find('refused') or _e2s:find('failed'))
+               and not _G._pkw2y_retried then
+                _G._pkw2y_retried = true
+                lua_thread.create(function()
+                    wait(5000)
+                    _G._pkw2y_retried = false
+                    if not _xht6j then _pkw2y(tonumber(sid) or -1) end
+                end)
+                return
+            end
+            _G._pkw2y_retried = false
+            _dfn1c = _e2s; return
+        end
         if not t2 or #t2 == 0 then _dfn1c = 'Пустой ответ'; return end
         local ok2, parsed = pcall(decodeJson, t2)
         if not ok2 or type(parsed) ~= 'table' or not parsed.shops then
-            _dfn1c = 'JSON err: ' .. tostring(c2)
+            _dfn1c = (c2 == nil and 'connection failed' or 'JSON err: ' .. tostring(c2))
             return
         end
         if not mh_arz_items_db then mh_arz_items_db = {} end
@@ -5177,10 +5413,10 @@ function _pkw2y(server_id)
                 _ztc7m(tonumber(sid) or -1)
             end)
         end
-        -- MCR: их данные приоритетнее — грузим поверх наших
-        lua_thread.create(function() wait(200); _pull_mcr(tonumber(sid) or -1) end)
-        -- TETO: третий источник, грузим параллельно
-        lua_thread.create(function() wait(400); _pull_teto(tonumber(sid) or -1) end)
+        -- [v4.3.4] MCR отключён полностью — закомментировано
+        -- if not settings.api_sources or settings.api_sources.mcr ~= false then
+        --     lua_thread.create(function() wait(200); _pull_mcr(tonumber(sid) or -1) end)
+        -- end
     end)
 end  -- function _pkw2y
 
@@ -5425,6 +5661,7 @@ function _pull_mcr(server_id)
                     end
                 end
                 if found_idx then
+                    -- Обновляем существующую запись
                     local ex = mh_arz_data[found_idx]
                     if #sell_ids > 0 then
                         ex.items_sell = sell_ids; ex.price_sell = sell_pr; ex.count_sell = sell_cnt
@@ -5439,8 +5676,32 @@ function _pull_mcr(server_id)
                     ex._mcr_cloud  = true
                     ex._mcr_ostime = sh.ostime or 0
                     merged = merged + 1
+                    -- Обновляем индексы
+                    _nick_idx[owner_lo] = found_idx
+                    _uid_idx[owner_lo .. ':' .. tostring(uid)] = found_idx
+                else
+                    -- Запись не найдена.
+                    -- Если MH Cloud выключен — MCR является основным источником,
+                    -- добавляем новые записи. Иначе — пропускаем (чужой сервер).
+                    local _mh_on = not settings.api_sources or settings.api_sources.mh ~= false
+                    if not _mh_on then
+                        local new_idx = #mh_arz_data + 1
+                        mh_arz_data[new_idx] = {
+                            serverId    = srv_id,
+                            username    = owner,
+                            LavkaUid    = uid,
+                            items_sell  = sell_ids, price_sell = sell_pr, count_sell = sell_cnt,
+                            items_buy   = buy_ids,  price_buy  = buy_pr,  count_buy  = buy_cnt,
+                            _mcr_cloud  = true,
+                            _mcr_ostime = sh.ostime or 0,
+                        }
+                        _nick_idx[owner_lo] = new_idx
+                        _uid_idx[owner_lo .. ':' .. tostring(uid)] = new_idx
+                        merged    = merged + 1
+                        added_new = added_new + 1
+                    end
+                    -- MH Cloud включён: пропускаем — не наш сервер или данные ещё грузятся
                 end
-                -- Если found_idx == nil — ник не в нашей базе, пропускаем (чужой сервер)
             end -- #sell_ids > 0
 
             end -- not _skip
@@ -5469,189 +5730,6 @@ function _pull_mcr(server_id)
 end
 
 -- ================================================================
--- Третий источник: https://teto.moder42.tech/lavka/registry
--- Формат: {ok:true, data:[{LavkaUid, username/owner, serverId,
---   items_sell:[numId,...], price_sell:[num,...], count_sell:[num,...],
---   items_buy:[numId,...],  price_buy:[num,...],  count_buy:[num,...]}]}
--- items_sell содержит числовые ID — резолвятся через mh_arz_items_db
--- (который заполняется из server-api.arizona.games при обычном скане)
--- ================================================================
-_G._TETO_LOADING = false
-_G._TETO_URL     = 'https://teto.moder42.tech/lavka/registry'
-
-function _pull_teto(server_id)
-    if _G._TETO_LOADING then return end
-    _G._TETO_LOADING = true
-    local sid_num = tonumber(server_id) or -1
-
-    _fwm2c(_G._TETO_URL, function(code, body, err)
-        _G._TETO_LOADING = false
-        if err then
-            if mh_debug_enabled then
-                sampAddChatMessage('[MH TETO] ошибка: ' .. tostring(err), 0xFF8866)
-            end
-            return
-        end
-        if not body or #body == 0 then
-            if mh_debug_enabled then
-                sampAddChatMessage('[MH TETO] пустой ответ HTTP ' .. tostring(code or '?'), 0xFF8866)
-            end
-            return
-        end
-        local ok, parsed = pcall(decodeJson, body)
-        if not ok or type(parsed) ~= 'table' then
-            if mh_debug_enabled then
-                sampAddChatMessage('[MH TETO] JSON err: ' .. tostring(body):sub(1,60), 0xFF8866)
-            end
-            return
-        end
-
-        -- Формат: {ok:true, data:[...]} или просто массив
-        local list
-        if parsed.ok == true and type(parsed.data) == 'table' then
-            list = parsed.data
-        elseif parsed[1] ~= nil then
-            list = parsed
-        else
-            if mh_debug_enabled then
-                sampAddChatMessage('[MH TETO] неизвестный формат', 0xFF8866)
-            end
-            return
-        end
-
-        if not mh_arz_items_db then mh_arz_items_db = {} end
-
-        -- Индекс nick -> idx для дедупликации
-        local _nick_idx = {}
-        for idx, lv in ipairs(mh_arz_data) do
-            local nk = lv.username and lv.username:lower() or ''
-            if nk ~= '' then _nick_idx[nk] = idx end
-        end
-
-        local merged, added_new = 0, 0
-
-        for _, sh in ipairs(list) do
-            local owner = sh.username or sh.owner or sh.nick or sh.userName or ''
-            owner = (owner:match('^%s*(.-)%s*$') or '')
-            -- Убираем мусорный префикс
-            local _cl = owner:match('%-%s*([A-Za-z_][A-Za-z0-9_]+)')
-                     or owner:match('^([A-Za-z_][A-Za-z0-9_]+)')
-            if _cl and _cl ~= '' then owner = _cl end
-            if owner == '' then goto teto_skip end
-
-            local uid     = tonumber(sh.LavkaUid or sh.shop_num or sh.id) or 0
-            local srv_id  = tonumber(sh.serverId or sh.server_id) or sid_num
-            local owner_lo = owner:lower()
-
-            -- Конвертируем items: числовой ID ? ищем имя в mh_arz_items_db
-            -- Если не нашли — пропускаем (имена появятся после скана лавок)
-            local sell_ids, sell_pr, sell_cnt = {}, {}, {}
-            local buy_ids,  buy_pr,  buy_cnt  = {}, {}, {}
-
-            local _enc_teto = require('encoding')
-        local function _decode_nm(s)
-            if type(s) ~= 'string' or s == '' then return s end
-            local ok, r = pcall(function() return _enc_teto.UTF8:decode(s) end)
-            return (ok and r and r ~= '') and r or s
-        end
-
-        local function _conv(items, prices, counts, out_ids, out_pr, out_cnt)
-            for i, item in ipairs(items) do
-                local nm, pr, cnt = '', 0, 0
-                local num_id = tonumber(item)
-                if num_id then
-                    nm  = mh_arz_items_db[num_id] or ('item#' .. tostring(num_id))
-                    pr  = tonumber(prices[i]) or 0
-                    cnt = tonumber(counts and counts[i]) or 0
-                elseif type(item) == 'string' and item ~= '' then
-                    nm  = _decode_nm(item)
-                    pr  = tonumber(prices[i]) or 0
-                    cnt = tonumber(counts and counts[i]) or 0
-                elseif type(item) == 'table' then
-                    nm  = _decode_nm(item.name or '')
-                    pr  = tonumber(item.price or item.cost) or 0
-                    cnt = tonumber(item.qty or item.count) or 0
-                end
-                nm = (nm or ''):match('^%s*(.-)%s*$') or ''
-                if nm ~= '' then
-                    if num_id then
-                        if not mh_arz_items_db[num_id]
-                           or mh_arz_items_db[num_id]:sub(1,5) == 'item#' then
-                            mh_arz_items_db[num_id] = nm
-                        end
-                        table.insert(out_ids, num_id)
-                    else
-                        _wyk7z = _wyk7z + 1
-                        mh_arz_items_db[_wyk7z] = nm
-                        table.insert(out_ids, _wyk7z)
-                    end
-                    table.insert(out_pr,  pr)
-                    table.insert(out_cnt, cnt)
-                end
-            end
-            end
-
-            local raw_s = sh.sell_slots or sh.items_sell or {}
-            local raw_b = sh.buy_slots  or sh.items_buy  or {}
-            _conv(raw_s, sh.price_sell or {}, sh.count_sell or {}, sell_ids, sell_pr, sell_cnt)
-            _conv(raw_b, sh.price_buy  or {}, sh.count_buy  or {}, buy_ids,  buy_pr,  buy_cnt)
-
-            if #sell_ids == 0 and #buy_ids == 0 then goto teto_skip end
-
-            -- Дедупликация
-            local found_idx = _nick_idx[owner_lo]
-            if not found_idx then
-                for idx, lv in ipairs(mh_arz_data) do
-                    if lv.username and lv.username:lower() == owner_lo then
-                        if srv_id == -1 or not lv.serverId or lv.serverId == -1
-                           or lv.serverId == srv_id then
-                            found_idx = idx; break
-                        end
-                    end
-                end
-            end
-
-            if found_idx then
-                local ex = mh_arz_data[found_idx]
-                if #sell_ids > 0 then
-                    ex.items_sell = sell_ids; ex.price_sell = sell_pr; ex.count_sell = sell_cnt
-                end
-                if #buy_ids > 0 then
-                    ex.items_buy = buy_ids; ex.price_buy = buy_pr; ex.count_buy = buy_cnt
-                end
-                if uid > 0 and (not ex.LavkaUid or ex.LavkaUid == 0) then ex.LavkaUid = uid end
-                if srv_id ~= -1 and (not ex.serverId or ex.serverId == -1) then ex.serverId = srv_id end
-                ex._teto_cloud = true
-            else
-                table.insert(mh_arz_data, {
-                    serverId    = srv_id,   username   = owner,
-                    LavkaUid    = uid,
-                    items_sell  = sell_ids, price_sell = sell_pr, count_sell = sell_cnt,
-                    items_buy   = buy_ids,  price_buy  = buy_pr,  count_buy  = buy_cnt,
-                    _teto_cloud = true,
-                })
-                added_new = added_new + 1
-            end
-            merged = merged + 1
-            ::teto_skip::
-        end
-
-        if merged > 0 then
-            _G.arz_cache_key  = nil
-            _G._dtl_cache_nm  = nil
-            _G._dtl_dirty     = true
-            _G._TETO_LOADED   = true
-            _G._teto_loaded_cnt = merged
-            _G._teto_cnt_cache  = nil  -- инвалидируем кэш счётчика
-            sampAddChatMessage(
-                string.format('[MH TETO] загружено %d лавок (%d новых)', merged, added_new),
-                0x88FF88
-            )
-        elseif mh_debug_enabled then
-            sampAddChatMessage('[MH TETO] ответ OK, лавок: 0', 0xAAAAAA)
-        end
-    end)
-end
 
 local function _bky4d(txt)
     if not txt then return nil end
@@ -5907,6 +5985,10 @@ local function fh_parse_inventory_dialog(dlg_text)
         if not slot_s then
             slot_s, name, cnt_s = clean:match('%[(%d+)%]%s+(.-)%s+%[(%d+)%s+')
         end
+        if not slot_s then
+            -- Objects format: [84] РњР°С‚РµСЂРёР°Р»С‹ [10] (no trailing space after number)
+            slot_s, name, cnt_s = clean:match('%[(%d+)%]%s+(.-)%s+%[(%d+)%]')
+        end
         if slot_s and name and cnt_s then
             name = name:match('^%s*(.-)%s*$') or name
             if name ~= '' and name ~= 'Название' then
@@ -6085,6 +6167,8 @@ local function _wmc7r()
 
             local dlg_text = ''
             local open_t = os.clock() + 1.5
+            -- Сначала ждём чтобы диалог обновился (сервер может не сразу обновить текст)
+            wait(80)
             while os.clock() < open_t do
                 wait(40)
                 -- Check cached text from onShowDialog first
@@ -6096,7 +6180,10 @@ local function _wmc7r()
                 end
                 if sampIsDialogActive() and sampGetCurrentDialogId() == 26545 then
                     local cur_text = sampGetDialogText() or ''
-                    if cur_text ~= '' and cur_text ~= prev_dlg_text then
+                    -- ФИКС: убираем проверку cur_text ~= prev_dlg_text
+                    -- Диалог 26545 один и тот же для всех товаров, текст может не меняться
+                    -- Достаточно что диалог активен и текст не пустой
+                    if cur_text ~= '' then
                         dlg_text = cur_text
                         break
                     end
@@ -6117,10 +6204,10 @@ local function _wmc7r()
                 sampSendDialogResponse(26545, 1, 0, resp)
                 fh_lv_autosell_done = fh_lv_autosell_done + 1
                 _dsf3y(item.name, item.price, item.qty, 'sell', 'ok')
-                local confirm_t = os.clock() + 3
+                local confirm_t = os.clock() + 4
                 while not mh_sell_confirmed and os.clock() < confirm_t do wait(40) end
                 if not fh_lv_sell_confirmed then
-                    local extra_t = os.clock() + 1.5
+                    local extra_t = os.clock() + 2.0
                     while not fh_lv_sell_confirmed and os.clock() < extra_t do wait(30) end
                 end
                 sampSendDialogResponse(26545, 0, 0, '')
@@ -6137,8 +6224,9 @@ local function _wmc7r()
                     wait(100)
                 end
                 _yzr1t(60, -1, 2, json_str)
-                local retry_t = os.clock() + 1.75
+                local retry_t = os.clock() + 2.5
                 local retry_text = ''
+                wait(80)
                 while os.clock() < retry_t do
                     wait(30)
                     if sampIsDialogActive() and sampGetCurrentDialogId() == 26545 then
@@ -6925,7 +7013,6 @@ local function _hmc6p(item_name, src)
         -- Версия источников данных: пересчитываем только при реальном изменении данных
         local _cur_data_ver = tostring(_G._mh_db_ver or 0)
             .. '|' .. tostring(_G._mh_shop_ver or 0)
-            .. '|' .. tostring(_G._mh_deals_cache_ver or 0)
             .. '|' .. tostring(_G._mh_daily_cache_ver or 0)
             .. '|' .. _dtl_cache_key
         if _G._dtl_last_data_ver == _cur_data_ver then
@@ -6936,20 +7023,19 @@ local function _hmc6p(item_name, src)
         _G._dtl_building = true
         local _build_nm  = item_name
         local _build_key = _dtl_cache_key
+        -- Deals pull: ONE TIME per open, outside lua_thread to avoid dirty cycle
+        if not _G._mh_deals_pull_ts or (os.time() - _G._mh_deals_pull_ts) > 600 then
+            _G._mh_deals_pull_ts = os.time()
+            lua_thread.create(function()
+                _G._mh_deals_pull(true)
+                _G._mh_upload_deals()
+            end)
+        end
         lua_thread.create(function()
         do
         local _nm_lo = _build_nm:lower()
         local _sr, _br = {}, {}
-        do -- deals pull trigger
         _sh_local = fh_get_daily_shop_history(_build_nm)
-        -- При открытии карточки: если кэш deals устарел (>10 мин) — обновляем
-        if not _G._mh_deals_pull_ts or (os.time() - _G._mh_deals_pull_ts) > 600 then
-            _G._mh_deals_pull_ts = os.time()
-            _G._mh_deals_pull(true)
-            -- Заодно пушим свои данные если они ещё не залиты
-            _G._mh_upload_deals()
-        end
-        end -- deals pull trigger
         -- Дополняем _sh_local данными из fh_mkt_log (местные сделки)
         do
             local _nm_lo_log = item_name:lower()
@@ -8624,7 +8710,11 @@ local function _hmc6p(item_name, src)
                     imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0,0,0,0))
                     imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.2,0.5,0.2,0.4))
                     imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.65,0.65,0.65,1))
-                    local _row_lbl = _cyr5f(r.owner..(r.src~='' and ' '..r.src or '')..(r.qty and ' x'..r.qty or ''))
+                    local _is_online_sr = (r.src == '[API]')
+                    local _dot_col_sr = _is_online_sr and imgui.ImVec4(0.2,0.9,0.2,1) or imgui.ImVec4(0.9,0.2,0.2,1)
+                    imgui.TextColored(_dot_col_sr, _ic_circ)
+                    imgui.SameLine(0,3*d)
+                    local _row_lbl = _cyr5f(r.owner..(r.qty and ' x'..r.qty or ''))
                     if imgui.Button(_row_lbl..'##sr'..ri, imgui.ImVec2(0,0)) then
                         if _G._goto_owner_lavka then _G._goto_owner_lavka(r.owner) end
                     end
@@ -8647,7 +8737,11 @@ local function _hmc6p(item_name, src)
                     imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0,0,0,0))
                     imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.1,0.2,0.5,0.4))
                     imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.65,0.65,0.65,1))
-                    local _row_lbl2 = _cyr5f(r.owner..(r.src~='' and ' '..r.src or '')..(r.qty and ' x'..r.qty or ''))
+                    local _is_online_br = (r.src == '[API]')
+                    local _dot_col_br = _is_online_br and imgui.ImVec4(0.2,0.9,0.2,1) or imgui.ImVec4(0.9,0.2,0.2,1)
+                    imgui.TextColored(_dot_col_br, _ic_circ)
+                    imgui.SameLine(0,3*d)
+                    local _row_lbl2 = _cyr5f(r.owner..(r.qty and ' x'..r.qty or ''))
                     if imgui.Button(_row_lbl2..'##br'..ri, imgui.ImVec2(0,0)) then
                         if _G._goto_owner_lavka then _G._goto_owner_lavka(r.owner) end
                     end
@@ -10530,54 +10624,31 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         imgui.TextColored(imgui.ImVec4(0.4,0.8,1,0.8),
                             _ic_cld .. '  ' .. _cyr5f('MCR: ' .. _G._mcr_cnt_cache .. ' лавок'))
                     end
-                    -- Teto API статус
-                    if _G._TETO_LOADING then
-                        imgui.SameLine(0, 8*d)
-                        imgui.TextColored(imgui.ImVec4(1,0.85,0.3,1),
-                            _ic_rot .. '  ' .. u8'Teto: загрузка...')
-                    elseif _G._TETO_LOADED and _G._teto_loaded_cnt and _G._teto_loaded_cnt > 0 then
-                        -- Кэш счётчика Teto по сервер+размер данных
-                        local _cur_srv_id = (_st_srv and _st_srv.id) or -1
-                        if not _G._teto_cnt_cache
-                           or _G._teto_cnt_sz ~= #mh_arz_data
-                           or _G._teto_cnt_srv ~= _cur_srv_id then
-                            _G._teto_cnt_sz  = #mh_arz_data
-                            _G._teto_cnt_srv = _cur_srv_id
-                            local _tc = 0
-                            for _, lv in ipairs(mh_arz_data) do
-                                if lv._teto_cloud then
-                                    local _sid = lv.serverId
-                                    if _cur_srv_id == -1 then
-                                        _tc = _tc + 1
-                                    elseif _sid and _sid ~= -1 and _sid == _cur_srv_id then
-                                        _tc = _tc + 1
-                                    end
-                                end
-                            end
-                            _G._teto_cnt_cache = _tc
-                        end
-                        imgui.SameLine(0, 8*d)
-                        imgui.TextColored(imgui.ImVec4(1,0.85,0.3,0.9),
-                            _ic_cld .. '  ' .. _cyr5f('Teto: ' .. _G._teto_cnt_cache .. ' лавок'))
-                    end
-                    imgui.SameLine(0, 8*d)
                     if imgui.SmallButton(_ic_rot .. '##cloud_refresh') then
-                        local _new_arz = {}
-                        for _, lv in ipairs(mh_arz_data) do
-                            if not lv._mh_cloud then table.insert(_new_arz, lv) end
+                        local _now_cd2 = os.clock()
+                        if not _G._mh_cloud_cd or (_now_cd2 - _G._mh_cloud_cd) >= 15 then
+                            _G._mh_cloud_cd = _now_cd2
+                            local _new_arz = {}
+                            for _, lv in ipairs(mh_arz_data) do
+                                if not lv._mh_cloud then table.insert(_new_arz, lv) end
+                            end
+                            mh_arz_data = _new_arz
+                            _mvr4p = false
+                            local _rf_srv = ARZ_SERVERS[_G.arz_srv_sel and (_G.arz_srv_sel[0]+1) or 1]
+                            _pkw2y(_rf_srv and _rf_srv.id or -1)
                         end
-                        mh_arz_data = _new_arz
-                        _mvr4p = false
-                        local _rf_srv = ARZ_SERVERS[_G.arz_srv_sel and (_G.arz_srv_sel[0]+1) or 1]
-                        _pkw2y(_rf_srv and _rf_srv.id or -1)
                     end
                 else
                     imgui.TextColored(imgui.ImVec4(0.5,0.5,0.5,1),
                         _ic_cld .. '  ' .. u8'MH Cloud: не загружен')
                     imgui.SameLine(0, 8*d)
                     if imgui.SmallButton(u8'Загрузить##cloud_load') then
-                        local _ld_srv = ARZ_SERVERS[_G.arz_srv_sel and (_G.arz_srv_sel[0]+1) or 1]
-                        _pkw2y(_ld_srv and _ld_srv.id or -1)
+                        local _now_cd3 = os.clock()
+                        if not _G._mh_cloud_cd or (_now_cd3 - _G._mh_cloud_cd) >= 15 then
+                            _G._mh_cloud_cd = _now_cd3
+                            local _ld_srv = ARZ_SERVERS[_G.arz_srv_sel and (_G.arz_srv_sel[0]+1) or 1]
+                            _pkw2y(_ld_srv and _ld_srv.id or -1)
+                        end
                     end
                 end
             end
@@ -10610,7 +10681,10 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.45, 0.45, 0.45, 1))
             end
             if imgui.Button(_ic_rot .. ' ' .. u8'Обновить##arz_refresh', imgui.ImVec2(btn_ref_w, 0)) then
-                if not loading_any then
+                local _now_cd = os.clock()
+                local _cd_ok = not _G._mh_refresh_cd or (_now_cd - _G._mh_refresh_cd) >= 15
+                if not loading_any and _cd_ok then
+                    _G._mh_refresh_cd = _now_cd
                     local sel_srv_id = ARZ_SERVERS[_G.arz_srv_sel[0] + 1] and ARZ_SERVERS[_G.arz_srv_sel[0] + 1].id or -1
                     _G.arz_cache_key = nil
                     _G.arz_page      = 1
@@ -10619,6 +10693,12 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 end
             end
             if loading_any then imgui.PopStyleColor() end
+            if imgui.IsItemHovered() and _G._mh_refresh_cd then
+                local _cd_left = math.ceil(15 - (os.clock() - _G._mh_refresh_cd))
+                if _cd_left > 0 then
+                    imgui.SetTooltip(_cyr5f('Кулдаун: ' .. _cd_left .. ' сек.'))
+                end
+            end
             imgui.PopStyleColor(3)
 
             imgui.SameLine(0, 6 * d)
@@ -10633,6 +10713,76 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 _G.arz_detail     = nil
             end
             imgui.PopStyleColor(3)
+
+            imgui.SameLine(0, 6 * d)
+            imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.08,0.16,0.28,1))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.14,0.26,0.46,1))
+            if imgui.Button(_ic_gear .. u8'##api_filter_btn', imgui.ImVec2(32*d, 0)) then
+                _G._api_filter_open = not (_G._api_filter_open or false)
+            end
+            imgui.PopStyleColor(2)
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(u8'Фильтр API-серверов')
+            end
+
+            if _G._api_filter_open then
+                imgui.Separator()
+                imgui.TextColored(imgui.ImVec4(0.5,0.8,1,1), u8'Фильтр API-серверов (снята убирает нагрузку):')
+                imgui.Spacing()
+                if not settings.api_filter then settings.api_filter = {} end
+                local _af = settings.api_filter
+                local _cols = 2
+                local _col_i = 0
+                for _si = 2, #ARZ_SERVERS do
+                    local _srv = ARZ_SERVERS[_si]
+                    local _k   = tostring(_srv.id)
+                    local _disabled = (_af[_k] == true)
+                    local _cb = imgui.new.bool(not _disabled)
+                    local _lbl = u8:encode(_cyr5f(_srv.name)) .. '##apif_' .. _k
+                    if imgui.Checkbox(_lbl, _cb) then
+                        _af[_k] = not _cb[0] or nil
+                        _wfn7p()
+                    end
+                    _col_i = _col_i + 1
+                    if _col_i % _cols ~= 0 then
+                        imgui.SameLine(0, 16*d)
+                    end
+                end
+                imgui.Spacing()
+                if imgui.SmallButton(u8'Разрешить все##apif_all') then
+                    for _si=2,#ARZ_SERVERS do _af[tostring(ARZ_SERVERS[_si].id)]=nil end
+                    _wfn7p()
+                end
+                imgui.SameLine(0,8*d)
+                if imgui.SmallButton(u8'Заблокировать все##apif_none') then
+                    for _si=2,#ARZ_SERVERS do _af[tostring(ARZ_SERVERS[_si].id)]=true end
+                    _wfn7p()
+                end
+                imgui.SameLine(0,8*d)
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.TextColored(imgui.ImVec4(0.5,0.8,1,1), u8'Источники данных:')
+                imgui.Spacing()
+                if not settings.api_sources then settings.api_sources={mh=true,mcr=false} end
+                settings.api_sources.mcr = false  -- [v4.3] MCR отключён
+                local _as = settings.api_sources
+                -- [v4.3] MCR скрыт (нерабочий источник), только MH Cloud
+                _as.mcr = false  -- принудительно выключаем MCR
+                local _en_mh = (_as.mh ~= false)
+                local _cb_mh = imgui.new.bool(_en_mh)
+                if imgui.Checkbox(u8'MH Cloud (наш сервер)##apisrc_mh', _cb_mh) then
+                    _as.mh = _cb_mh[0] or false
+                    _wfn7p()
+                end
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.Spacing()
+                if imgui.SmallButton(u8'Скрыть##apif_close') then
+                    _G._api_filter_open = false
+                    _wfn7p()  -- [v4.3] сохраняем при закрытии
+                end
+                imgui.Separator()
+            end
 
             if #mh_arz_data == 0 and not mh_arz_loading then
                 imgui.SameLine(0, 10 * d)
@@ -11549,17 +11699,18 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                             return
                         end
                         for _, it in ipairs(_dedup) do
+                            local function _s(v) return _to_utf8(v or '?') end
                             local _wmsg =
-                                '[*] \xc2\xee\xf2\xf7\xeb\xe8\xf1\xf2' .. '\n'
+                                _to_utf8('[*] Вотчлист') .. '\n'
                                 .. '--------------------\n'
-                                .. '\xcf\xf0\xe5\xe4\xec\xe5\xf2: ' .. (it.nm or '?') .. '\n'
-                                .. '\xd6\xe5\xed\xe0: $' .. _kcr3y(it.price)
-                                .. (it.cnt and ('  x'..tostring(it.cnt)..' \xf8\xf2.') or '') .. '\n'
-                                .. '\xcb\xe0\xe2\xea\xe0: #' .. tostring(it.uid) .. ' ' .. (it.owner or '?')
-                                .. '  (' .. (it.srv_nm or '') .. ')\n'
+                                .. _to_utf8('Предмет: ') .. _s(it.nm) .. '\n'
+                                .. _to_utf8('Цена: $') .. _kcr3y(it.price)
+                                .. (it.cnt and (_to_utf8('  x')..tostring(it.cnt).._to_utf8(' шт.')) or '') .. '\n'
+                                .. _to_utf8('Лавка: #') .. tostring(it.uid) .. ' ' .. _s(it.owner)
+                                .. '  (' .. _s(it.srv_nm) .. ')\n'
                                 .. '--------------------\n'
                                 .. os.date('%H:%M  %d.%m.%Y')
-                            mh_tg_send(_wmsg, true)
+                            _mh_tg_send_utf8(_wmsg)
                             wait(400)
                         end
                         sampAddChatMessage('[MH] {aaffaa}\xce\xf2\xef\xf0\xe0\xe2\xeb\xe5\xed\xee: ' .. #_dedup .. ' \xf2\xee\xe2\xe0\xf0\xe0', 0xFFFFFF)
@@ -11983,10 +12134,13 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 end
                 -- FIX LAG: кэш цен пресета на кадр (не вызывать _mh_get_mkt_price 60fps*N товаров)
                 -- Инвалидируем при смене версии данных или размера пресета
+                -- FIX: добавляем текущий сервер в ключ версии
+                local _cur_srv_asp = (_G.arz_srv_sel and _G.arz_srv_sel[0]) or _mpf7d() or 0
                 local _asp_price_ver = tostring(_G._mh_db_ver or 0)..'|'
                     ..tostring(_G._mh_shop_ver or 0)..'|'
                     ..tostring(_G._mh_deals_cache_ver or 0)..'|'
-                    ..tostring(#fh_lv_autosell_preset)
+                    ..tostring(#fh_lv_autosell_preset)..'|'
+                    ..tostring(_cur_srv_asp)
                 if _G._asp_frame_cache_ver ~= _asp_price_ver then
                     _G._asp_frame_cache_ver = _asp_price_ver
                     _G._asp_frame_cache = {}
@@ -12077,6 +12231,33 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         imgui.SameLine(0,3*d)
                         imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.45,0.08,0.08,1))
                         if imgui.Button(_ic_x..'##asd'..asi, imgui.ImVec2(x_w2, 0)) then del_as_i=asi end
+                        imgui.PopStyleColor()
+                        imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.08,0.25,0.45,1))
+                        if imgui.Button(_ic_up..'##asmu'..asi, imgui.ImVec2((fw-2*d)/2, 0)) then
+                            if asi > 1 then
+                                _G._as_swap = fh_lv_autosell_preset[asi]
+                                fh_lv_autosell_preset[asi] = fh_lv_autosell_preset[asi-1]
+                                fh_lv_autosell_preset[asi-1] = _G._as_swap
+                                _G.as_price_buf=nil; _G.as_qty_buf=nil
+                                local _ap2 = settings.presets and settings.presets[fh_active_preset_idx]
+                                if _ap2 then _ap2.items = fh_lv_autosell_preset end
+                                _wfn7p()
+                            end
+                        end
+                        imgui.PopStyleColor()
+                        imgui.SameLine(0,2*d)
+                        imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.08,0.25,0.45,1))
+                        if imgui.Button(_ic_dn..'##asmd'..asi, imgui.ImVec2((fw-2*d)/2, 0)) then
+                            if asi < #fh_lv_autosell_preset then
+                                _G._as_swap = fh_lv_autosell_preset[asi]
+                                fh_lv_autosell_preset[asi] = fh_lv_autosell_preset[asi+1]
+                                fh_lv_autosell_preset[asi+1] = _G._as_swap
+                                _G.as_price_buf=nil; _G.as_qty_buf=nil
+                                local _ap2 = settings.presets and settings.presets[fh_active_preset_idx]
+                                if _ap2 then _ap2.items = fh_lv_autosell_preset end
+                                _wfn7p()
+                            end
+                        end
                         imgui.PopStyleColor()
                     end
                     do
@@ -12501,12 +12682,14 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 imgui.PopItemWidth()
                 imgui.SameLine(0, 4*d)
                 local _ab_sort_lbls = {_cyr5f('А-Я'), _cyr5f('Цена+'), _cyr5f('Цена-'), _cyr5f('Сумма-')}
+                -- -1 = ручной порядок (после нажатия стрелок), нормализуем для отображения
+                local _ab_srt_disp = _G.ab_preset_sort == -1 and 0 or _G.ab_preset_sort
                 imgui.PushStyleColor(imgui.Col.Button,
-                    _G.ab_preset_sort > 0
+                    _ab_srt_disp > 0
                     and imgui.ImVec4(bb_r*0.6, bb_g*0.6, bb_b*0.6, 1)
                     or  imgui.ImVec4(0.18, 0.18, 0.18, 1))
-                if imgui.Button(_ab_sort_lbls[_G.ab_preset_sort+1]..'##abpsort', imgui.ImVec2(-1, 0)) then
-                    _G.ab_preset_sort = (_G.ab_preset_sort + 1) % 4
+                if imgui.Button(_ab_sort_lbls[_ab_srt_disp+1]..'##abpsort', imgui.ImVec2(-1, 0)) then
+                    _G.ab_preset_sort = (_ab_srt_disp + 1) % 4
                 end
                 imgui.PopStyleColor()
                 if not _G.ab_flt_min_buf then _G.ab_flt_min_buf = imgui.new.char[20]('') end
@@ -12607,34 +12790,30 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 -- total_budget: берём из фонового кэша (пересчитывается в lua_thread)
                 local _ab_total_budget_cache = _G._abp_budget_total or 0
                 local del_ab_i = nil
-                local _ab_render_ids = {}
-                -- Кэшируем отсортированный список: пересчёт только при изменении фильтра/сортировки/пресета
+                -- Простой рендер: итерируем напрямую по fh_lv_autobuy_preset
+                -- Сортировка: строим отсортированную копию индексов каждый кадр (дёшево для <200 элементов)
                 local _ab_srt = _G.ab_preset_sort or 0
-                local _ab_rid_key = #fh_lv_autobuy_preset .. '|' .. _ab_srt .. '|' .. (_G.ab_preset_srch2 or '') .. '|' .. tostring(_G.ab_flt_min or 0) .. '|' .. tostring(_G.ab_flt_max or 0)
-                if _G._ab_rid_key ~= _ab_rid_key then
-                    _G._ab_rid_key = _ab_rid_key
-                    local _new_ids = {}
-                    for _abi_raw2 = 1, #fh_lv_autobuy_preset do
-                        local _abp_r2 = fh_lv_autobuy_preset[_abi_raw2]
-                        if _G.ab_preset_srch2 and _G.ab_preset_srch2 ~= '' and not _abp_r2.name:lower():find(_G.ab_preset_srch2, 1, true) then
-                        elseif (_G.ab_flt_min or 0) > 0 and (_abp_r2.max_price or 0) < _G.ab_flt_min then
-                        elseif (_G.ab_flt_max or 0) > 0 and (_abp_r2.max_price or 0) > _G.ab_flt_max then
-                        else table.insert(_new_ids, _abi_raw2) end
-                    end
-                    if _ab_srt == 1 then
-                        table.sort(_new_ids, function(a,b) return (fh_lv_autobuy_preset[a].max_price or 0) < (fh_lv_autobuy_preset[b].max_price or 0) end)
-                    elseif _ab_srt == 2 then
-                        table.sort(_new_ids, function(a,b) return (fh_lv_autobuy_preset[a].max_price or 0) > (fh_lv_autobuy_preset[b].max_price or 0) end)
-                    elseif _ab_srt == 3 then
-                        table.sort(_new_ids, function(a,b)
-                            return ((fh_lv_autobuy_preset[a].max_price or 0)*(fh_lv_autobuy_preset[a].qty or 1)) > ((fh_lv_autobuy_preset[b].max_price or 0)*(fh_lv_autobuy_preset[b].qty or 1))
-                        end)
-                    else
-                        table.sort(_new_ids, function(a,b) return (fh_lv_autobuy_preset[a].name or '') < (fh_lv_autobuy_preset[b].name or '') end)
-                    end
-                    _G._ab_render_ids_cache = _new_ids
+                if _ab_srt == -1 then _ab_srt = 0 end  -- -1 = ручной = как в массиве = 0 без сортировки
+                local _ab_render_ids = {}
+                for _i2 = 1, #fh_lv_autobuy_preset do
+                    local _p2 = fh_lv_autobuy_preset[_i2]
+                    local _srch2 = _G.ab_preset_srch2 or ''
+                    if _srch2 ~= '' and not (_p2.name or ''):lower():find(_srch2, 1, true) then
+                    elseif (_G.ab_flt_min or 0) > 0 and (_p2.max_price or 0) < (_G.ab_flt_min or 0) then
+                    elseif (_G.ab_flt_max or 0) > 0 and (_p2.max_price or 0) > (_G.ab_flt_max or 0) then
+                    else table.insert(_ab_render_ids, _i2) end
                 end
-                _ab_render_ids = _G._ab_render_ids_cache or _ab_render_ids
+                if _ab_srt == 1 then
+                    table.sort(_ab_render_ids, function(a,b) return (fh_lv_autobuy_preset[a].max_price or 0) < (fh_lv_autobuy_preset[b].max_price or 0) end)
+                elseif _ab_srt == 2 then
+                    table.sort(_ab_render_ids, function(a,b) return (fh_lv_autobuy_preset[a].max_price or 0) > (fh_lv_autobuy_preset[b].max_price or 0) end)
+                elseif _ab_srt == 3 then
+                    table.sort(_ab_render_ids, function(a,b)
+                        return ((fh_lv_autobuy_preset[a].max_price or 0)*(fh_lv_autobuy_preset[a].qty or 1))
+                             > ((fh_lv_autobuy_preset[b].max_price or 0)*(fh_lv_autobuy_preset[b].qty or 1))
+                    end)
+                -- srt==0: натуральный порядок, не сортируем
+                end
                 for _, abi in ipairs(_ab_render_ids) do
                     local abp = fh_lv_autobuy_preset[abi]
                     if true then
@@ -12707,6 +12886,52 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         imgui.SameLine(0,3*d)
                         imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.45,0.08,0.08,1))
                         if imgui.Button(_ic_x..'##abd'..abi, imgui.ImVec2(x_w3, 0)) then del_ab_i=abi end
+                        imgui.PopStyleColor()
+                        imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.08,0.25,0.45,1))
+                        if imgui.Button(_ic_up..'##abmu'..abi, imgui.ImVec2((fw2-2*d)/2, 0)) then
+                            -- abi = реальный индекс. Ищем предыдущий в render_ids
+                            local _pos_u = nil
+                            for _ri_u, _rv_u in ipairs(_ab_render_ids) do
+                                if _rv_u == abi then _pos_u = _ri_u; break end
+                            end
+                            if _pos_u and _pos_u > 1 then
+                                local _prev = _ab_render_ids[_pos_u - 1]
+                                _G._ab_swap = fh_lv_autobuy_preset[abi]
+                                fh_lv_autobuy_preset[abi]   = fh_lv_autobuy_preset[_prev]
+                                fh_lv_autobuy_preset[_prev] = _G._ab_swap
+                                _G.ab_preset_sort = -1  -- переключаем в ручной режим
+                                _G.ab_max_buf=nil; _G.ab_qty_buf=nil
+                                _G._abp_price_cache_key=nil
+                                settings.autobuy_preset=fh_lv_autobuy_preset
+                                if settings.buy_presets and settings.buy_presets[fh_ab_preset_idx] then
+                                    settings.buy_presets[fh_ab_preset_idx].items=fh_lv_autobuy_preset
+                                end
+                                _wfn7p()
+                            end
+                        end
+                        imgui.PopStyleColor()
+                        imgui.SameLine(0,2*d)
+                        imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.08,0.25,0.45,1))
+                        if imgui.Button(_ic_dn..'##abmd'..abi, imgui.ImVec2((fw2-2*d)/2, 0)) then
+                            local _pos_d = nil
+                            for _ri_d, _rv_d in ipairs(_ab_render_ids) do
+                                if _rv_d == abi then _pos_d = _ri_d; break end
+                            end
+                            if _pos_d and _pos_d < #_ab_render_ids then
+                                local _next = _ab_render_ids[_pos_d + 1]
+                                _G._ab_swap = fh_lv_autobuy_preset[abi]
+                                fh_lv_autobuy_preset[abi]   = fh_lv_autobuy_preset[_next]
+                                fh_lv_autobuy_preset[_next] = _G._ab_swap
+                                _G.ab_preset_sort = -1
+                                _G.ab_max_buf=nil; _G.ab_qty_buf=nil
+                                _G._abp_price_cache_key=nil
+                                settings.autobuy_preset=fh_lv_autobuy_preset
+                                if settings.buy_presets and settings.buy_presets[fh_ab_preset_idx] then
+                                    settings.buy_presets[fh_ab_preset_idx].items=fh_lv_autobuy_preset
+                                end
+                                _wfn7p()
+                            end
+                        end
                         imgui.PopStyleColor()
                         -- -- target_qty строка: Цель / Сохранить / Восстановить --
                         do
@@ -14921,7 +15146,8 @@ function main()
             for idx, t in ipairs(settings.piar_templates or {}) do
                 local _piar_iv = t.auto_interval or 300
                 if (t.auto_interval_max or 0) > _piar_iv then
-                    if not t._next_interval then t._next_interval = _piar_iv + math.random(0, t.auto_interval_max - _piar_iv) end
+                    local _rng = math.max(0, t.auto_interval_max - _piar_iv)
+                    if not t._next_interval then t._next_interval = _piar_iv + (_rng > 0 and math.random(0, _rng) or 0) end
                     _piar_iv = t._next_interval
                 end
                 if t.enable and t.auto and os.time() - (t.last_time or 0) >= _piar_iv then
@@ -15077,6 +15303,21 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
                 table.insert(fh_trade_log,1,{dt=os.date('%d.%m %H:%M'),partner=_dp,
                     give_items=_gi,get_items=_gei,give_money=_gm,get_money=_gem})
                 while #fh_trade_log>500 do table.remove(fh_trade_log) end
+                -- XP из трейда: get_money=я получил(продажа), give_money=я отдал(покупка)
+                do
+                    local _my_trd_nick = ''
+                    pcall(function()
+                        local _pid3 = select(2, sampGetPlayerIdByCharHandle(PLAYER_PED))
+                        _my_trd_nick = (sampGetPlayerNickname(_pid3) or ''):lower()
+                    end)
+                    if _my_trd_nick == '' then
+                        pcall(function() _my_trd_nick = (sampGetCurrentPlayerName() or ''):lower() end)
+                    end
+                    if _my_trd_nick ~= '' then
+                        _xp_add_trade(_my_trd_nick, _gem, _gm)
+                        _xp_save()
+                    end
+                end
                 _ryb5t()
                 _G._mh_trade_partner=nil
                 _G._mh_trade_saved_ts = os.time()
@@ -15582,7 +15823,8 @@ function sampev.onTextDrawHide(td_id)
         fh_mkt_shop_ui_open = false
         fh_mkt_shop_inv_tds = {}
         fh_mkt_lavka_page_id = -1
-        if fh_other_shop_scanning and fh_other_shop_cur then
+        -- [v4.3.4] Не вызываем _qbh9f если sub=1 уже запланировал его через lua_thread
+        if fh_other_shop_scanning and fh_other_shop_cur and not _G._mh_qbh9f_scheduled then
             _qbh9f()
             fh_other_shop_scanning = false
             fh_other_shop_price_tds = {}
@@ -15591,7 +15833,8 @@ function sampev.onTextDrawHide(td_id)
     local hid_td_data = fh_mkt_lavka_all_tds[td_id]
     if hid_td_data and hid_td_data.text == 'ON_SALE' then
         fh_mkt_lavka_all_tds[td_id] = nil
-        if fh_other_shop_scanning and fh_other_shop_cur then
+        -- [v4.3.4] Не вызываем _qbh9f если sub=1 уже запланировал его через lua_thread
+        if fh_other_shop_scanning and fh_other_shop_cur and not _G._mh_qbh9f_scheduled then
             _qbh9f()
             fh_other_shop_scanning = false
             fh_other_shop_price_tds = {}
@@ -16598,6 +16841,21 @@ addEventHandler("onReceivePacket", function(packet_id, bs)
                             give_money=_gm, get_money=_gem
                         })
                         while #fh_trade_log > 500 do table.remove(fh_trade_log) end
+                        -- XP из трейда: get_money=я получил(продажа), give_money=я отдал(покупка)
+                        do
+                            local _my_trd_nick2 = ''
+                            pcall(function()
+                                local _pid4 = select(2, sampGetPlayerIdByCharHandle(PLAYER_PED))
+                                _my_trd_nick2 = (sampGetPlayerNickname(_pid4) or ''):lower()
+                            end)
+                            if _my_trd_nick2 == '' then
+                                pcall(function() _my_trd_nick2 = (sampGetCurrentPlayerName() or ''):lower() end)
+                            end
+                            if _my_trd_nick2 ~= '' then
+                                _xp_add_trade(_my_trd_nick2, _gem, _gm)
+                                _xp_save()
+                            end
+                        end
                         _ryb5t()
                         _G._mh_trade_saved_ts = os.time()
                         _G._mh_trade_partner  = nil
@@ -16762,6 +17020,8 @@ addEventHandler("onReceivePacket", function(packet_id, bs)
     if iface == 60 and subid == 1 then
         _mh_flog('PKT60_1 full json=' .. json_s:sub(1,500))
         if mh_debug_enabled then sampAddChatMessage('[MH] {88CCFF}iface=60/sub=1 пришёл', 0x88CCFF) end
+        -- Пришёл sub=1 во время ручного скана => ручное открытие
+        if fh_other_shop_scanning then _G._mh_is_manual_scan = true end
         mh_lavka_inv = {}
         mh_lavka_inv_ready = true
         local _enc = require('encoding')
@@ -16820,6 +17080,7 @@ addEventHandler("onReceivePacket", function(packet_id, bs)
                     owner      = eff_owner,
                     shop_num   = _snum or '?',
                     dt         = os.date('%d.%m %H:%M'),
+                    ts         = os.time(),
                     sell_items = {},
                     buy_items  = {},
                     server_id  = (function()
@@ -16833,6 +17094,7 @@ addEventHandler("onReceivePacket", function(packet_id, bs)
                     end)(),
                 }
                 fh_other_shop_scanning = true
+                _G._mh_qbh9f_scheduled = true  -- [v4.3.4] sub=1 возьмёт на себя _qbh9f
                 fh_other_shop_pending_num = nil  -- сброс после использования
                 for _, batch in ipairs(mh_pending_lavka_buf) do
                     local cur_list
@@ -16870,26 +17132,41 @@ addEventHandler("onReceivePacket", function(packet_id, bs)
                 end
 
                 lua_thread.create(function()
-                    wait(300)
+                    wait(800)  -- [v4.3.4] увеличен: даём время запоздавшим sub=0 пакетам прийти
                     if not fh_other_shop_cur then return end
-                    local sell_c = #fh_other_shop_cur.sell_items
-                    local buy_c  = #fh_other_shop_cur.buy_items
-                    if sell_c > 0 or buy_c > 0 then
-                        -- Дедупликация: не пушим одну лавку чаще чем в 5 мин
-                        local _ow_lo = (fh_other_shop_cur.owner or ""):lower()
-                        local _last  = _G._mh_passive_seen and _G._mh_passive_seen[_ow_lo] or 0
-                        local _cd    = _G._mh_passive_cooldown or 300
-                        if os.time() - _last >= _cd then
-                            if _G._mh_passive_seen then _G._mh_passive_seen[_ow_lo] = os.time() end
-                            _qbh9f()
-                            if mh_debug_enabled then
-                                sampAddChatMessage('[MH pass] Пуш лавки: '..(fh_other_shop_cur.owner or '?')..' sell='..sell_c..' buy='..buy_c, 0x88FF88)
-                            end
-                        else
-                            if mh_debug_enabled then
-                                sampAddChatMessage('[MH pass] Пропуск: '..(fh_other_shop_cur.owner or '?')..' cd='..(os.time()-_last)..'s', 0x888888)
+                    -- FIX race: если sub=1 пришёл раньше sub=0, items могут быть в pending_lavka_buf
+                    -- Обрабатываем запоздавшие пакеты напрямую
+                    if #(fh_other_shop_cur.sell_items or {}) == 0 and #(fh_other_shop_cur.buy_items or {}) == 0
+                       and #mh_pending_lavka_buf > 0 then
+                        for _, _late_batch in ipairs(mh_pending_lavka_buf) do
+                            local _late_list
+                            if     _late_batch.pkt_type == 13 then _late_list = fh_other_shop_cur.sell_items
+                            elseif _late_batch.pkt_type == 28 then _late_list = fh_other_shop_cur.buy_items end
+                            if _late_list then
+                                local _lg, _lo = {}, {}
+                                for _, _li in ipairs(_late_batch.items) do
+                                    local _lnm = _G._rgn9z(_li.item_id)
+                                    _lnm = _lnm:gsub('{[^}]+}',''):match('^%s*(.-)%s*$') or _lnm
+                                    local _lk = tostring(_li.item_id)..'|'..tostring(_li.price)
+                                    if _lg[_lk] then _lg[_lk].qty = _lg[_lk].qty + 1
+                                    else _lg[_lk]={name=_lnm,price=_li.price,qty=1,item_id=_li.item_id}; table.insert(_lo,_lk) end
+                                end
+                                for _, _lk2 in ipairs(_lo) do table.insert(_late_list, _lg[_lk2]) end
                             end
                         end
+                        mh_pending_lavka_buf = {}
+                        if mh_debug_enabled then
+                            sampAddChatMessage('[MH race] Обработаны запоздавшие пакеты: sell='..#fh_other_shop_cur.sell_items..' buy='..#fh_other_shop_cur.buy_items, 0xFFAA44)
+                        end
+                    end
+                    local sell_c = #fh_other_shop_cur.sell_items
+                    local buy_c  = #fh_other_shop_cur.buy_items
+                    -- Пушим всегда при каждом открытии лавки, без кулдаунов
+                    _G._mh_is_manual_scan = false
+                    _G._mh_qbh9f_scheduled = false
+                    _qbh9f()  -- пушит на MH Cloud
+                    if mh_debug_enabled then
+                        sampAddChatMessage('[MH] push: '..(fh_other_shop_cur.owner or '?')..' sell='..sell_c..' buy='..buy_c, 0x88FF88)
                     end
                     fh_other_scan_done  = sell_c + buy_c
                     fh_other_scan_total = sell_c + buy_c
@@ -16905,12 +17182,23 @@ addEventHandler("onReceivePacket", function(packet_id, bs)
             -- Определяем первый slot текущего пакета
             local _first_slot = tonumber(json_s:match('"slot"%s*:%s*(%d+)')) or 999
             if _first_slot == 0 then
-                -- Слот 0 = начало новой лавки. Сбрасываем старый буфер чтобы данные прошлой лавки не смешались
-                mh_pending_lavka_buf = {}
-                _G._mh_passive_buf_ts = os.time()
-                if mh_debug_enabled then
-                    sampAddChatMessage('[MH pass] slot=0: новая лавка, буфер сброшен', 0x88FF88)
+                -- Слот 0 = начало новой лавки.
+                -- Сбрасываем буфер только если нет свежих данных (sub=1 ещё не обработал)
+                -- [v4.3.5] Аризона шлёт sub=0 автоматически -> не сбрасываем если буфер свежий
+                local _now_ts = os.time()
+                local _buf_age = _now_ts - (_G._mh_passive_buf_ts or 0)
+                local _buf_fresh = (_buf_age < 10) and (#mh_pending_lavka_buf > 0)
+                if not _buf_fresh then
+                    mh_pending_lavka_buf = {}
+                    if mh_debug_enabled then
+                        sampAddChatMessage('[MH pass] slot=0: буфер сброшен (новая лавка)', 0x88FF88)
+                    end
+                else
+                    if mh_debug_enabled then
+                        sampAddChatMessage('[MH pass] slot=0: буфер НЕ сброшен (свежий, age='..tostring(_buf_age)..'s)', 0xFF8800)
+                    end
                 end
+                _G._mh_passive_buf_ts = _now_ts
             end
             local buf_items = {}
             for item_obj in json_s:gmatch('{([^}]+)}') do
@@ -16966,32 +17254,61 @@ addEventHandler("onReceivePacket", function(packet_id, bs)
             -- Меню товаров: открываем попап; запоминаем время для защиты от мгновенного type=0
             _mh_qpop_try_open('', 3.0)
             _G._mh_qpop_opened_at = os.clock()
-            -- PASSIVE SCAN: игрок вблизи лавки -> сервер открыл сессию.
-            -- Запрашиваем слоты iface=60 -> сервер отдаёт содержимое лавки
+            -- PASSIVE SCAN: Аризона теперь шлёт iface=60 sub=0 АВТОМАТИЧЕСКИ
+            -- при подходе к лавке. sub=1 (имя) обрабатывает буфер и вызывает _qbh9f.
+            -- Нам НЕ нужно делать запрос — только если данные ещё не пришли.
             if not _G._mh_passive_scan_busy then
                 _G._mh_passive_scan_busy = true
+                _G._mh_is_manual_scan = true
                 lua_thread.create(function()
-                    -- Небольшая задержка: даём серверу время зарегистрировать интеракцию
-                    wait(150)
-                    -- Запрашиваем открыть слоты (iface=60)
-                    -- Сервер ответит iface=60 sub=0 (слоты) + sub=1 (имя владельца)
-                    _yzr1t(60, 113, 113, '')
-                    -- Цикл: ждём подтверждения что sub=1 пришёл (fh_other_shop_owner или fh_other_shop_cur)
-                    local _deadline = os.clock() + 3.0
-                    local _prev_owner = fh_other_shop_owner
-                    while os.clock() < _deadline do
-                        wait(100)
-                        -- sub=1 пришёл хтоть один пакет с слотами
-                        if #mh_pending_lavka_buf > 0 and fh_other_shop_owner ~= _prev_owner then
-                            break
+                    -- Ждём: возможно sub=0+sub=1 уже летят автоматически
+                    wait(300)
+                    -- Если fh_other_shop_cur уже заполнен (sub=1 сработал) — не мешаем
+                    if fh_other_shop_cur and
+                       ((#(fh_other_shop_cur.sell_items or {}) > 0) or
+                        (#(fh_other_shop_cur.buy_items  or {}) > 0)) then
+                        _G._mh_passive_scan_busy = false
+                        return
+                    end
+                    -- Данных ещё нет — либо буфер заполнен но sub=1 не пришёл,
+                    -- либо вообще ничего нет. Ждём ещё немного.
+                    wait(700)
+                    if fh_other_shop_cur and
+                       ((#(fh_other_shop_cur.sell_items or {}) > 0) or
+                        (#(fh_other_shop_cur.buy_items  or {}) > 0)) then
+                        _G._mh_passive_scan_busy = false
+                        return
+                    end
+                    -- Буфер есть но sub=1 не пришёл — ждём его
+                    if #mh_pending_lavka_buf > 0 then
+                        local _dl = os.clock() + 3.0
+                        while os.clock() < _dl do
+                            wait(100)
+                            if fh_other_shop_cur and
+                               ((#(fh_other_shop_cur.sell_items or {}) > 0) or
+                                (#(fh_other_shop_cur.buy_items  or {}) > 0)) then
+                                break
+                            end
                         end
-                        if fh_other_shop_cur and #fh_other_shop_cur.sell_items > 0 then
-                            break  -- уже собралось
+                        _G._mh_passive_scan_busy = false
+                        return
+                    end
+                    -- Ничего нет (лавка не прислала данные автоматически) -> запрашиваем
+                    mh_pending_lavka_buf = {}
+                    _yzr1t(60, 113, 113, '')
+                    local _dl2 = os.clock() + 4.0
+                    local _prev = fh_other_shop_owner
+                    while os.clock() < _dl2 do
+                        wait(100)
+                        if fh_other_shop_cur and
+                           ((#(fh_other_shop_cur.sell_items or {}) > 0) or
+                            (#(fh_other_shop_cur.buy_items  or {}) > 0)) then
+                            wait(400); break
+                        end
+                        if #mh_pending_lavka_buf > 0 and fh_other_shop_owner ~= _prev then
+                            wait(400); break
                         end
                     end
-                    -- Закрываем меню чтобы плеер не видел интерфейс
-                    _yzr1t(255, 113, 113, '')
-                    wait(100)
                     _G._mh_passive_scan_busy = false
                 end)
             end
@@ -17113,17 +17430,18 @@ function _mh_draw_tab_rating()
                 imgui.Spacing()
 
                 -- Заголовки колонок
-                local ncols = 6
-                local col_w = {32*d, cw*0.22, cw*0.14, cw*0.16, cw*0.18, cw*0.18}
+                local ncols = 7
+                local col_w = {28*d, cw*0.20, cw*0.12, cw*0.14, cw*0.16, cw*0.14, cw*0.17}
                 imgui.Columns(ncols, '##rtg_hdr', false)
                 for i, w in ipairs(col_w) do imgui.SetColumnWidth(i-1, w) end
                 local hc = imgui.ImVec4(ar_r*0.6, ag_r*0.6, ab_r*0.4, 1)
-                imgui.TextColored(hc, '#');                    imgui.NextColumn()
-                imgui.TextColored(hc, _cyr5f(' Ник'));         imgui.NextColumn()
-                imgui.TextColored(hc, _cyr5f(' Сервер'));      imgui.NextColumn()
-                imgui.TextColored(hc, _cyr5f(' Уровень'));      imgui.NextColumn()
-                imgui.TextColored(hc, _cyr5f(' Опыт / след.'));  imgui.NextColumn()
-                imgui.TextColored(hc, _cyr5f(' До ур.'));       imgui.NextColumn()
+                imgui.TextColored(hc, '#');                          imgui.NextColumn()
+                imgui.TextColored(hc, _cyr5f(' Ник'));               imgui.NextColumn()
+                imgui.TextColored(hc, _cyr5f(' Сервер'));            imgui.NextColumn()
+                imgui.TextColored(hc, _cyr5f(' Уровень'));           imgui.NextColumn()
+                imgui.TextColored(hc, _cyr5f(' Опыт / след.'));      imgui.NextColumn()
+                imgui.TextColored(hc, _cyr5f(' До ур.'));            imgui.NextColumn()
+                imgui.TextColored(hc, _cyr5f(' Получил/Отдал'));     imgui.NextColumn()
                 imgui.Columns(1)
                 imgui.Separator()
 
@@ -17292,8 +17610,8 @@ function _mh_draw_tab_rating()
 
                     -- Опыт: текущий / следующий уровень
                     function _fmt_xpv(n)
-                        if n >= 1e9 then return string.format('%.1fB', n/1e9)
-                        elseif n >= 1e6 then return string.format('%.1fM', n/1e6)
+                        if n >= 1e9 then return string.format('%.1fM', n/1e9)
+                        elseif n >= 1e6 then return string.format('%.1fKK', n/1e6)
                         elseif n >= 1e3 then return string.format('%.1fK', n/1e3)
                         else return tostring(math.floor(n)) end
                     end
@@ -17307,14 +17625,34 @@ function _mh_draw_tab_rating()
                     local _xp_next = _xp_for_level(_lv_cur + 1)
                     local _xp_need = math.max(0, _xp_next - (p.xp or 0))
                     local _nls
-                    if _xp_need >= 1e9 then _nls = string.format('%.1fB', _xp_need/1e9)
-                    elseif _xp_need >= 1e6 then _nls = string.format('%.1fM', _xp_need/1e6)
+                    if _xp_need >= 1e9 then _nls = string.format('%.1fM', _xp_need/1e9)
+                    elseif _xp_need >= 1e6 then _nls = string.format('%.1fKK', _xp_need/1e6)
                     elseif _xp_need >= 1e3 then _nls = string.format('%.1fK', _xp_need/1e3)
                     else _nls = tostring(math.floor(_xp_need)) end
                     if _xp_need == 0 then
                         imgui.TextDisabled(' --')
                     else
                         imgui.TextDisabled(' -' .. _nls)
+                    end
+                    imgui.NextColumn()
+
+                    -- +/- : продажи (лавки+трейды) / покупки (лавки+трейды)
+                    local _all_sell = (p.sales_virtu or 0) + (p.trade_sell_virtu or 0)
+                    local _all_buy  = (p.buy_virtu   or 0) + (p.trade_buy_virtu  or 0)
+                    local function _fmt_tv(n)
+                        if n >= 1e9 then return string.format('%.1fM', n/1e9)
+                        elseif n >= 1e6 then return string.format('%.0fKK', n/1e6)
+                        elseif n >= 1e3 then return string.format('%.0fK', n/1e3)
+                        else return tostring(math.floor(n)) end
+                    end
+                    if _all_sell > 0 or _all_buy > 0 then
+                        imgui.TextColored(imgui.ImVec4(0.35,0.9,0.35,1), ' '.._fmt_tv(_all_sell))
+                        imgui.SameLine(0,2*d)
+                        imgui.TextDisabled('/')
+                        imgui.SameLine(0,2*d)
+                        imgui.TextColored(imgui.ImVec4(1,0.55,0.3,1), _fmt_tv(_all_buy))
+                    else
+                        imgui.TextDisabled(' --')
                     end
                     imgui.NextColumn()
 
@@ -19237,7 +19575,7 @@ imgui.OnFrame(function() return _G.mh_piar_edit_open == true and _G.mh_piar_edit
       end
       local PiarEditWindowMH = imgui.new.bool(true)
       imgui.SetNextWindowPos(imgui.ImVec2(_G.mh_piar_edit_pos.x, _G.mh_piar_edit_pos.y), imgui.Cond.Once, imgui.ImVec2(0.5, 0.5))
-      imgui.SetNextWindowSize(imgui.ImVec2(500*d, 380*d), imgui.Cond.FirstUseEver)
+      imgui.SetNextWindowSize(imgui.ImVec2(620*d, 560*d), imgui.Cond.Always)
       imgui.GetIO().ConfigWindowsMoveFromTitleBarOnly = false
       imgui.Begin(_cyr5f(' \xcf\xe8\xe0\xf0 /  \xd0\xe5\xe4\xe0\xea\xf2\xee\xf0'), PiarEditWindowMH, imgui.WindowFlags.NoCollapse)
       _G._ltz8m()
@@ -19276,7 +19614,7 @@ imgui.OnFrame(function() return _G.mh_piar_edit_open == true and _G.mh_piar_edit
     imgui.PopItemWidth()
     imgui.Separator()
     imgui.Text(u8'Строки (используй & для разделения):')
-    if imgui.BeginChild('##mhpl', imgui.ImVec2(-1, 100*d), true) then
+    if imgui.BeginChild('##mhpl', imgui.ImVec2(-1, 160*d), true) then
         local rm = nil
         for li, line in ipairs(t.lines or {}) do
             local _lbk = 'mh_piar_linebuf_'..tostring(_G.mh_piar_edit_index)..'_'..li
@@ -19296,12 +19634,36 @@ imgui.OnFrame(function() return _G.mh_piar_edit_open == true and _G.mh_piar_edit
         end
         imgui.EndChild()
     end
-    local hw_p = (imgui.GetWindowContentRegionWidth() - 4*d) / 2
-    if imgui.Button(_ic_circp..' '..u8'Строка##mhpaline', imgui.ImVec2(hw_p, 0)) then
+    local hw_p3 = (imgui.GetWindowContentRegionWidth() - 6*d) / 3
+    if imgui.Button(_ic_circp..' '..u8'Строка##mhpaline', imgui.ImVec2(hw_p3, 0)) then
         table.insert(t.lines, '/s Текст'); _wfn7p()
     end
-    imgui.SameLine()
-    if imgui.Button(_ic_trash..' '..u8'Удалить шаблон##mhpldel', imgui.ImVec2(hw_p, 0)) then
+    imgui.SameLine(0, 3*d)
+    -- Кнопка "Лавка": вставляет <lavka> в последнюю строку (или создаёт новую)
+    local _cur_lavka = mh_own_shop_num or fh_other_shop_pending_num
+    local _lbtn_lbl = _cur_lavka and (_cyr5f('Лавка #')..tostring(_cur_lavka)) or _cyr5f('Лавка')
+    imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.08, 0.30, 0.50, 1))
+    if imgui.Button(_lbtn_lbl..'##mhplavka', imgui.ImVec2(hw_p3, 0)) then
+        if #(t.lines or {}) == 0 then
+            table.insert(t.lines, '/s <lavka>')
+        else
+            -- Добавляем <lavka> в конец последней строки если её там нет
+            local _last = t.lines[#t.lines]
+            if not _last:find('<lavka>', 1, true) then
+                t.lines[#t.lines] = _last .. ' <lavka>'
+                -- Сбрасываем буфер этой строки чтобы обновился в InputText
+                local _lbk2 = 'mh_piar_linebuf_'..tostring(_G.mh_piar_edit_index)..'_'..#t.lines
+                _G[_lbk2] = imgui.new.char[512](_cyr5f(t.lines[#t.lines]))
+            end
+        end
+        _wfn7p()
+    end
+    imgui.PopStyleColor()
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(_cyr5f('<lavka> подставит номер лавки при отправке'))
+    end
+    imgui.SameLine(0, 3*d)
+    if imgui.Button(_ic_trash..' '..u8'Удалить шаблон##mhpldel', imgui.ImVec2(hw_p3, 0)) then
         table.remove(settings.piar_templates, _G.mh_piar_edit_index)
         _wfn7p(); _G.mh_piar_edit_open = false; _G.mh_piar_edit_index = nil
     end
