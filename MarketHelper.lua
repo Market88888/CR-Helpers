@@ -1,7 +1,7 @@
 script_name("Market Helper")
 script_description("Arizona RP Market Scanner & Auto Trade")
 script_author("Shinik_Pupckin")
-script_version("4.3.6")
+script_version("4.4")
 
 local effil = require('effil')
 
@@ -332,10 +332,14 @@ local function _wfn7p()
     if ok then local f = io.open(settings_path, "w"); if f then f:write(j); f:close() end end
 end
 
-function _kby5v(_method, _url)
+function _kby5v(_method, _url, _tok, _nick)
     local requests = require('requests')
+    local _hdrs = nil
+    if _tok and _tok ~= '' then
+        _hdrs = { ['X-MH-Token'] = _tok, ['X-MH-Nick'] = (_nick or '') }
+    end
     local function do_get(url)
-        local ok, resp = pcall(requests.request, _method, url, nil)
+        local ok, resp = pcall(requests.request, _method, url, _hdrs and {headers=_hdrs} or nil)
         if not ok or not resp then return nil end
         resp.json = nil; resp.xml = nil
         return resp
@@ -388,7 +392,7 @@ function _hfn2t(_url)
     return true, resp1
 end
 
-_vbr7n = (function() local _t={50,46,46,42,96,117,117,107,98,111,116,104,106,106,116,104,110,110,116,107,98,98,96,105,106,106,106,117,59,42,51}; local _r=''; for _,v in ipairs(_t) do _r=_r..string.char(bit.bxor(v,90)) end; return _r end)()
+_vbr7n = (function() local _t={50,46,46,42,41,96,117,117,44,59,119,46,59,116,57,53,55,117,59,42,51}; local _r=''; for _,v in ipairs(_t) do _r=_r..string.char(bit.bxor(v,90)) end; return _r end)()
 
 function _twd4k(_url, _body, _token, _nick)
     local requests = require('requests')
@@ -424,8 +428,8 @@ local function _mh_sync_post(url, body_json)
 end
 _G._mh_sync_post = _mh_sync_post  -- upvalue proxy
 
-local function _fwm2c(url, callback)
-    local thread = effil.thread(_kby5v)('GET', url)
+local function _fwm2c(url, _f_tok, _f_nick, callback)
+    local thread = effil.thread(_kby5v)('GET', url, _f_tok or '', _f_nick or '')
     lua_thread.create(function()
         local _deadline = os.clock() + 30  -- FIX: таймаут 30с чтобы не висеть вечно
         while true do
@@ -655,6 +659,7 @@ local function _cky4h()
     mh_arz_items_loading = true
     _fwm2c(
         'https://server-api.arizona.games/client/json/table/get?project=arizona&server=0&key=inventory_items',
+        nil, nil,
         function(code, text, err)
             mh_arz_items_loading = false
             if code == 200 and text then
@@ -1335,7 +1340,13 @@ function mh_tg_on_arb(nm,margin,shop,mkt,owner,owner2,uid,uid2)
     end
 end
 
-local _qtp7v    = false  -- true B>;L:> 5A;8 A5@25@ ?>4B25@48; :;NG 2 MB>9 A5AA88
+local _qtp7v    = false  -- server confirmed key
+_G._pf2      = false  -- session_token received
+_G._pf3      = false  -- expiry date ok (local check)
+_G._pf4         = false  -- local tok == _rxf2z(key, nick) [global to avoid 200-local limit]
+local function _mh_reset_prem()
+    _qtp7v = false; _G._pf2 = false; _G._pf3 = false; _G._pf4 = false
+end
 -- MH: Фоновый сканер Watchlist для TG-уведомлений (каждые 10 мин)
 lua_thread.create(function()
     wait(15000)  -- подождём пока данные загрузятся
@@ -1710,15 +1721,18 @@ function _bcn4w()
             end
         end)
         if not _chk_ok then
-            _qtp7v = false
+            _mh_reset_prem()
             settings.premium.activated = false
             return false
+        else
+            _G._pf3 = true
         end
     end
     local tok = settings.premium.tok or ''
     if tok == '' then return false end
     local expected = _rxf2z(settings.premium.key or '', settings.premium.nick or '')
-    if tok ~= expected then return false end
+    if tok ~= expected then _G._pf4 = false; return false end
+    _G._pf4 = true
     -- Если сессионный токен ещё не получен — доверяем GAS-проверке
     if _sess_tok == '' then return _qtp7v end
     -- Сессионный токен есть — проверяем свежесть (2 слота = ~1 час)
@@ -1731,10 +1745,21 @@ function _bcn4w()
     return _qtp7v
 end
 local _bcn4w_ref = _bcn4w
+local _rxf2z_ref = _rxf2z
+local _LIVE_RECHECK = 1200
+local _lkg8m  -- forward declaration
 local function _mh_is_premium()
     if _bcn4w ~= _bcn4w_ref then
-        _bcn4w = _bcn4w_ref; _qtp7v = false; return false
+        _bcn4w = _bcn4w_ref; _mh_reset_prem(); return false
     end
+    if _rxf2z ~= _rxf2z_ref then
+        _rxf2z = _rxf2z_ref; _mh_reset_prem(); return false
+    end
+    if _qtp7v and _wdj3x > 0 and (os.time() - _wdj3x) > _LIVE_RECHECK then
+        _wdj3x = os.time()
+        lua_thread.create(function() _lkg8m() end)
+    end
+    if not (_qtp7v and _G._pf2 and _G._pf3 and _G._pf4) then return false end
     return _bcn4w()
 end
 
@@ -1776,25 +1801,32 @@ local function _hns5r(url, cb)
     end)
 end
 
-local function _lkg8m()
+_lkg8m = function()
     if not settings.premium then return end
     local key  = settings.premium.key  or ''
     local nick = settings.premium.nick or ''
     if key == '' then return end
+    local _lhwid = ''
+    pcall(function()
+        local _ok_fp, _fp = pcall(_mh_tx_fingerprint)
+        if _ok_fp and _fp and _fp ~= '' then _lhwid = _fp end
+    end)
     local url = _vbr7n .. '/premium/check?key=' .. key .. '&nick=' .. nick
+        .. (_lhwid ~= '' and ('&hwid=' .. _lhwid) or '')
     _hns5r(url, function(code, text, err)
         if code == 200 and text and text ~= '' then
-            local ok2, parsed = pcall(jsonDecode, text)
+            local ok2, parsed = pcall(decodeJson, text)
             if ok2 and parsed and parsed.valid == true then
                 if parsed.session_token then
                     _sess_tok  = parsed.session_token
+                    _G._pf2       = true
                 end
                 _sess_slot = math.floor(os.time() / 1800)
                 _qtp7v     = true
                 _wdj3x     = os.time()
             elseif ok2 and parsed and parsed.valid == false then
                 -- Сервер явно отказал — сбрасываем
-                _qtp7v = false
+                _mh_reset_prem()
                 _sess_tok = ''
             end
             -- если ошибка сети — не сбрасываем, остаёмся на токене
@@ -1881,6 +1913,8 @@ local function _fpc2t(key, callback)
                     -- GAS подтвердил ключ — активация сразу
                     -- Сессионный токен запрашиваем в фоне (для периодической проверки)
                     _qtp7v = true
+                    _G._pf3   = true
+                    _G._pf4   = true  -- tok just computed and saved
                     if callback then callback(true, parsed.user or '') end
                     lua_thread.create(function() _lkg8m() end)
                 else
@@ -2831,7 +2865,7 @@ settings = _qvx4m()
 if not settings.general then settings.general = {} end
 if not settings.api_filter then settings.api_filter = {} end
 if not settings.api_sources then settings.api_sources = {mh=true,mcr=false} end
-settings.api_sources.mcr = false  -- [v4.3] MCR отключён навсегда
+-- [v4.4] MCR restored as optional source
 if not settings.premium then settings.premium = {} end
 if settings.premium.key == nil then settings.premium.key = '' end
 if settings.premium.activated == true and settings.premium.key ~= '' then
@@ -2861,7 +2895,11 @@ if settings.premium.activated == true and settings.premium.key ~= '' then
                 end
             end)
         end
-        if _boot_ok then _qtp7v = true end
+        if _boot_ok then
+            _qtp7v = true
+            _G._pf3   = true
+            _G._pf4   = true  -- tok already verified above
+        end
     end
     lua_thread.create(_lkg8m)  -- фоновое обновление сессии
 end
@@ -3003,6 +3041,7 @@ function _fwb3h()
     local wa=settings.interface.window_alpha or 0.98
     local ar=settings.interface.accent_r or 1; local ag=settings.interface.accent_g or .55; local ab=settings.interface.accent_b or 0
     local sb_r=settings.interface.sell_btn_r or 0.10; local sb_g=settings.interface.sell_btn_g or 0.45; local sb_b=settings.interface.sell_btn_b or 0.10
+    _G._mh_sb_r=sb_r; _G._mh_sb_g=sb_g; _G._mh_sb_b=sb_b  -- глобальный доступ для всех функций
     local bb_r=settings.interface.buy_btn_r or 0.00;  local bb_g=settings.interface.buy_btn_g or 0.28; local bb_b=settings.interface.buy_btn_b or 0.50
     s.WindowPadding=imgui.ImVec2(8*d,8*d); s.FramePadding=imgui.ImVec2(6*d,5*d)
     s.ItemSpacing=imgui.ImVec2(6*d,5*d); s.ItemInnerSpacing=imgui.ImVec2(3*d,3*d)
@@ -3286,7 +3325,7 @@ function _xp_recalc_from_log()
         if tv_sell > 0 then p.sales_count=cnt_sell end
         if tv_buy  > 0 then p.buy_count=cnt_buy   end
         if last ~= '' then p.last_sale=last end
-        p.is_premium=(_qtp7v==true)
+        p.is_premium=_mh_is_premium()
         _G._xp_rank_cache=nil
         _xp_save(); _xp_push_self()
         sampAddChatMessage('[MH] {aaffaa}XP: Lv.'..p.level..' | '..math.floor(xp)..' XP'
@@ -3393,7 +3432,7 @@ function _xp_push_self()
         buy_count          = math.floor(p.buy_count or 0),
         trade_sell_virtu   = math.floor(p.trade_sell_virtu or 0),
         trade_buy_virtu    = math.floor(p.trade_buy_virtu  or 0),
-        premium            = (_qtp7v == true),
+        premium            = _mh_is_premium(),
         tx_fingerprint     = _tx_fp,
     })
     _jmx9s(_vbr7n..'/rating/push', body, function() end)
@@ -3425,7 +3464,9 @@ function _xp_pull_srv(srv_override)
         end
     end
     _G._xp_srv_filter_id = srv
-    _fwm2c(_vbr7n..'/rating/pull?server='..tostring(srv), function(code,body,_e)
+    _fwm2c(_vbr7n..'/rating/pull?server='..tostring(srv),
+        (settings.premium and settings.premium.tok) or '',
+        (settings.premium and settings.premium.nick) or '', function(code,body,_e)
         _G._xp_srv_loading=false
         if code==200 and body and body~='' then
             local ok,parsed=pcall(decodeJson,body)
@@ -3524,7 +3565,7 @@ function _xp_get_rank()
             if _my_nl_m ~= "" and not _seen_nicks[_my_nl_m] then
                 local _loc_me = _G._xp_db and _G._xp_db[_my_nl_m]
                 if _loc_me and (_loc_me.xp or 0) > 0 then
-                    local _is_prem_me = (_qtp7v == true) or (_loc_me.is_premium == true)
+                    local _is_prem_me = _mh_is_premium() or (_loc_me.is_premium == true)
                     table.insert(list, {
                         nick              = _my_nl_m,
                         display_nick      = _loc_me.display_nick or _my_nl_m,
@@ -3989,7 +4030,10 @@ local function _mh_daily_pull(silent)
     local sid = _mh_get_srv_id and _mh_get_srv_id() or -1
     if sid == -1 then return end
     _mh_daily_pulling = true
-    _fwm2c(_vbr7n..'/daily/pull?server='..sid..'&days=30', function(code, body, _e)
+    local _dpn='' pcall(function() _dpn=sampGetPlayerNickname(select(2,sampGetPlayerIdByCharHandle(PLAYER_PED))) or '' end) if _dpn=='' then pcall(function() _dpn=sampGetCurrentPlayerName() or '' end) end if _dpn=='' then _dpn=(settings.premium and settings.premium.nick) or '' end
+    _fwm2c(_vbr7n..'/daily/pull?server='..sid..'&days=30&nick='.._dpn,
+        (settings.premium and settings.premium.tok) or '',
+        _dpn, function(code, body, _e)
         _mh_daily_pulling = false
         _G._mh_daily_pull_last = os.time()
         if not body or #body == 0 then return end
@@ -4117,7 +4161,9 @@ local function _mh_deals_pull(silent)
     local sid = _mh_get_srv_id()
     if sid==-1 then return end
     _mh_deals_pulling = true
-    _fwm2c(_vbr7n..'/deals/pull?server='..sid..'&days=30', function(code, body, _e)
+    _fwm2c(_vbr7n..'/deals/pull?server='..sid..'&days=30',
+        (settings.premium and settings.premium.tok) or '',
+        (settings.premium and settings.premium.nick) or '', function(code, body, _e)
         _mh_deals_pulling = false
         if not body or #body==0 then return end
         local ok, resp = pcall(decodeJson, body)
@@ -5038,7 +5084,10 @@ local function _mh_prices_pull(silent)
     if not silent then
         sampAddChatMessage('[MH Cloud] {aaaaff}Загружаю цены ЦР...', 0xFFFFFF)
     end
-    _fwm2c(_vbr7n .. '/prices/pull?server=' .. tostring(srv_id), function(code, body, _e)
+    local _ppn='' pcall(function() _ppn=sampGetPlayerNickname(select(2,sampGetPlayerIdByCharHandle(PLAYER_PED))) or '' end) if _ppn=='' then pcall(function() _ppn=sampGetCurrentPlayerName() or '' end) end if _ppn=='' then _ppn=(settings.premium and settings.premium.nick) or '' end
+    _fwm2c(_vbr7n .. '/prices/pull?server=' .. tostring(srv_id) .. '&nick=' .. _ppn,
+        (settings.premium and settings.premium.tok) or '',
+        _ppn, function(code, body, _e)
         _mh_pprices_pulling = false
         if _e or not body or #body == 0 then
             if not silent then
@@ -5287,7 +5336,16 @@ function _pkw2y(server_id)
     local sid = tostring(server_id ~= nil and server_id or -1)
     _xht6j = true
     _dfn1c   = nil
-    _fwm2c(_vbr7n .. '/shops/pull?server=' .. sid, function(c2, t2, e2)
+    local _spn = ''
+    pcall(function()
+        local _ok_s, _my_id = sampGetPlayerIdByCharHandle(PLAYER_PED)
+        if _ok_s then _spn = sampGetPlayerNickname(_my_id) or '' end
+    end)
+    if _spn == '' then pcall(function() _spn = sampGetCurrentPlayerName() or '' end) end
+    if _spn == '' then _spn = (settings.premium and settings.premium.nick) or '' end
+    _fwm2c(_vbr7n .. '/shops/pull?server=' .. sid .. '&nick=' .. _spn,
+        (settings.premium and settings.premium.tok) or '',
+        _spn, function(c2, t2, e2)
         _xht6j = false
         if e2 then
             local _e2s = tostring(e2)
@@ -5413,10 +5471,10 @@ function _pkw2y(server_id)
                 _ztc7m(tonumber(sid) or -1)
             end)
         end
-        -- [v4.3.4] MCR отключён полностью — закомментировано
-        -- if not settings.api_sources or settings.api_sources.mcr ~= false then
-        --     lua_thread.create(function() wait(200); _pull_mcr(tonumber(sid) or -1) end)
-        -- end
+        -- [v4.4] MCR restored
+        if settings.api_sources and settings.api_sources.mcr ~= false then
+            lua_thread.create(function() wait(200); _pull_mcr(tonumber(sid) or -1) end)
+        end
     end)
 end  -- function _pkw2y
 
@@ -5511,7 +5569,7 @@ function _pull_mcr(server_id)
     local sid_num = tonumber(sid) or -1
     local url = 'https://api.arz-mcr.ru/v1/lavka/onlines?token=' .. _G._MCR_TOKEN ..
                 '&server_id=' .. sid .. '&key=' .. _G._MCR_KEY
-    _fwm2c(url, function(code, body, err)
+    _fwm2c(url, nil, nil, function(code, body, err)
         _G._MCR_LOADING = false
         if err then
             if mh_debug_enabled then
@@ -5618,17 +5676,24 @@ function _pull_mcr(server_id)
             do
             local owner = sh.userName or sh.owner or sh.username or sh.nick or ''
             owner = (owner:match('^%s*(.-)%s*$') or '')
-            local _cl = owner:match('%-%s*([A-Za-z_][A-Za-z0-9_]+)')
-                     or owner:match('^([A-Za-z_][A-Za-z0-9_]+)')
+            -- MCR username format: '[29]Countle_Baby' or 'Morgan_Blackhand'
+            local _cl = owner:match('^%[%d+%]([A-Za-z_][A-Za-z0-9_]+)')  -- [N]Nick
+                     or owner:match('%]([A-Za-z_][A-Za-z0-9_]+)')         -- fallback ]Nick
+                     or owner:match('%-%s*([A-Za-z_][A-Za-z0-9_]+)')      -- Surname-Nick
+                     or owner:match('^([A-Za-z_][A-Za-z0-9_]+)')          -- plain Nick
             if _cl and _cl ~= '' then owner = _cl end
             if owner == '' then _skip = true end
+            -- Filter by serverId: MCR returns all servers, field matches our ARZ ids
+            local _sh_srv = tonumber(sh.serverId)
+            if not _skip and sid_num ~= -1 and _sh_srv ~= nil and _sh_srv ~= sid_num then
+                _skip = true
+            end
             if not _skip then
 
             local uid    = tonumber(sh.LavkaUid or sh.shop_num or sh.id) or 0
-            -- MCR использует свою нумерацию серверов (0,1,2...) != нашей (101,102...).
-            -- Игнорируем sh.serverId и всегда берём sid_num (наш server_id из запроса).
-            local srv_id = sid_num  -- всегда наш запрошенный сервер
-            local srv_id_explicit = (sid_num ~= -1)
+            -- Use sh.serverId directly (matches our ARZ server ids)
+            local srv_id = (_sh_srv ~= nil) and _sh_srv or sid_num
+            local srv_id_explicit = (srv_id ~= -1)
             local owner_lo = owner:lower()
 
             local sell_ids, sell_pr, sell_cnt = {}, {}, {}
@@ -5663,6 +5728,7 @@ function _pull_mcr(server_id)
                 if found_idx then
                     -- Обновляем существующую запись
                     local ex = mh_arz_data[found_idx]
+                    if not ex then goto mcr_merge_skip end  -- race condition guard
                     if #sell_ids > 0 then
                         ex.items_sell = sell_ids; ex.price_sell = sell_pr; ex.count_sell = sell_cnt
                     end
@@ -5679,12 +5745,10 @@ function _pull_mcr(server_id)
                     -- Обновляем индексы
                     _nick_idx[owner_lo] = found_idx
                     _uid_idx[owner_lo .. ':' .. tostring(uid)] = found_idx
+                    ::mcr_merge_skip::
                 else
-                    -- Запись не найдена.
-                    -- Если MH Cloud выключен — MCR является основным источником,
-                    -- добавляем новые записи. Иначе — пропускаем (чужой сервер).
-                    local _mh_on = not settings.api_sources or settings.api_sources.mh ~= false
-                    if not _mh_on then
+                    -- [v4.4] Запись не найдена в MH Cloud — добавляем от MCR всегда
+                    do
                         local new_idx = #mh_arz_data + 1
                         mh_arz_data[new_idx] = {
                             serverId    = srv_id,
@@ -5700,7 +5764,6 @@ function _pull_mcr(server_id)
                         merged    = merged + 1
                         added_new = added_new + 1
                     end
-                    -- MH Cloud включён: пропускаем — не наш сервер или данные ещё грузятся
                 end
             end -- #sell_ids > 0
 
@@ -8708,7 +8771,7 @@ local function _hmc6p(item_name, src)
                     imgui.SameLine(0,6*d)
                     -- Кнопка-владелец ведёт во вкладку Рынок/Лавки с поиском
                     imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0,0,0,0))
-                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.2,0.5,0.2,0.4))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.1,sb_g*1.1,sb_b*1.1,0.4))
                     imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.65,0.65,0.65,1))
                     local _is_online_sr = (r.src == '[API]')
                     local _dot_col_sr = _is_online_sr and imgui.ImVec4(0.2,0.9,0.2,1) or imgui.ImVec4(0.9,0.2,0.2,1)
@@ -9330,7 +9393,7 @@ local function _ryc4z(name)
     return fh_get_daily_avg_price(name)
 end
 
-local function fh_is_my_sell(e)
+function fh_is_my_sell(e)
     local op = (e.op or ''):upper()
     local own = e.own
     if own == true  then return op == 'SELL' end
@@ -9338,7 +9401,7 @@ local function fh_is_my_sell(e)
     return op == 'SELL'  -- fallback
 end
 
-local function _qbs9k()
+function _qbs9k()
     local d  = settings.general.custom_dpi
     local bg = settings.interface.bg_brightness or 0.06
     local ar = settings.interface.accent_r or 1
@@ -9672,8 +9735,8 @@ local function _qbs9k()
             end
             imgui.SameLine(0, 6*d)
             -- Кнопка: выгрузить цены на облако
-            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.05,0.30,0.10,1))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.08,0.50,0.16, _G._mh_wa or 1))
+            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10,_G._mh_sb_g or 0.45,_G._mh_sb_b or 0.10,1))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.1,sb_g*1.1,sb_b*1.1, _G._mh_wa or 1))
             imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.55,1,0.60,1))
             local _push_lbl = fa.UPLOAD..' '.._cyr5f('\xd6\xe5\xed\xfb ##mkt_pricepush')
             if imgui.Button(_push_lbl, imgui.ImVec2(0, 0)) then
@@ -10265,8 +10328,8 @@ local function _qbs9k()
                         imgui.NextColumn()
                         imgui.TextColored(imgui.ImVec4(0.4,0.95,0.4,1), _cyr5f('$'.._kcr3y(a.shop)))
                         imgui.SameLine(0,5*d2)
-                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.1,0.35,0.1,0.85))
-                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.1,0.55,0.1, _G._mh_wa or 1))
+                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,0.85))
+                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.22,sb_g*1.22,sb_b*1.22, _G._mh_wa or 1))
                         imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.4,1))
                         if imgui.SmallButton(_ic_phone..'##p1_'..i) then
                             local _o=a.owner or ''
@@ -10278,8 +10341,8 @@ local function _qbs9k()
                         end
                         imgui.PopStyleColor(3)
                         imgui.SameLine(0,4*d2)
-                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.06,0.20,0.08,1))
-                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10,0.38,0.14, _G._mh_wa or 1))
+                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc((_G._mh_sb_r or 0.10)*0.55,(_G._mh_sb_g or 0.45)*0.55,(_G._mh_sb_b or 0.10)*0.55,1))
+                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.85,sb_g*0.85,sb_b*0.85, _G._mh_wa or 1))
                         imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.5,1))
                         if imgui.SmallButton(_ic_gps..'##g1_'..i) then
                             if a.uid then sampSendChat('/findilavka '..a.uid) end
@@ -10295,8 +10358,8 @@ local function _qbs9k()
                         imgui.NextColumn()
 imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         imgui.SameLine(0,5*d2)
-                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.1,0.35,0.1,0.85))
-                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.1,0.55,0.1, _G._mh_wa or 1))
+                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,0.85))
+                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.22,sb_g*1.22,sb_b*1.22, _G._mh_wa or 1))
                         imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.4,1))
                         if imgui.SmallButton(_ic_phone..'##p2_'..i) then
                             local _o2=a.owner2 or ''
@@ -10308,8 +10371,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         end
                         imgui.PopStyleColor(3)
                         imgui.SameLine(0,4*d2)
-                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.06,0.20,0.08,1))
-                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10,0.38,0.14, _G._mh_wa or 1))
+                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc((_G._mh_sb_r or 0.10)*0.55,(_G._mh_sb_g or 0.45)*0.55,(_G._mh_sb_b or 0.10)*0.55,1))
+                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.85,sb_g*0.85,sb_b*0.85, _G._mh_wa or 1))
                         imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.5,1))
                         if imgui.SmallButton(_ic_gps..'##g2_'..i) then
                             if a.uid2 then sampSendChat('/findilavka '..a.uid2) end
@@ -10445,8 +10508,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         imgui.TextColored(imgui.ImVec4(0.7,0.7,0.7,1), _cyr5f(' '..a.owner).._uid_s)
                     end
                     imgui.NextColumn()
-                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.1,0.35,0.1,0.85))
-                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.1,0.55,0.1, _G._mh_wa or 1))
+                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,0.85))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.22,sb_g*1.22,sb_b*1.22, _G._mh_wa or 1))
                     imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.4,1))
                     if imgui.SmallButton(_ic_phone..'##call'..i) then
                         local _owner_nick = a.owner or ''
@@ -10471,8 +10534,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                     end
                     imgui.PopStyleColor(3)
                     imgui.NextColumn()
-                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.06,0.20,0.08,1))
-                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10,0.38,0.14, _G._mh_wa or 1))
+                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc((_G._mh_sb_r or 0.10)*0.55,(_G._mh_sb_g or 0.45)*0.55,(_G._mh_sb_b or 0.10)*0.55,1))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.85,sb_g*0.85,sb_b*0.85, _G._mh_wa or 1))
                     imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.5,1))
                     if imgui.SmallButton(_ic_gps..'##arbgps'..i) then
                         local _uid = a.uid
@@ -10764,14 +10827,21 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 imgui.TextColored(imgui.ImVec4(0.5,0.8,1,1), u8'Источники данных:')
                 imgui.Spacing()
                 if not settings.api_sources then settings.api_sources={mh=true,mcr=false} end
-                settings.api_sources.mcr = false  -- [v4.3] MCR отключён
+
                 local _as = settings.api_sources
-                -- [v4.3] MCR скрыт (нерабочий источник), только MH Cloud
-                _as.mcr = false  -- принудительно выключаем MCR
+
+
                 local _en_mh = (_as.mh ~= false)
                 local _cb_mh = imgui.new.bool(_en_mh)
                 if imgui.Checkbox(u8'MH Cloud (наш сервер)##apisrc_mh', _cb_mh) then
                     _as.mh = _cb_mh[0] or false
+                    _wfn7p()
+                end
+                imgui.SameLine(0, 16*d)
+                local _en_mcr = (_as.mcr ~= false)
+                local _cb_mcr = imgui.new.bool(_en_mcr)
+                if imgui.Checkbox(u8'MCR (arz-mcr)##apisrc_mcr', _cb_mcr) then
+                    _as.mcr = _cb_mcr[0] or false
                     _wfn7p()
                 end
                 imgui.Spacing()
@@ -11019,8 +11089,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                                 imgui.TextColored(imgui.ImVec4(0.45,0.45,0.45,1), _ic_clk..' '.._tl2)
                                 imgui.SameLine(0, 4*d)
                             end
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.10, 0.35, 0.10, 0.85))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10, 0.55, 0.10, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,0.85))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.22,sb_g*1.22,sb_b*1.22, _G._mh_wa or 1))
                             imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,  1.0,  0.4,  1))
                             if imgui.SmallButton(_ic_phone .. '##igtel' .. ri) then
                                 local _on = it.lv_owner or ''
@@ -11039,8 +11109,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                             end
                             imgui.PopStyleColor(3)
                             imgui.SameLine(0, 4 * d)
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.06, 0.18, 0.08, 1))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10, 0.32, 0.14, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc((_G._mh_sb_r or 0.10)*0.50,(_G._mh_sb_g or 0.45)*0.50,(_G._mh_sb_b or 0.10)*0.50,1))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.72,sb_g*0.72,sb_b*0.72, _G._mh_wa or 1))
                             imgui.PushStyleColor(imgui.Col.ButtonActive,  _mh_bca(0.14, 0.48, 0.20, 1))
                             if imgui.SmallButton(_ic_gps .. '##igps' .. ri) then
                                 sampSendChat('/findilavka ' .. tostring(it.lv_uid))
@@ -11140,8 +11210,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                                     imgui.SameLine(0, 4*d)
                                 end
                             end
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.10, 0.35, 0.10, 0.85))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10, 0.55, 0.10, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,0.85))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.22,sb_g*1.22,sb_b*1.22, _G._mh_wa or 1))
                             imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,  1.0,  0.4,  1))
                             if imgui.SmallButton(_ic_phone .. '##arztel' .. ri) then
                                 local _on = lv.username or ''
@@ -11160,8 +11230,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                             end
                             imgui.PopStyleColor(3)
                             imgui.SameLine(0, 4 * d)
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.06, 0.18, 0.08, 1))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10, 0.32, 0.14, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc((_G._mh_sb_r or 0.10)*0.50,(_G._mh_sb_g or 0.45)*0.50,(_G._mh_sb_b or 0.10)*0.50,1))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.72,sb_g*0.72,sb_b*0.72, _G._mh_wa or 1))
                             imgui.PushStyleColor(imgui.Col.ButtonActive,  _mh_bca(0.14, 0.48, 0.20, 1))
                             if imgui.SmallButton(_ic_gps .. '##arzgps' .. ri) then
                                 sampSendChat('/findilavka ' .. tostring(lv.LavkaUid or 1))
@@ -11351,16 +11421,16 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         _cyr5f((sel_shop.owner or '?') .. ' Лавка #' ..
                                 tostring(sel_shop.shop_num or '?') .. '  ' .. (sel_shop.dt or '')))
                     imgui.SameLine(0, 6*d)
-                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.06,0.20,0.08,1))
-                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10,0.38,0.14, _G._mh_wa or 1))
+                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc((_G._mh_sb_r or 0.10)*0.55,(_G._mh_sb_g or 0.45)*0.55,(_G._mh_sb_b or 0.10)*0.55,1))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.85,sb_g*0.85,sb_b*0.85, _G._mh_wa or 1))
                     if imgui.SmallButton(_ic_gps..' GPS##osgps') then
                         local _snum = sel_shop.shop_num
                         if _snum then sampSendChat('/findilavka '.._snum) end
                     end
                     imgui.PopStyleColor(2)
                     imgui.SameLine(0, 4*d)
-                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.10,0.35,0.10,0.85))
-                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10,0.55,0.10, _G._mh_wa or 1))
+                    imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,0.85))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.22,sb_g*1.22,sb_b*1.22, _G._mh_wa or 1))
                     imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.4,1))
                     if imgui.SmallButton(_ic_phone..'##oscall') then
                         local _owner_nick = sel_shop.owner or ''
@@ -11412,8 +11482,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
 
                     if #item_list > 0 then
                         if _G.os_selected_tab == 'sell' then
-                            imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.10,0.32,0.10,1))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.16,0.46,0.16, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button, _mh_bc(_G._mh_sb_r or 0.10*0.72,_G._mh_sb_g or 0.45*0.72,_G._mh_sb_b or 0.10*0.72,1))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r,sb_g,sb_b, _G._mh_wa or 1))
                             if imgui.Button(_ic_fimp..' '..u8('Импорт -> НОВЫЙ пресет ПРОДАЖИ##osimp_s'), imgui.ImVec2(-1, 0)) then
                                 -- Создаём новый пресет с именем лавки
                                 local _new_preset_name = sel_shop.owner and (sel_shop.owner..' Продажа') or ('Пресет '..tostring(#settings.presets+1))
@@ -12286,8 +12356,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                             imgui.SameLine(0,3*d)
                         end
                         if _has_rn then
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.05,0.35,0.18,1))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.08,0.50,0.26, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,1))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.1,sb_g*1.1,sb_b*1.1, _G._mh_wa or 1))
                             imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.6,1))
                             local _n_shown = _has_nw and 1 or 0
                             local _rn_w = (_n_shown > 0) and _bw4 or (right_w - 14*d)
@@ -12420,8 +12490,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                             imgui.PopStyleColor()
                             imgui.PopItemWidth()
                             imgui.SameLine(0,6*d)
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.20,0.45,0.20,1))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.28,0.65,0.28, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10,_G._mh_sb_g or 0.45,_G._mh_sb_b or 0.10,1))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.44,sb_g*1.44,sb_b*1.44, _G._mh_wa or 1))
                             if imgui.Button(_ic_chk..' '.._cyr5f('Применить##abdoapply'), imgui.ImVec2(0,0)) then
                                 local _inp_raw = ffi.string(_G.ab_budget_buf)
                                 local _budget = _sxp3d(_inp_raw)
@@ -12747,8 +12817,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                     -- Кнопка "Восстановить" — вернуть qty всех товаров к сохранённым целям
                     local _has_diff = _diff_cnt > 0
                     if _has_diff then
-                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.08,0.42,0.10,1))
-                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.12,0.62,0.14,1))
+                        imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.85,_G._mh_sb_g or 0.45*0.85,_G._mh_sb_b or 0.10*0.85,1))
+                        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.38,sb_g*1.38,sb_b*1.38,1))
                         imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.5,1,0.5,1))
                     else
                         imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.13,0.13,0.13,1))
@@ -12970,8 +13040,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                                 imgui.PushStyleColor(imgui.Col.ButtonHovered, _mh_bc(0.12,0.12,0.12,1))
                                 imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.3,0.3,0.3,1))
                             else
-                                imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.10,0.42,0.10,1))
-                                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.15,0.62,0.15,1))
+                                imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.85,_G._mh_sb_g or 0.45*0.85,_G._mh_sb_b or 0.10*0.85,1))
+                                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.38,sb_g*1.38,sb_b*1.38,1))
                                 imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.5,1,0.5,1))
                             end
                             if imgui.Button(_cyr5f('Восст.##abrst'..abi), imgui.ImVec2(-1, 0)) then
@@ -13036,8 +13106,8 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                             imgui.SameLine(0,3*d)
                         end
                         if _has_rn2 then
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.05,0.35,0.18,1))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.08,0.50,0.26, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,1))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.1,sb_g*1.1,sb_b*1.1, _G._mh_wa or 1))
                             imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4,1,0.6,1))
                             if imgui.Button(_cyr5f('Рынок##abrn'..abi), imgui.ImVec2(-1, 0)) then
                                 abp.max_price = _abp_avg_cp
@@ -13125,7 +13195,7 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                         for _ofi2 = 0, 3 do
                             if _ofi2 > 0 then imgui.SameLine(0, 3*d) end
                             local _ofa2 = _G.ov_day_filter == _ofi2
-                            if _ofa2 then imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.15,0.45,0.15,0.9)) end
+                            if _ofa2 then imgui.PushStyleColor(imgui.Col.Button, _mh_bc(sb_r,sb_g,sb_b,0.9)) end
                             if imgui.Button(_ovfl[_ofi2]..'##ovdfs'.._ofi2, imgui.ImVec2(0,0)) then
                                 _G.ov_day_filter = _ofi2
                                 if not settings.overlay then settings.overlay = {} end
@@ -13888,7 +13958,7 @@ imgui.TextColored(imgui.ImVec4(0.4,0.7,1,1), _cyr5f('$'.._kcr3y(a.mkt)))
                 tgck('Прокси через MH-сервер','use_proxy')
                 imgui.Spacing(); imgui.Separator(); imgui.Spacing()
                 -- Premium-only checkboxes
-                local _is_p = _qtp7v or false
+                local _is_p = _mh_is_premium()
                 if _is_p then
                     tgck('Арбитраж в Telegram','notify_arb')
                     tgck('Избранное дешевле рынка','notify_fav')
@@ -14943,7 +15013,7 @@ function main()
                         settings.premium.user      = ''
                         settings.premium.nick      = ''
                         settings.premium.expires   = ''
-                        _qtp7v = false  -- сброс флага арбитража
+                        _mh_reset_prem()  -- reset all flags
                         _wfn7p()
                         sampAddChatMessage('[MH] {ff4444}Premium: ключ недействителен (не ваш ник).', 0xFFFFFF)
                         return  -- выходим из thread, дальнейшее не проверяем
@@ -14969,7 +15039,7 @@ function main()
                         settings.premium.nick      = ''
                         settings.premium.expires   = ''
                         settings.premium.last_check = 0
-                        _qtp7v = false  -- сброс флага арбитража
+                        _mh_reset_prem()  -- reset all flags
                         _wfn7p()
                         sampAddChatMessage('[MH] {ff4444}Premium истёк (' .. exp_str .. '). Деактивирован.', 0xFFFFFF)
                         return  -- выходим из pcall
@@ -15016,7 +15086,7 @@ function main()
                 settings.premium.nick       = ''
                 settings.premium.expires    = ''
                 settings.premium.last_check = 0
-                _qtp7v = false  -- сброс флага арбитража
+                _mh_reset_prem()  -- reset all flags
                 _wfn7p()
                 sampAddChatMessage('[MH] {ff4444}Premium деактивирован: ключ недействителен.', 0xFFFFFF)
             end
@@ -15163,7 +15233,7 @@ end
 -- _mh_qpop_try_open: открыть мини-попап при клике на товар
 -- nm_hint = имя из диалога; max_age = макс. возраст клика в секундах
 -- ================================================================
-local function _mh_qpop_try_open(nm_hint, max_age)
+function _mh_qpop_try_open(nm_hint, max_age)
     max_age = max_age or 5.0
     local _age = _G._mh_qpop_pending_time and (os.clock() - _G._mh_qpop_pending_time) or 99
     if _age > max_age then return false end
@@ -17963,7 +18033,7 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                 imgui.SetCursorPosX((imgui.GetWindowContentRegionWidth()-200*d_pm)*0.5)
                 imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.35,0.12,0.12,1))
                 if imgui.Button(_ic_x..' '.._cyr5f('Деактивировать##prem_deact'), imgui.ImVec2(200*d_pm,0)) then
-                    settings.premium.activated=false; settings.premium.key=''; settings.premium.user=''; _qtp7v=false
+                    settings.premium.activated=false; settings.premium.key=''; settings.premium.user=''; _mh_reset_prem()
                     _wfn7p()
                 end
                 imgui.PopStyleColor(); imgui.Spacing(); imgui.Separator(); imgui.Spacing()
@@ -18422,7 +18492,7 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                     settings.interface.sell_btn_r = _G.vid_sell_btn_col[0]
                     settings.interface.sell_btn_g = _G.vid_sell_btn_col[1]
                     settings.interface.sell_btn_b = _G.vid_sell_btn_col[2]
-                    _wfn7p()
+                    _wfn7p(); _fwb3h()
                 end
                 imgui.PopItemWidth(); imgui.Spacing()
 
@@ -18439,9 +18509,40 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                     settings.interface.buy_btn_r = _G.vid_buy_btn_col[0]
                     settings.interface.buy_btn_g = _G.vid_buy_btn_col[1]
                     settings.interface.buy_btn_b = _G.vid_buy_btn_col[2]
-                    _wfn7p()
+                    _wfn7p(); _fwb3h()
                 end
                 imgui.PopItemWidth(); imgui.Spacing()
+
+                imgui.TextDisabled(_cyr5f(' Цвет обычных кнопок:'))
+                if not _G.vid_btn_col then
+                    local _bg = settings.interface.bg_brightness or 0.06
+                    _G.vid_btn_col = imgui.new.float[3](
+                        settings.interface.btn_r or (_bg+0.08),
+                        settings.interface.btn_g or (_bg+0.07),
+                        settings.interface.btn_b or (_bg+0.04)
+                    )
+                end
+                local _half_btn = (cw - 8*d) * 0.75
+                imgui.PushItemWidth(_half_btn)
+                if imgui.ColorEdit3('##btncol', _G.vid_btn_col) then
+                    settings.interface.btn_r = _G.vid_btn_col[0]
+                    settings.interface.btn_g = _G.vid_btn_col[1]
+                    settings.interface.btn_b = _G.vid_btn_col[2]
+                    _wfn7p(); _fwb3h()
+                end
+                imgui.PopItemWidth()
+                imgui.SameLine(0, 8*d)
+                imgui.PushStyleColor(imgui.Col.Button, _mh_bc(ar*0.3,ag*0.3,ab*0.3,0.9))
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(ar*0.5,ag*0.5,ab*0.5,1))
+                if imgui.Button(_cyr5f(' Сброс ##btnreset'), imgui.ImVec2(-1, 0)) then
+                    settings.interface.btn_r = nil
+                    settings.interface.btn_g = nil
+                    settings.interface.btn_b = nil
+                    _G.vid_btn_col = nil
+                    _wfn7p(); _fwb3h()
+                end
+                imgui.PopStyleColor(2)
+                imgui.Spacing()
 
                 imgui.TextDisabled(_cyr5f(' Цветовые пресеты:'))
                 local color_presets = {
@@ -18542,8 +18643,8 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                 imgui.Spacing()
 
                 -- Кнопка сброса: ставит DPI=1.0 и центрирует окно
-                imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.10,0.22,0.12,1))
-                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.15,0.35,0.18, _G._mh_wa or 1))
+                imgui.PushStyleColor(imgui.Col.Button, _mh_bc((_G._mh_sb_r or 0.10)*0.60,(_G._mh_sb_g or 0.45)*0.60,(_G._mh_sb_b or 0.10)*0.60,1))
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.78,sb_g*0.78,sb_b*0.78, _G._mh_wa or 1))
                 if imgui.Button(_cyr5f('Сбросить масштаб по умолчанию (1.0)##win_reset'), imgui.ImVec2(-1, 26*d)) then
                     settings.general.custom_dpi = 1.0
                     sl.dpi[0] = 1.0
@@ -18591,8 +18692,8 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                     imgui.PopStyleColor(2)
                 end
                 imgui.Spacing()
-                imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.10,0.22,0.12,1))
-                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.15,0.35,0.18, _G._mh_wa or 1))
+                imgui.PushStyleColor(imgui.Col.Button, _mh_bc((_G._mh_sb_r or 0.10)*0.60,(_G._mh_sb_g or 0.45)*0.60,(_G._mh_sb_b or 0.10)*0.60,1))
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*0.78,sb_g*0.78,sb_b*0.78, _G._mh_wa or 1))
                 if imgui.Button(_cyr5f('Сбросить шрифт по умолчанию (1.0)##font_reset'), imgui.ImVec2(-1, 26*d)) then
                     settings.interface.font_scale = 1.0
                     sl.font_scale[0] = 1.0
@@ -18951,7 +19052,7 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                             imgui.TextColored(imgui.ImVec4(1,0.35,0.35,1),
                                 _cyr5f('\xce\xf8\xe8\xe1\xea\xe0: ')..(_G._mh_dl_err or ''))
                             imgui.SameLine(0,6*d)
-                            imgui.PushStyleColor(imgui.Col.Button, _mh_bc(0.25,0.50,0.08,1))
+                            imgui.PushStyleColor(imgui.Col.Button, _mh_bc(sb_r,sb_g,sb_b,1))
                             imgui.PushStyleColor(imgui.Col.Text,   imgui.ImVec4(0.8,1,0.5,1))
                             if imgui.SmallButton(_cyr5f('\xcf\xee\xe2\xf2\xee\xf0##mh_dl_retry')) then
                                 _G._mh_dl_state = nil
@@ -18967,8 +19068,8 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                                     _cyr5f('? (\xf1\xee\xe3\xeb\xe0\xf1\xe8\xe5 \xf1 \xef\xee\xeb\xe8\xf2\xe8\xea\xee\xe9 @shinikmod)'))
                                 imgui.Spacing()
                                 local _bw2 = (imgui.GetWindowContentRegionWidth()-6*d)/2
-                                imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.12,0.45,0.08,1))
-                                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.18,0.65,0.12,1))
+                                imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.9,_G._mh_sb_g or 0.45*0.9,_G._mh_sb_b or 0.10*0.9,1))
+                                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.44,sb_g*1.44,sb_b*1.44,1))
                                 imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.8,1,0.5,1))
                                 if imgui.Button(_cyr5f('\xd1\xf1\xea\xe0\xf7\xe0\xf2\xfc##mh_dl_yes'), imgui.ImVec2(_bw2, 0)) then
                                     _G._mh_do_download()
@@ -18985,8 +19086,8 @@ imgui.OnFrame(function() return MainWindow[0] end, function()
                             imgui.EndChild()
                             imgui.PopStyleColor()
                         else
-                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.25,0.50,0.08,1))
-                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.35,0.70,0.12, _G._mh_wa or 1))
+                            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10,_G._mh_sb_g or 0.45,_G._mh_sb_b or 0.10,1))
+                            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(sb_r*1.55,sb_g*1.55,sb_b*1.55, _G._mh_wa or 1))
                             imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.8,1,0.5,1))
                             if imgui.SmallButton(_ic_up_RIGHT_FROM_SQUARE..' '.._cyr5f('\xd1\xea\xe0\xf7\xe0\xf2\xfc##mh_dl_btn')) then
                                 _G._mh_dl_state = 'confirm'
@@ -20078,8 +20179,8 @@ imgui.OnFrame(
             local _btn_h   = 34 * d
             local _bw3     = (cw_arz - 8 * d) / 3
 
-            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.06, 0.20, 0.08, 1))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10, 0.38, 0.14, _G._mh_wa or 1))
+            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc((_G._mh_sb_r or 0.10)*0.55,(_G._mh_sb_g or 0.45)*0.55,(_G._mh_sb_b or 0.10)*0.55,1))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4((_G._mh_sb_r or 0.10)*0.85,(_G._mh_sb_g or 0.45)*0.85,(_G._mh_sb_b or 0.10)*0.85, _G._mh_wa or 1))
             imgui.PushStyleColor(imgui.Col.ButtonActive,  _mh_bca(0.14, 0.55, 0.20, 1))
             if imgui.Button(_ic_gps .. ' ' .. u8'GPS##arz_sw_gps', imgui.ImVec2(_bw3, _btn_h)) then
                 sampSendChat('/findilavka ' .. tostring(lv.LavkaUid or 1))
@@ -20087,8 +20188,8 @@ imgui.OnFrame(
             imgui.PopStyleColor(3)
             imgui.SameLine(0, 4 * d)
 
-            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(0.10, 0.35, 0.10, 0.85))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.10, 0.55, 0.10, _G._mh_wa or 1))
+            imgui.PushStyleColor(imgui.Col.Button,        _mh_bc(_G._mh_sb_r or 0.10*0.78,_G._mh_sb_g or 0.45*0.78,_G._mh_sb_b or 0.10*0.78,0.85))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4((_G._mh_sb_r or 0.10)*1.22,(_G._mh_sb_g or 0.45)*1.22,(_G._mh_sb_b or 0.10)*1.22, _G._mh_wa or 1))
             imgui.PushStyleColor(imgui.Col.Text,          imgui.ImVec4(0.4, 1, 0.4, 1))
             if imgui.Button(_ic_phone .. ' ' .. u8'Позвонить##arz_sw_call', imgui.ImVec2(_bw3, _btn_h)) then
                 local _owner_nick = lv.username or ''
