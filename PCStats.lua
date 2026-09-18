@@ -51,6 +51,289 @@ local inicfg = safeRequire("inicfg")
 local ffi    = safeRequire("ffi")
 
 -- ============================================================
+--  САМООБНОВЛЕНИЕ (проверка версии + автозагрузка с GitHub)
+-- ------------------------------------------------------------
+-- Источник тот же, что и у остальных скриптов линейки (см.
+-- MarketLauncher): репозиторий Market88888/CR-Helpers, файл
+-- PCStats.lua. Порядок опроса источников идентичен —
+-- GitHub Releases (tag_name) → tags API → raw-файл из веток
+-- main/master, берём первый, что отдал корректный script_version().
+-- Команда в чате: /pcsupdate — проверить; /pcsupdate install —
+-- скачать актуальную версию и перезаписать этим файлом себя же,
+-- затем попытаться горячо перезагрузиться через script:reload()
+-- (тот же метод, что уже использует кнопка "Перезагрузить скрипт").
+-- ============================================================
+do
+local PCS_UPD = {
+    github_user = 'Market88888',
+    github_repo = 'CR-Helpers',
+    file        = 'PCStats.lua',
+}
+PCS_UPD.api_release = ('https://api.github.com/repos/%s/%s/releases/latest'):format(PCS_UPD.github_user, PCS_UPD.github_repo)
+PCS_UPD.api_tags    = ('https://api.github.com/repos/%s/%s/tags'):format(PCS_UPD.github_user, PCS_UPD.github_repo)
+PCS_UPD.raw_main    = ('https://raw.githubusercontent.com/%s/%s/main/%s'):format(PCS_UPD.github_user, PCS_UPD.github_repo, PCS_UPD.file)
+PCS_UPD.raw_master  = ('https://raw.githubusercontent.com/%s/%s/master/%s'):format(PCS_UPD.github_user, PCS_UPD.github_repo, PCS_UPD.file)
+PCS_UPD.release_dl  = ('https://github.com/%s/%s/releases/latest/download/%s'):format(PCS_UPD.github_user, PCS_UPD.github_repo, PCS_UPD.file)
+
+local _effil = safeRequire('effil')
+
+local _updState = {
+    checking   = false,
+    installing = false,
+    ver_remote = nil,
+    available  = false,
+    last_check = 0,
+}
+
+local function _updNormVer(v)
+    if not v or v == '' then return nil end
+    return tostring(v):gsub('^[vV]', '')
+end
+
+local function _updVerLt(a, b)
+    local function parts(s)
+        local t = {}
+        for p in (s or '0'):gmatch('%d+') do t[#t + 1] = tonumber(p) end
+        return t
+    end
+    local pa, pb = parts(a), parts(b)
+    for i = 1, math.max(#pa, #pb) do
+        local ai, bi = pa[i] or 0, pb[i] or 0
+        if ai < bi then return true end
+        if ai > bi then return false end
+    end
+    return false
+end
+
+local function _updVerFromBody(body)
+    if not body or body == '' then return nil end
+    return _updNormVer(body:match('script_version%s*%(%s*["\']([^"\']+)["\']')
+        or body:match('SCRIPT_VER%s*=%s*["\']([^"\']+)["\']'))
+end
+
+local function _updParseRelease(body)
+    return _updNormVer(body and body:match('"tag_name"%s*:%s*"([^"]+)"'))
+end
+
+local function _updParseFirstTag(body)
+    return _updNormVer(body and body:match('"name"%s*:%s*"([^"]+)"'))
+end
+
+local function _updIsValidBody(body)
+    if type(body) ~= 'string' or #body < 500 then return false end
+    if body:find('<!DOCTYPE html', 1, true) or body:find('<html', 1, true) then return false end
+    if body:find('Not Found', 1, true) and #body < 400 then return false end
+    return body:find('script_name%s*%(') ~= nil
+end
+
+local function _updWriteAtomic(path, content)
+    local tmp = path .. '.tmp'
+    local f = io.open(tmp, 'wb')
+    if not f then return false end
+    f:write(content)
+    f:close()
+    os.remove(path)
+    if os.rename(tmp, path) then return true end
+    local rf = io.open(tmp, 'rb')
+    local wf = io.open(path, 'wb')
+    if not rf or not wf then
+        if rf then rf:close() end
+        if wf then wf:close() end
+        os.remove(tmp)
+        return false
+    end
+    wf:write(rf:read('*a'))
+    rf:close(); wf:close()
+    os.remove(tmp)
+    return true
+end
+
+local function _updHttpFetch(url)
+    if not _effil then return nil end
+    return _effil.thread(function(target)
+        local req = require('requests')
+        local function once(link, depth)
+            depth = depth or 0
+            if depth > 5 then
+                return false, { status_code = 0, text = '', error = 'redirect loop' }
+            end
+            local ok, response = pcall(req.request, 'GET', link, {
+                headers = {
+                    ['User-Agent'] = 'PCStats-AutoUpdate/1.0',
+                    ['Accept'] = 'application/vnd.github+json, application/octet-stream;q=0.9, text/plain;q=0.8, */*;q=0.7',
+                },
+                timeout = 20,
+            })
+            if not ok or not response then
+                return false, { status_code = 0, text = '', error = tostring(response or 'connect error') }
+            end
+            local code = tonumber(response.status_code) or 0
+            if code == 301 or code == 302 or code == 303 or code == 307 or code == 308 then
+                local loc = response.headers and (response.headers.Location or response.headers.location)
+                if loc and loc ~= '' then return once(loc, depth + 1) end
+            end
+            return true, { status_code = code, text = response.text or '', headers = response.headers or {}, error = nil }
+        end
+        return once(target, 0)
+    end)(url)
+end
+
+-- Идёт через уже переопределённый выше sampAddChatMessage (см. секцию
+-- "ФИКС КАРАКУЛЬ") — поэтому сообщение сразу дублируется и тостом.
+local function _updNotify(text, color)
+    pcall(sampAddChatMessage, (color or '{66ccff}') .. '[PC Stats] ' .. text, -1)
+end
+
+-- Проверка версии на GitHub. silent=true — тихая фоновая проверка
+-- (например, при старте скрипта): сообщение в чат появится, только
+-- если реально нашлось обновление; ошибки и "версия актуальна" в
+-- этом режиме не выводятся, чтобы не спамить при каждом заходе.
+function pcsCheckForUpdate(silent)
+    if _updState.checking or _updState.installing then return end
+    if not _effil then
+        if not silent then
+            _updNotify("\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20\xed\xe5\xe4\xee\xf1\xf2\xf3\xef\xed\xee\x3a\x20\xed\xe5\xf2\x20\xe1\xe8\xe1\xeb\xe8\xee\xf2\xe5\xea\xe8\x20\x65\x66\x66\x69\x6c", "{FF6666}")
+        end
+        return
+    end
+    _updState.checking = true
+    if not silent then
+        _updNotify("\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe9\x2e\x2e\x2e")
+    end
+
+    lua_thread.create(function()
+        local sources = {
+            { url = PCS_UPD.api_release, mode = 'release' },
+            { url = PCS_UPD.api_tags,    mode = 'tags'    },
+            { url = PCS_UPD.raw_main,    mode = 'raw'     },
+            { url = PCS_UPD.raw_master,  mode = 'raw'     },
+        }
+        for _, item in ipairs(sources) do
+            local thr = _updHttpFetch(item.url)
+            if thr then
+                for _ = 1, 180 do
+                    wait(100)
+                    local thread_state, thread_error = thr:status()
+                    if not thread_state or thread_state == 'canceled' or thread_state == 'failed' or thread_error then
+                        break
+                    end
+                    if thread_state == 'completed' then
+                        local ok, response = thr:get()
+                        if ok and response and tonumber(response.status_code) == 200 and response.text ~= '' then
+                            local remote_ver
+                            if item.mode == 'release' then
+                                remote_ver = _updParseRelease(response.text)
+                            elseif item.mode == 'tags' then
+                                remote_ver = _updParseFirstTag(response.text)
+                            else
+                                remote_ver = _updVerFromBody(response.text)
+                            end
+                            if remote_ver then
+                                _updState.checking = false
+                                _updState.ver_remote = remote_ver
+                                _updState.last_check = os.time()
+                                _updState.available = _updVerLt(SCRIPT_VER, remote_ver)
+                                if _updState.available then
+                                    _updNotify("\xe4\xee\xf1\xf2\xf3\xef\xed\xee\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20v" .. remote_ver ..
+                                        "\x2e\x20\xd3\xf1\xf2\xe0\xed\xee\xe2\xe8\xf2\xfc\x3a\x20\x2f\x70\x63\x73\x75\x70\x64\x61\x74\x65\x20\x69\x6e\x73\x74\x61\x6c\x6c", "{FFD700}")
+                                elseif not silent then
+                                    _updNotify("\xf3\xf1\xf2\xe0\xed\xee\xe2\xeb\xe5\xed\xe0\x20\xe0\xea\xf2\xf3\xe0\xeb\xfc\xed\xe0\xff\x20\xe2\xe5\xf0\xf1\xe8\xff\x20v" .. SCRIPT_VER, "{00FF88}")
+                                end
+                                return
+                            end
+                        end
+                        break
+                    end
+                end
+            end
+        end
+        _updState.checking = false
+        if not silent then
+            _updNotify("\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xef\xf0\xee\xe2\xe5\xf0\xe8\xf2\xfc\x20\xe2\xe5\xf0\xf1\xe8\xfe\x20\xed\xe0\x20\x47\x69\x74\x48\x75\x62", "{FF6666}")
+        end
+    end)
+end
+
+-- Скачивает актуальный файл с GitHub и перезаписывает им СЕБЯ САМОГО
+-- на диске (тот же путь, что вернёт thisScript().path), затем
+-- пробует горячую перезагрузку через штатный script:reload() —
+-- если в этой сборке MoonLoader его нет, откатывается на unload()
+-- с сообщением в чат, и игроку нужно будет запустить скрипт заново
+-- вручную (папка moonloader / F4)
+function pcsInstallUpdate()
+    if _updState.installing then
+        _updNotify("\xd3\xe6\xe5\x20\xe8\xe4\xb8\xf2\x20\xf3\xf1\xf2\xe0\xed\xee\xe2\xea\xe0\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff", "{FFAA00}")
+        return
+    end
+    if not _effil then
+        _updNotify("\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20\xed\xe5\xe4\xee\xf1\xf2\xf3\xef\xed\xee\x3a\x20\xed\xe5\xf2\x20\xe1\xe8\xe1\xeb\xe8\xee\xf2\xe5\xea\xe8\x20\x65\x66\x66\x69\x6c", "{FF6666}")
+        return
+    end
+    local ok, scr = pcall(thisScript)
+    local self_path = ok and scr and scr.path
+    if not self_path or self_path == '' then
+        _updNotify("\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xee\xef\xf0\xe5\xe4\xe5\xeb\xe8\xf2\xfc\x20\xef\xf3\xf2\xfc\x20\xea\x20\xf1\xe2\xee\xe5\xec\xf3\x20\xf4\xe0\xe9\xeb\xf3", "{FF6666}")
+        return
+    end
+
+    _updState.installing = true
+    _updNotify("\xcd\xe0\xf7\xe8\xed\xe0\xfe\x20\xf1\xea\xe0\xf7\xe8\xe2\xe0\xed\xe8\xe5\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff\x2e\x2e\x2e")
+
+    lua_thread.create(function()
+        local sources = {
+            { url = PCS_UPD.release_dl },
+            { url = PCS_UPD.raw_main   },
+            { url = PCS_UPD.raw_master },
+        }
+        for _, item in ipairs(sources) do
+            local thr = _updHttpFetch(item.url)
+            if thr then
+                for _ = 1, 260 do
+                    wait(120)
+                    local thread_state, thread_error = thr:status()
+                    if not thread_state or thread_state == 'canceled' or thread_state == 'failed' or thread_error then
+                        break
+                    end
+                    if thread_state == 'completed' then
+                        local ok2, response = thr:get()
+                        if ok2 and response and tonumber(response.status_code) == 200 then
+                            local body = response.text or ''
+                            if _updIsValidBody(body) then
+                                if not _updWriteAtomic(self_path, body) then
+                                    _updState.installing = false
+                                    _updNotify("\xce\xf8\xe8\xe1\xea\xe0\x20\xe7\xe0\xef\xe8\xf1\xe8\x20\xf4\xe0\xe9\xeb\xe0", "{FF6666}")
+                                    return
+                                end
+                                local new_ver = _updVerFromBody(body) or _updState.ver_remote or '?'
+                                _updNotify("\xee\xe1\xed\xee\xe2\xeb\xb8\xed\x20\xe4\xee\x20v" .. new_ver .. "\x2e\x20\xef\xe5\xf0\xe5\xe7\xe0\xef\xf3\xf1\xea\xe0\xfe\x2e\x2e\x2e", "{00FF88}")
+                                wait(300)
+
+                                local reloaded = false
+                                if ok and scr and type(scr.reload) == 'function' then
+                                    reloaded = pcall(function() scr:reload() end)
+                                end
+                                if not reloaded then
+                                    _updNotify("\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xef\xe5\xf0\xe5\xe7\xe0\xef\xf3\xf1\xf2\xe8\xf2\xfc\x20\xe0\xe2\xf2\xee\xec\xe0\xf2\xe8\xf7\xe5\xf1\xea\xe8\x3b\x20\xe7\xe0\xef\xf3\xf1\xf2\xe8\xf2\xe5\x20\xe2\xf0\xf3\xf7\xed\xf3\xfe\x20\x28\x46\x34\x20\x2f\x20\xef\xe5\xf0\xe5\xe7\xe0\xf5\xee\xe4\x20\xe2\x20\xef\xe0\xef\xea\xf3\x20\x6d\x6f\x6f\x6e\x6c\x6f\x61\x64\x65\x72\x29", "{FFAA00}")
+                                    if ok and scr then pcall(function() scr:unload() end) end
+                                end
+                                _updState.installing = false
+                                _updState.available = false
+                                return
+                            end
+                        end
+                        break
+                    end
+                end
+            end
+        end
+        _updState.installing = false
+        _updNotify("\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xf1\xea\xe0\xf7\xe0\xf2\xfc\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20\xf1\x20\x47\x69\x74\x48\x75\x62", "{FF6666}")
+    end)
+end
+end -- do ... end (самообновление): освобождаем регистры локальных
+    -- переменных обратно чанку файла
+
+-- ============================================================
 --  ФИКС "КАРАКУЛЬ" В ЧАТЕ ВМЕСТО ЭМОДЗИ
 -- ------------------------------------------------------------
 -- родной чат SA-MP рисует текст как однобайтовую CP1251-кодировку —
@@ -8872,6 +9155,28 @@ function main()
 
     -- ── команда чата для ручной оплаты налогов (по просьбе) ──
     pcall(sampRegisterChatCommand, "paytax", function() payTaxesThenHotel(false) end)
+
+    -- ── команда самообновления: "/pcsupdate" — проверить версию на
+    -- GitHub, "/pcsupdate install" — скачать актуальную версию и
+    -- перезаписать ею этот же файл (см. pcsCheckForUpdate /
+    -- pcsInstallUpdate выше) ──
+    pcall(sampRegisterChatCommand, "pcsupdate", function(arg)
+        arg = tostring(arg or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+        if arg == "install" or arg == "update" then
+            pcsInstallUpdate()
+        else
+            pcsCheckForUpdate(false)
+        end
+    end)
+
+    -- ── тихая проверка обновлений раз за сессию, через несколько
+    -- секунд после старта (чтобы не мешать загрузке остального) —
+    -- уведомление в чат придёт, только если реально нашлась более
+    -- новая версия на GitHub ──
+    lua_thread.create(function()
+        wait(4000)
+        pcsCheckForUpdate(true)
+    end)
 
     -- уведомляем игрока в чат, что подхватилась ранее сохранённая
     -- (не дефолтная) команда открытия меню — по просьбе: "если игрок
