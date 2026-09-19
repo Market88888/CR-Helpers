@@ -1,9 +1,11 @@
 {
   "version": "1.8.4",
-  "sha256": "5312fc69f3a3c48de3cd0e52f64586fa1dd5838e5b01fe8a649491fa83ebaba5",
+  "sha256": "b07d6d929bb993bf9ee883fd80dfe8b99ca16a105f989e56a871b9fba2359c89",
+  "parts": 11,
+  "parts_prefix": "pcs_raw_",
   "download_url": "https://raw.githubusercontent.com/Market88888/CR-Helpers/main/PCStats.lua",
   "min_version": "1.8.0",
-  "changelog": "Безопасное автообновление: manifest.json, SHA-256, атомарная замена, throttle 15 мин",
+  "changelog": "Безопасное автообновление: manifest, SHA-256, атомарная замена, загрузка по частям",
   "release_date": "2026-09-19",
   "required": false
 }
