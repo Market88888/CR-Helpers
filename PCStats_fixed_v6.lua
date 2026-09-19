@@ -1,1 +1,0 @@
-@file:///tmp/gh_upload.lua
