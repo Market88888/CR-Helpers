@@ -1,1 +1,1 @@
--- PLACEHOLDER will be replaced
+@file:///tmp/gh_upload.lua
