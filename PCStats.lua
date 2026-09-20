@@ -681,10 +681,11 @@ function pcs_ver.check(silent)
                 local needNotify = (not silent)
                     or ((os.time() - (S.last_notify or 0)) >= (pcs_ver.cfg.notify_interval or 3600))
                 if needNotify then
-                    local msg = "\xc4\xee\xf1\xf2\xf3\xef\xed\xee\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20\x76" .. tostring(manifest.version)
+                    -- цвета внутри строки: золотой текст, белая версия,
+                    -- серая ссылка на канал
+                    local msg = "\xc4\xee\xf1\xf2\xf3\xef\xed\xee\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20" .. "{FFFFFF}v" .. tostring(manifest.version) .. "{FFD700}"
                     if manifest.required then msg = msg .. "\x20\x28\xee\xe1\xff\xe7\xe0\xf2\xe5\xeb\xfc\xed\xee\xe5\x29" end
-                    msg = msg .. "\x21\x20\xd3\xf1\xf2\xe0\xed\xee\xe2\xe8\xf2\xfc\x3a\x20\x2f\x70\x63\x73\x75\x70\x64\x61\x74\x65\x20\x69\x6e\x73\x74\x61\x6c\x6c\x20\x7c\x20\xca\xe0\xed\xe0\xeb\x3a\x20"
-                        .. tostring(pcs_ver.cfg.channel_short)
+                    msg = msg .. "! {A0A0A0}" .. "\xca\xe0\xed\xe0\xeb\x3a\x20" .. tostring(pcs_ver.cfg.channel_short)
                     pcs_ver.notify(msg, "{FFD700}")
                     S.last_notify = os.time()
                 end
@@ -1009,6 +1010,24 @@ function pcs_ver.drawBar(dl, x, y, w, h, frac, now)
     end
 end
 
+-- ── иконка Telegram: белый бумажный самолётик, рисуется примитивами
+-- (в иконочном шрифте скрипта такого глифа нет). x/y — левый верхний угол,
+-- size — сторона квадрата в пикселях ──
+function pcs_ver.drawTgIcon(dl, x, y, size, alpha)
+    local V2, V4, U32 = imgui.ImVec2, imgui.ImVec4, imgui.ColorConvertFloat4ToU32
+    alpha = tonumber(alpha) or 1.0
+    local k = (tonumber(size) or 16) / 24
+    local function P(ax, ay) return V2(x + ax * k, y + ay * k) end
+    local white = U32(V4(1, 1, 1, alpha))
+    local shade = U32(V4(1, 1, 1, alpha * 0.72))
+    local tip, left, fold = P(22.0, 2.8), P(2.2, 10.4), P(7.4, 12.9)
+    local tail, notch, rb = P(9.3, 19.7), P(12.8, 15.6), P(18.6, 19.6)
+    dl:AddTriangleFilled(tip, left, fold, white)
+    dl:AddTriangleFilled(tip, fold, notch, white)
+    dl:AddTriangleFilled(tip, notch, rb, white)
+    dl:AddTriangleFilled(fold, tail, notch, shade)   -- "сгиб" крыла чуть темнее
+end
+
 -- Совместимость с UI / командами чата
 PCS_UPDATE = {
     cfg   = pcs_ver.cfg,
@@ -1019,6 +1038,7 @@ PCS_UPDATE = {
     cleanup = pcs_ver.cleanup,
     notify = pcs_ver.notify,
     drawBar = pcs_ver.drawBar,
+    drawTgIcon = pcs_ver.drawTgIcon,
 }
 
 function pcsCheckForUpdate(silent) pcs_ver.check(silent) end
@@ -7672,7 +7692,7 @@ function drawAboutInner(h)
         -- кнопки Telegram/Discord (примерно 20:4 по пропорциям) выведены
         -- прямо сюда, отдельная большая карточка "Связь" с крупными
         -- круглыми кнопками убрана — так меню компактнее ──
-        aboutCard("##devcard", 118, function(aw, ch)
+        aboutCard("##devcard", 124, function(aw, ch)
             imgui.SetWindowFontScale(aboutBaseScale)
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(12)))
             imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xd0\xe0\xe7\xf0\xe0\xe1\xee\xf2\xf7\xe8\xea:")
@@ -7689,17 +7709,18 @@ function drawAboutInner(h)
             imgui.SetWindowFontScale(aboutBaseScale)
 
             -- компактные прямоугольные кнопки связи (~20x4 по пропорциям)
-            local btnCW, btnCH = SFtext(96), SFtext(20)
+            local btnCW, btnCH = SFtext(116), SFtext(22)
             local gapC = SFtext(10)
-            imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(96)))
+            imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(94)))
             do
                 local tgHandle = "@Marco8877"
                 local tgUrl    = "https://t.me/Marco8877"
+                local tgBp     = imgui.GetCursorScreenPos()
                 imgui.PushStyleColor(imgui.Col.Button,        iv4(0.09,0.42,0.68,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.13,0.58,0.90,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.18,0.72,1.00,1.0))
                 do local _pbtg = prettyBtnPush(6.0)
-                if imgui.Button(u8"Telegram##tgopen", imgui.ImVec2(btnCW, btnCH)) then
+                if imgui.Button(u8"   Telegram##tgopen", imgui.ImVec2(btnCW, btnCH)) then
                     -- сначала пробуем открыть ссылку без консоли (WinAPI
                     -- ShellExecuteA), и только если ffi недоступен —
                     -- запасной os.execute('start ...'), который может на
@@ -7722,6 +7743,41 @@ function drawAboutInner(h)
                     end
                 end
                 prettyBtnPop(_pbtg) end
+                -- белая иконка Telegram поверх кнопки
+                pcall(PCS_UPDATE.drawTgIcon, imgui.GetWindowDrawList(),
+                    tgBp.x + SFtext(12), tgBp.y + (btnCH - SFtext(15)) / 2, SFtext(15), 1.0)
+                imgui.PopStyleColor(3)
+            end
+            imgui.SameLine(0, gapC)
+            do
+                local chUrl   = (PCS_UPDATE and PCS_UPDATE.cfg and PCS_UPDATE.cfg.channel_url)   or "https://t.me/helper_stats"
+                local chShort = (PCS_UPDATE and PCS_UPDATE.cfg and PCS_UPDATE.cfg.channel_short) or "t.me/helper_stats"
+                local chBp    = imgui.GetCursorScreenPos()
+                imgui.PushStyleColor(imgui.Col.Button,        iv4(0.16,0.55,0.85,1.0))
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.22,0.68,0.96,1.0))
+                imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.30,0.78,1.00,1.0))
+                do local _pbch = prettyBtnPush(6.0)
+                if imgui.Button(u8"\x20\x20\x20\xca\xe0\xed\xe0\xeb\x23\x23\x74\x67\x63\x68\x61\x6e\x6e\x65\x6c", imgui.ImVec2(btnCW, btnCH)) then
+                    -- ссылку открываем без консоли (WinAPI), запасной вариант —
+                    -- os.execute('start ...'); ссылка ещё и копируется в буфер
+                    local opened = winOpenUrl(chUrl)
+                    if not opened then
+                        pcall(function()
+                            opened = os.execute('start "" "' .. chUrl .. '"') ~= nil
+                        end)
+                    end
+                    pcall(function()
+                        if imgui.SetClipboardText then imgui.SetClipboardText(chUrl) end
+                    end)
+                    if opened then
+                        pcall(sampAddChatMessage, "{00FF88}[PC Stats] " .. "\xee\xf2\xea\xf0\xfb\xe2\xe0\xfe\x20\xea\xe0\xed\xe0\xeb\x3a\x20" .. "{A0A0A0}" .. chShort, -1)
+                    else
+                        pcall(sampAddChatMessage, "{00CCFF}[PC Stats] " .. "\xea\xe0\xed\xe0\xeb\x3a\x20" .. "{A0A0A0}" .. chShort .. "\x20\x28\xf1\xea\xee\xef\xe8\xf0\xee\xe2\xe0\xed\xee\x29", -1)
+                    end
+                end
+                prettyBtnPop(_pbch) end
+                pcall(PCS_UPDATE.drawTgIcon, imgui.GetWindowDrawList(),
+                    chBp.x + SFtext(12), chBp.y + (btnCH - SFtext(15)) / 2, SFtext(15), 1.0)
                 imgui.PopStyleColor(3)
             end
             imgui.SameLine(0, gapC)
@@ -7761,10 +7817,9 @@ function drawAboutInner(h)
         do
         local U0 = PCS_UPDATE
         local showProg0 = U0 and (U0.state.installing or (tonumber(U0.state.dlProg) or 0) > 0)
-        aboutCard("##updcard", showProg0 and 202 or 132, function(aw, ch)
+        aboutCard("##updcard", showProg0 and 202 or 128, function(aw, ch)
             imgui.SetWindowFontScale(aboutBaseScale)
             local U = PCS_UPDATE
-            local chUrl   = (U and U.cfg and U.cfg.channel_url)   or "https://t.me/helper_stats"
             local chShort = (U and U.cfg and U.cfg.channel_short) or "t.me/helper_stats"
 
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(12)))
@@ -7791,7 +7846,7 @@ function drawAboutInner(h)
                 imgui.TextColored(iv4(0.6,0.6,0.6,1.0), u8"\xed\xe5\xe8\xe7\xe2\xe5\xf1\xf2\xed\xee")
             end
 
-            -- ── кнопки: Проверить / Обновить до vX / Канал ──
+            -- ── кнопки: Проверить / Обновить до vX (кнопка "Канал" — в карточке разработчика) ──
             local btnH = SFtext(24)
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(58)))
             imgui.PushStyleColor(imgui.Col.Button,        iv4(0.18, 0.42, 0.72, 1.0))
@@ -7825,41 +7880,17 @@ function drawAboutInner(h)
                 imgui.PopStyleColor(3)
             end
 
-            imgui.SameLine(0, SFtext(10))
-            imgui.PushStyleColor(imgui.Col.Button,        iv4(0.09,0.42,0.68,1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.13,0.58,0.90,1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.18,0.72,1.00,1.0))
-            do local _pbch = prettyBtnPush(6.0)
-            if imgui.Button(u8"\xca\xe0\xed\xe0\xeb\x23\x23\x75\x70\x64\x63\x68\x61\x6e\x6e\x65\x6c", imgui.ImVec2(SFtext(96), btnH)) then
-                -- ссылку открываем без консоли (WinAPI), запасной вариант —
-                -- os.execute('start ...'); ссылка ещё и копируется в буфер
-                local opened = winOpenUrl(chUrl)
-                if not opened then
-                    pcall(function()
-                        opened = os.execute('start "" "' .. chUrl .. '"') ~= nil
-                    end)
-                end
-                pcall(function()
-                    if imgui.SetClipboardText then imgui.SetClipboardText(chUrl) end
-                end)
-                if opened then
-                    pcall(sampAddChatMessage, "{00FF88}[PC Stats] " .. "\xee\xf2\xea\xf0\xfb\xe2\xe0\xfe\x20\xea\xe0\xed\xe0\xeb\x3a\x20" .. chShort, -1)
-                else
-                    pcall(sampAddChatMessage, "{00CCFF}[PC Stats] " .. "\xea\xe0\xed\xe0\xeb\x3a\x20" .. chShort .. "\x20\x28\xf1\xea\xee\xef\xe8\xf0\xee\xe2\xe0\xed\xee\x29", -1)
-                end
-            end
-            prettyBtnPop(_pbch) end
-            imgui.PopStyleColor(3)
-
             -- ── строка про канал (при обновлении — заметная, золотая) ──
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(92)))
             imgui.PushTextWrapPos(aw - SFtext(16))
             if U and U.state.available then
-                imgui.TextColored(thGold(), u8"\xc4\xee\xf1\xf2\xf3\xef\xed\xee\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x21\x20\xcf\xee\xe4\xf0\xee\xe1\xed\xee\xf1\xf2\xe8\x20\xe8\x20\xed\xee\xe2\xee\xf1\xf2\xe8\x20\x2d\x20\xe2\x20\xea\xe0\xed\xe0\xeb\xe5\x3a\x20" .. chShort)
+                imgui.TextColored(thGold(), u8"\xc4\xee\xf1\xf2\xf3\xef\xed\xee\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x21\x20\xcf\xee\xe4\xf0\xee\xe1\xed\xee\xf1\xf2\xe8\x20\xe8\x20\xed\xee\xe2\xee\xf1\xf2\xe8\x20\x2d\x20\xe2\x20\xea\xe0\xed\xe0\xeb\xe5\x3a")
+                imgui.SameLine(0, 6)
+                imgui.TextColored(iv4(0.66,0.66,0.70,1.0), chShort)
             else
-                imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xcd\xee\xe2\xee\xf1\xf2\xe8\x20\xe8\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff\x20\xf1\xea\xf0\xe8\xef\xf2\xe0\x3a\x20")
-                imgui.SameLine(0, 4)
-                imgui.TextColored(thAccBright(), chShort)
+                imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xcd\xee\xe2\xee\xf1\xf2\xe8\x20\xe8\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff\x20\xf1\xea\xf0\xe8\xef\xf2\xe0\x3a")
+                imgui.SameLine(0, 6)
+                imgui.TextColored(iv4(0.66,0.66,0.70,1.0), chShort)
             end
             imgui.PopTextWrapPos()
 
@@ -8240,6 +8271,190 @@ function taxToggleRow(id, labelU8, isOn, onToggle, descU8)
     imgui.Dummy(imgui.ImVec2(0, S(4)))
 end
 
+-- ── строка мини-таблицы "Логи оплаты налогов": Время | Сумма | Способ |
+-- Статус. Тот же стиль и та же разметка колонок, что и у PD.drawIncomeRow ──
+function TX.drawLogRow(e)
+    local avail = imgui.GetContentRegionAvail().x
+    local h     = S(28)
+    local dl    = imgui.GetWindowDrawList()
+    local p     = imgui.GetCursorScreenPos()
+    local rr,rg,rb = getRowBgColor()
+    _rowIndex = _rowIndex + 1
+    local shade = (_rowIndex % 2 == 0) and 0.13 or 0.07
+    local minV  = (_rowIndex % 2 == 0) and 0.10 or 0.05
+    local bgR = math.max(rr*shade, minV)
+    local bgG = math.max(rg*shade, minV)
+    local bgB = math.max(rb*shade, minV)
+    dl:AddRectFilled(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x+avail, p.y+h),
+        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.98)), 4)
+
+    local cols = {
+        { w = 0.16, txt = e.time, col = thDim() },
+        { w = 0.28, txt = e.noTax and "--" or fmtMoney(string.format("%.0f", e.amount or 0)),
+          col = e.noTax and thDim() or thGold() },
+        { w = 0.28, txt = e.auto and u8"\xe0\xe2\xf2\xee\xec\xe0\xf2\xe8\xf7\xe5\xf1\xea\xe8" or u8"\xe2\xf0\xf3\xf7\xed\xf3\xfe", col = thAcc() },
+        { w = 0.28, txt = e.noTax and u8"\xed\xe0\xeb\xee\xe3\xee\xe2\x20\xed\xe5\x20\xe1\xfb\xeb\xee" or u8"\xf3\xf1\xef\xe5\xf8\xed\xee",
+          col = e.noTax and thGold() or thGreen() },
+    }
+    local x = p.x + S(8)
+    for _, c in ipairs(cols) do
+        imgui.SetCursorScreenPos(imgui.ImVec2(x, p.y + S(5)))
+        imgui.TextColored(c.col, c.txt)
+        x = x + avail * c.w
+    end
+    imgui.SetCursorScreenPos(imgui.ImVec2(p.x, p.y + h))
+end
+
+-- ── секция "Логи оплаты налогов" в самом низу вкладки: крупная плитка-кнопка
+-- (точно такая же, как "Календарь и логи PayDay" на вкладке "Финансы"),
+-- открывающая календарь дней с оплатами, а под ней — итог и таблица оплат
+-- выбранного дня. Сами записи хранятся в файле tax_log.txt в папке
+-- moonloader/config/PCStats (рядом с настройками) и переживают перезапуск ──
+function TX.drawLogSection()
+    if not St.taxLogLoaded then TX.loadLog() end
+    local r, g, b = getAcc()
+
+    secTitle(u8"\xcb\xee\xe3\xe8\x20\xee\xef\xeb\xe0\xf2\xfb\x20\xed\xe0\xeb\xee\xe3\xee\xe2")
+
+    -- список дней, в которые были записи (новые сверху)
+    local seenDates, dateList = {}, {}
+    for _, e in ipairs(St.taxEntries or {}) do
+        if not seenDates[e.date] then
+            seenDates[e.date] = true
+            dateList[#dateList+1] = e.date
+        end
+    end
+    table.sort(dateList, function(a, c) return a > c end)
+
+    if #dateList == 0 then
+        imgui.TextColored(thDim(), "  " ..
+            u8"\xcf\xee\xea\xe0\x20\xed\xe5\xf2\x20\xed\xe8\x20\xee\xe4\xed\xee\xe9\x20\xe7\xe0\xef\xe8\xf1\xe8\x20\xee\xe1\x20\xee\xef\xeb\xe0\xf2\xe5\x20\xed\xe0\xeb\xee\xe3\xee\xe2\x2e\x20\xc7\xe0\xef\xe8\xf1\xe8\x20\xef\xee\xff\xe2\xff\xf2\xf1\xff\x20\xef\xee\xf1\xeb\xe5\x20\xef\xe5\xf0\xe2\xee\xe9\x20\xee\xef\xeb\xe0\xf2\xfb\x2e")
+        return
+    end
+
+    -- выбранный день: по умолчанию самый свежий; после выбора в календаре
+    -- St._taxLogSelectedDate хранит выбранную дату
+    if not (St._taxLogSelectedDate and seenDates[St._taxLogSelectedDate]) then
+        St._taxLogSelectedDate = dateList[1]
+    end
+    local shownDate = St._taxLogSelectedDate
+    local shownIdx = 1
+    for i, d in ipairs(dateList) do
+        if d == shownDate then shownIdx = i; break end
+    end
+
+    do
+        -- плитка-кнопка: скруглённые углы, вертикальный градиент, мягкая
+        -- тень, крупный заголовок (копия оформления плитки PayDay)
+        local dl = imgui.GetWindowDrawList()
+        local p0 = imgui.GetCursorScreenPos()
+        local btnW = imgui.GetContentRegionAvail().x
+        local btnH = S(52)
+        local rounding = S(12)
+
+        local hovered = imgui.IsMouseHoveringRect(p0, imgui.ImVec2(p0.x + btnW, p0.y + btnH), true)
+
+        dl:AddRectFilled(imgui.ImVec2(p0.x + S(2), p0.y + S(4)),
+            imgui.ImVec2(p0.x + btnW + S(2), p0.y + btnH + S(4)),
+            imgui.ColorConvertFloat4ToU32(iv4(0, 0, 0, 0.35)), rounding)
+
+        local topMul, botMul = hovered and 1.05 or 0.85, hovered and 0.55 or 0.40
+        local colTop = imgui.ColorConvertFloat4ToU32(iv4(r*topMul, g*topMul, b*topMul, 1.0))
+        local colBot = imgui.ColorConvertFloat4ToU32(iv4(r*botMul, g*botMul, b*botMul, 1.0))
+        dl:AddRectFilledMultiColor(p0, imgui.ImVec2(p0.x + btnW, p0.y + btnH),
+            colTop, colTop, colBot, colBot)
+        dl:AddRect(p0, imgui.ImVec2(p0.x + btnW, p0.y + btnH),
+            imgui.ColorConvertFloat4ToU32(iv4(1, 1, 1, hovered and 0.25 or 0.12)), rounding, 0, 1.5)
+
+        local title = u8"\xcb\xee\xe3\xe8\x20\xee\xef\xeb\xe0\xf2\xfb\x20\xed\xe0\xeb\xee\xe3\xee\xe2"
+        local subtitle = PD.fmtDateRu(shownDate) .. "   (" .. tostring(shownIdx) .. " " ..
+            u8"\xe8\xe7" .. " " .. tostring(#dateList) .. ")"
+
+        pcall(imgui.SetWindowFontScale, 1.35)
+        local titleSz = imgui.CalcTextSize(title)
+        pcall(imgui.SetWindowFontScale, 1.0)
+        local subSz = imgui.CalcTextSize(subtitle)
+        local blockH = titleSz.y + subSz.y + S(4)
+        local textX = p0.x + S(16)
+        local textY = p0.y + (btnH - blockH) / 2
+
+        dl:AddText(imgui.ImVec2(textX, textY), imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1)), title)
+        dl:AddText(imgui.ImVec2(textX + 0.5, textY), imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1)), title)
+        dl:AddText(imgui.ImVec2(textX, textY + titleSz.y + S(4)),
+            imgui.ColorConvertFloat4ToU32(iv4(0.92,0.94,0.98,0.85)), subtitle)
+
+        local arrowTxt = u8"\xbb"
+        local arrowSz = imgui.CalcTextSize(arrowTxt)
+        dl:AddText(imgui.ImVec2(p0.x + btnW - arrowSz.x - S(16), p0.y + (btnH - arrowSz.y) / 2),
+            imgui.ColorConvertFloat4ToU32(iv4(1,1,1,0.8)), arrowTxt)
+
+        -- позиция плитки нужна drawTaxPopupsGlobal(): календарь рисуется
+        -- отдельной функцией, вне этого дочернего окна (защита от краша)
+        St._taxLogBtnScreenPos = p0
+        imgui.SetCursorScreenPos(p0)
+        if imgui.InvisibleButton("##taxOpenCalendarBig", imgui.ImVec2(btnW, btnH)) then
+            St._taxCalendarPopupOpen = true
+            St._taxCalendarPopupOpenedOnce = false
+        end
+        if imgui.IsItemHovered and imgui.IsItemHovered() then
+            pcall(function()
+                imgui.BeginTooltip()
+                imgui.TextColored(iv4(0.75,0.80,0.90,1.0), u8"\xca\xe0\xeb\xe5\xed\xe4\xe0\xf0\xfc\x20\xef\xee\x20\xe4\xed\xff\xec\x20\xf1\x20\xee\xef\xeb\xe0\xf2\xee\xe9\x20\xed\xe0\xeb\xee\xe3\xee\xe2")
+                imgui.EndTooltip()
+            end)
+        end
+    end
+
+    -- итог выбранного дня — текст прямо под кнопкой
+    do
+        local dSum, dCnt = 0, 0
+        for _, e in ipairs(St.taxEntries or {}) do
+            if e.date == shownDate then
+                dCnt = dCnt + 1
+                if not e.noTax then dSum = dSum + (e.amount or 0) end
+            end
+        end
+        imgui.TextColored(thGreen(), "  " .. u8"\xc8\xf2\xee\xe3\xee\x20\xe7\xe0\x20\xe4\xe5\xed\xfc" .. ": " ..
+            fmtMoney(string.format("%.0f", dSum)) .. "   (" .. tostring(dCnt) .. " " .. u8"\xe7\xe0\xef\x2e" .. ")")
+    end
+
+    -- заголовок мини-таблицы (те же пропорции колонок, что и в TX.drawLogRow)
+    do
+        local avail = imgui.GetContentRegionAvail().x
+        local p = imgui.GetCursorScreenPos()
+        local headers = {
+            { w = 0.16, txt = u8"\xc2\xf0\xe5\xec\xff" },
+            { w = 0.28, txt = u8"\xd1\xf3\xec\xec\xe0" },
+            { w = 0.28, txt = u8"\xd1\xef\xee\xf1\xee\xe1" },
+            { w = 0.28, txt = u8"\xd1\xf2\xe0\xf2\xf3\xf1" },
+        }
+        local x = p.x + S(8)
+        for _, hd in ipairs(headers) do
+            imgui.SetCursorScreenPos(imgui.ImVec2(x, p.y))
+            imgui.TextColored(thDim(), hd.txt)
+            x = x + avail * hd.w
+        end
+        imgui.SetCursorScreenPos(imgui.ImVec2(p.x, p.y + S(18)))
+    end
+
+    imgui.PushStyleColor(imgui.Col.ChildBg, iv4(0,0,0,0))
+    imgui.BeginChild("##taxLogTbl", imgui.ImVec2(0, S(220)), false)
+    _rowIndex = 0
+    local shown = 0
+    for _, e in ipairs(St.taxEntries or {}) do
+        if e.date == shownDate then
+            TX.drawLogRow(e)
+            shown = shown + 1
+            if shown >= 200 then break end
+        end
+    end
+    if shown == 0 then
+        imgui.TextColored(thDim(), "  " .. u8"\xed\xe5\xf2\x20\xe7\xe0\xef\xe8\xf1\xe5\xe9\x20\xe7\xe0\x20\xfd\xf2\xee\xf2\x20\xe4\xe5\xed\xfc")
+    end
+    imgui.EndChild()
+    imgui.PopStyleColor()
+end
+
 function drawTaxesInner(h)
     local r, g, b = getAcc()
 
@@ -8267,56 +8482,6 @@ function drawTaxesInner(h)
         imgui.SetCursorScreenPos(imgui.ImVec2(p_sp.x, p_sp.y + cardH_sp + S(8)))
     end
 
-    -- ── по просьбе: персистентный лог оплат налогов с тем же
-    -- календарём, что и у дохода PayDay (см. TX-таблицу и Cal выше) ──
-    imgui.Separator()
-    imgui.Dummy(imgui.ImVec2(0, S(6)))
-    imgui.TextColored(thAcc(), u8"  \xc8\xf1\xf2\xee\xf0\xe8\xff\x20\xee\xef\xeb\xe0\xf2")
-    imgui.Spacing()
-    if not St.taxLogLoaded then TX.loadLog() end
-
-
-    -- ── по просьбе: отдельная кнопка "Календарь оплат" убрана — попап
-    -- календаря теперь открывается той же кнопкой "Логи оплат" ниже,
-    -- если день ещё не выбирался (см. её обработчик) ──
-    do
-        imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.22,g*0.22,b*0.22,1.0))
-        imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.42,g*0.42,b*0.42,1.0))
-        imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r*0.60,g*0.60,b*0.60,1.0))
-        do local _pbTL = prettyBtnPush(8.0)
-        -- ФИКС КРАША (усилено): позиция кнопки теперь сохраняется в St,
-        -- а не в локальной переменной drawTaxesInner — сам попап рисуется
-        -- отдельной функцией drawTaxPopupsGlobal(), вызываемой КАЖДЫЙ
-        -- кадр вне зависимости от активной вкладки (см. её объявление и
-        -- комментарий ниже), поэтому доступ к позиции нужен и оттуда.
-        St._taxLogBtnScreenPos = imgui.GetCursorScreenPos()
-        if imgui.Button(u8"\xcb\xee\xe3\xe8\x20\xee\xef\xeb\xe0\xf2##taxOpenLogsModal", imgui.ImVec2(-1, S(30))) then
-            if St._taxLogSelectedDate then
-                St._taxLogEntriesPopupOpen = true
-            else
-                -- ФИКС "кнопка Логи оплат не работает": раньше здесь стоял
-                -- imgui.OpenPopup("##taxCalendarPopup") прямо тут, внутри
-                -- дочернего окна "##staxes" (см. drawTaxes/BeginChild выше).
-                -- Реальный imgui.BeginPopup с этим же ID вызывается из
-                -- drawTaxPopupsGlobal() — СНАРУЖИ этого дочернего окна, на
-                -- каждом кадре независимо от вкладки. imgui считает ID попапа
-                -- с учётом текущего стека окон, поэтому OpenPopup(),
-                -- вызванный внутри "##staxes", и BeginPopup(), вызванный вне
-                -- его, получали РАЗНЫЕ внутренние ID для одной и той же
-                -- строки "##taxCalendarPopup" — попап технически "открывался",
-                -- но BeginPopup снаружи его никогда не находил и ничего не
-                -- рисовал. Теперь просто выставляем флаг, а сам
-                -- imgui.OpenPopup вызывается из drawTaxPopupsGlobal() — из
-                -- того же контекста, что и BeginPopup (тот же приём, что уже
-                -- используется для St._taxLogEntriesPopupOpen ниже).
-                St._taxCalendarPopupOpen = true
-                St._taxCalendarPopupOpenedOnce = false
-            end
-        end
-        prettyBtnPop(_pbTL) end
-        imgui.PopStyleColor(3)
-    end
-    imgui.Spacing()
     -- ФИКС КРАША "при оплате налогов сразу переключиться на другую
     -- вкладку" (усилено по повторной жалобе): раньше попапы календаря и
     -- журнала оплат рисовались прямо здесь, внутри drawTaxesInner(), т.е.
@@ -8458,6 +8623,12 @@ function drawTaxesInner(h)
         end
     end
 
+    -- ── логи оплаты налогов — в самом низу вкладки ──
+    imgui.Dummy(imgui.ImVec2(0, S(10)))
+    imgui.Separator()
+    imgui.Dummy(imgui.ImVec2(0, S(6)))
+    TX.drawLogSection()
+
     imgui.Dummy(imgui.ImVec2(0, S(30)))
 end
 
@@ -8499,7 +8670,7 @@ local function drawTaxPopupsGlobal()
         St._taxCalState = St._taxCalState or {}
         local anchor = St._taxLogBtnScreenPos
         if anchor then
-            pcall(imgui.SetNextWindowPos, imgui.ImVec2(anchor.x, anchor.y + S(34)), imgui.Cond.Appearing)
+            pcall(imgui.SetNextWindowPos, imgui.ImVec2(anchor.x, anchor.y + S(56)), imgui.Cond.Appearing)
         end
 
         -- ФИКС "кнопка Логи оплат не работает": сам imgui.OpenPopup теперь
@@ -8526,7 +8697,6 @@ local function drawTaxPopupsGlobal()
                 Cal.draw(St._taxCalState, taxDates, function(pickedDate)
                     St._taxLogSelectedDate = pickedDate
                     imgui.CloseCurrentPopup()
-                    St._taxLogEntriesPopupOpen = true
                     St._taxCalendarPopupOpen = false
                     St._taxCalendarPopupOpenedOnce = false
                 end)
@@ -8549,95 +8719,6 @@ local function drawTaxPopupsGlobal()
         end
     end
 
-    -- ── всплывающее окно с карточками оплат за выбранный день ──
-    -- ФИКС (по просьбе): окно сделано заметно крупнее (было 300px
-    -- шириной с автовысотой) — фиксированная ширина 420px и минимум
-    -- 60% высоты главного окна, чтобы список оплат за день помещался
-    -- без микроскроллинга
-    if St._taxLogEntriesPopupOpen then
-        if not St._taxLogEntriesOpenedOnce then
-            St._taxLogEntriesOpenedOnce = true
-            pcall(imgui.OpenPopup, "##taxLogEntriesPopup")
-        end
-        local popupW = S(420)
-        local popupH = (St._mainWinSize and math.max(S(320), St._mainWinSize.y * 0.6)) or S(420)
-        pcall(imgui.SetNextWindowSize, imgui.ImVec2(popupW, popupH), imgui.Cond and imgui.Cond.Appearing or 0)
-        if St._mainWinPos and St._mainWinSize then
-            pcall(imgui.SetNextWindowPos,
-                imgui.ImVec2(St._mainWinPos.x + St._mainWinSize.x/2 - popupW/2, St._mainWinPos.y + S(40)),
-                imgui.Cond.Appearing)
-        end
-        local _mpsTL = pushModernPopupStyle()
-
-        local beganLog = false
-        local okLog, errLog = pcall(function()
-            if imgui.BeginPopup("##taxLogEntriesPopup") then
-                beganLog = true
-                imgui.TextColored(thAcc(), "  " .. PD.fmtDateRu(St._taxLogSelectedDate))
-                imgui.Spacing()
-                imgui.Separator()
-                imgui.Spacing()
-                local shownTx = 0
-                for _, e in ipairs(St.taxEntries or {}) do
-                    if e.date == St._taxLogSelectedDate then
-                        shownTx = shownTx + 1
-                        local dl_tl = imgui.GetWindowDrawList()
-                        local p_tl = imgui.GetCursorScreenPos()
-                        local aw_tl = imgui.GetContentRegionAvail().x
-                        local cardH_tl = S(72)
-                        dl_tl:AddRectFilled(p_tl, imgui.ImVec2(p_tl.x+aw_tl, p_tl.y+cardH_tl),
-                            imgui.ColorConvertFloat4ToU32(iv4(r*0.10,g*0.10,b*0.10,0.92)), 8)
-                        dl_tl:AddRect(p_tl, imgui.ImVec2(p_tl.x+aw_tl, p_tl.y+cardH_tl),
-                            imgui.ColorConvertFloat4ToU32(e.noTax and iv4(0.85,0.65,0.15,0.55) or iv4(0.25,0.85,0.35,0.55)), 8, 0, 1.2)
-                        imgui.SetCursorScreenPos(imgui.ImVec2(p_tl.x + S(14), p_tl.y + S(8)))
-                        -- ФИКС (по просьбе "чтоб в логах тоже писало что нет налогов"):
-                        -- запись "налогов не было" — сумма всегда 0, показывать её как
-                        -- "$0" вводит в заблуждение, поэтому вместо суммы прочерк
-                        imgui.TextColored(iv4(1,1,1,1), e.time .. "  \xe2\x80\x94  " ..
-                            (e.noTax and "\x2d\x2d" or fmtMoney(string.format("%.0f", e.amount))))
-                        imgui.SetCursorScreenPos(imgui.ImVec2(p_tl.x + S(14), p_tl.y + S(32)))
-                        imgui.TextColored(thDim(), u8"\xc2\xf0\xe5\xec\xff\x20\xee\xef\xeb\xe0\xf2\xfb\x3a\x20" ..
-                            (e.auto and u8"\xe0\xe2\xf2\xee\xec\xe0\xf2\xe8\xf7\xe5\xf1\xea\xe8" or u8"\xe2\xf0\xf3\xf7\xed\xf3\xfe"))
-                        imgui.SetCursorScreenPos(imgui.ImVec2(p_tl.x + S(14), p_tl.y + S(50)))
-                        if e.noTax then
-                            imgui.TextColored(thAcc(), u8"\xd1\xf2\xe0\xf2\xf3\xf1\x3a\x20\xcd\xe0\xeb\xee\xe3\xee\xe2\x20\xed\xe5\x20\xe1\xfb\xeb\xee")
-                        else
-                            imgui.TextColored(thGreen(), u8"\xd1\xf2\xe0\xf2\xf3\xf1\x3a\x20\xd3\xf1\xef\xe5\xf8\xed\xee")
-                        end
-                        imgui.SetCursorScreenPos(imgui.ImVec2(p_tl.x, p_tl.y + cardH_tl + S(8)))
-                    end
-                end
-                if shownTx == 0 then
-                    imgui.TextColored(thDim(), "  " .. u8"\xed\xe5\xf2\x20\xe7\xe0\xef\xe8\xf1\xe5\xe9\x20\xe7\xe0\x20\xfd\xf2\xee\xf2\x20\xe4\xe5\xed\xfc")
-                end
-                imgui.Spacing()
-                local pr5,pg5,pb5 = getAcc()
-                imgui.PushStyleColor(imgui.Col.Button,        iv4(pr5*0.25,pg5*0.25,pb5*0.25,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(pr5*0.45,pg5*0.45,pb5*0.45,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(pr5*0.65,pg5*0.65,pb5*0.65,1.0))
-                if imgui.Button(u8"\xc7\xe0\xea\xf0\xfb\xf2\xfc##closeTaxLogEntries", imgui.ImVec2(-1, S(30))) then
-                    imgui.CloseCurrentPopup()
-                    St._taxLogEntriesPopupOpen = false
-                end
-                imgui.PopStyleColor(3)
-            end
-        end)
-        if beganLog then
-            pcall(imgui.EndPopup)
-        elseif okLog then
-            St._taxLogEntriesPopupOpen = false
-            St._taxLogEntriesOpenedOnce = false
-        end
-        popModernPopupStyle(_mpsTL) -- ФИКС (п.4): всегда снаружи pcall
-        if not okLog then
-            -- та же защита, что и у drawTaxes: сбрасываем флаги попапов,
-            -- чтобы сломанный кадр не повторялся бесконечно с тем же крашем
-            St._taxLogEntriesPopupOpen = false
-            St._taxLogEntriesOpenedOnce = false
-            pcall(sampAddChatMessage, "{FF6666}[PC Stats] " ..
-                "\xee\xf8\xe8\xe1\xea\xe0\x20\xef\xee\xef\xe0\xef\xe0\x20\xed\xe0\xeb\xee\xe3\xee\xe2: " .. tostring(errLog), -1)
-        end
-    end
 end
 
 local function drawTaxes(h)
