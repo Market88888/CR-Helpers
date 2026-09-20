@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.1"
+local SCRIPT_VER = "1.9.1"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -1072,6 +1072,16 @@ function pcsCheckForUpdate(silent) pcs_ver.check(silent) end
 function pcsInstallUpdate() pcs_ver.install() end
 
 PCS_MENU_BUTTON = { hover = 0 }
+-- ФИКС "МЕШОК ПРИ ЗАКРЫТОМ МЕНЮ": раньше эта плавающая кнопка-шестерёнка
+-- (открывает меню, когда оно закрыто — то есть рисуется РОВНО тогда,
+-- когда, по описанию, и вылезает лишний "мешок") была настоящим
+-- imgui.Begin()-окном с InvisibleButton внутри. Любое такое окно — это
+-- физическая область захвата мыши, даже маленькая 36x36: клики/повороты
+-- камеры под ней могли "проглатываться" игрой не так, как ожидалось,
+-- именно всё время, пока меню свёрнуто. Тот же приём, что и у тостов:
+-- никакого Begin/End/SetNextWindowPos/InvisibleButton — просто рисуем на
+-- ForegroundDrawList (это пиксели поверх игры без окна) и ловим клик
+-- вручную через imgui.IsMouseClicked(0) + проверку "мышь внутри квадрата".
 function PCS_MENU_BUTTON.draw()
     if not imgui or not cfg then return end
     if cfg.menuButtonEnabled == false then return end
@@ -1087,45 +1097,50 @@ function PCS_MENU_BUTTON.draw()
         elseif pos == "bottom_left" then x = pad; y = sh - size - pad
         elseif pos == "bottom_right" then x = sw - size - pad; y = sh - size - pad
         end
-        imgui.SetNextWindowPos(imgui.ImVec2(x, y), imgui.Cond.Always)
-        imgui.SetNextWindowSize(imgui.ImVec2(size + 4, size + 4), imgui.Cond.Always)
-        local flags = 0
-        local W = imgui.WindowFlags
-        if W then
-            for _, name in ipairs({"NoTitleBar","NoResize","NoMove","NoScrollbar","NoSavedSettings","NoBackground","NoCollapse"}) do
-                if W[name] then flags = flags + W[name] end
-            end
+
+        local dl = nil
+        pcall(function() dl = imgui.GetForegroundDrawList() end)
+        if not dl then pcall(function() dl = imgui.GetOverlayDrawList() end) end
+        if not dl then pcall(function() dl = imgui.GetBackgroundDrawList() end) end
+        if not dl then return end
+
+        local mx, my = io.MousePos.x, io.MousePos.y
+        local hovered = (mx >= x and mx <= x + size and my >= y and my <= y + size)
+        local baseA = tonumber(cfg.menuButtonAlpha) or 0.7
+        local a = hovered and 1.0 or baseA
+        local ar, ag, ab = 0.3, 0.55, 0.95
+        pcall(function()
+            local t = getTheme and getTheme()
+            if t and t.acc then ar, ag, ab = t.acc[1], t.acc[2], t.acc[3] end
+        end)
+        dl:AddRectFilled(imgui.ImVec2(x, y), imgui.ImVec2(x + size, y + size),
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(ar, ag, ab, a * 0.85)), 8)
+        dl:AddRect(imgui.ImVec2(x, y), imgui.ImVec2(x + size, y + size),
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, a * 0.5)), 8, 0, 1.5)
+        local icon = ICON_GEAR or "*"
+        local ts = imgui.CalcTextSize(icon)
+        dl:AddText(imgui.ImVec2(x + (size - ts.x) / 2, y + (size - ts.y) / 2),
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, a)), icon)
+        if PCS_UPDATE and PCS_UPDATE.state and PCS_UPDATE.state.available then
+            dl:AddCircleFilled(imgui.ImVec2(x + size - 4, y + 4), 5,
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.3, 0.25, 1.0)))
         end
-        if imgui.Begin("##pcs_menu_btn", nil, flags) then
-            local dl = imgui.GetWindowDrawList()
-            local p = imgui.GetCursorScreenPos()
-            local mx, my = io.MousePos.x, io.MousePos.y
-            local hovered = (mx >= p.x and mx <= p.x + size and my >= p.y and my <= p.y + size)
-            local baseA = tonumber(cfg.menuButtonAlpha) or 0.7
-            local a = hovered and 1.0 or baseA
-            local ar, ag, ab = 0.3, 0.55, 0.95
-            pcall(function()
-                local t = getTheme and getTheme()
-                if t and t.acc then ar, ag, ab = t.acc[1], t.acc[2], t.acc[3] end
-            end)
-            dl:AddRectFilled(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x + size, p.y + size),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(ar, ag, ab, a * 0.85)), 8)
-            dl:AddRect(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x + size, p.y + size),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, a * 0.5)), 8, 0, 1.5)
-            local icon = ICON_GEAR or "*"
-            local ts = imgui.CalcTextSize(icon)
-            dl:AddText(imgui.ImVec2(p.x + (size - ts.x) / 2, p.y + (size - ts.y) / 2),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, a)), icon)
-            if PCS_UPDATE and PCS_UPDATE.state and PCS_UPDATE.state.available then
-                dl:AddCircleFilled(imgui.ImVec2(p.x + size - 4, p.y + 4), 5,
-                    imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.3, 0.25, 1.0)))
-            end
-            imgui.InvisibleButton("##pcs_menu_btn_hit", imgui.ImVec2(size, size))
-            if imgui.IsItemClicked() then
+
+        if hovered then
+            local clicked = false
+            pcall(function() clicked = imgui.IsMouseClicked(0) end)
+            if clicked then
                 pcall(function() if toggleMenuWindow then toggleMenuWindow() end end)
             end
         end
-        imgui.End()
+
+        -- страховка: даже если что-то выше всё-таки решит, что мышь
+        -- "захвачена" (например, другой скрипт в том же кадре), явно
+        -- отпускаем захват — кнопка не должна мешать игре ни на кадр
+        pcall(function()
+            io.WantCaptureMouse    = false
+            io.WantCaptureKeyboard = false
+        end)
     end)
     if not ok then print("[PC Stats] menu button: " .. tostring(err)) end
 end
@@ -3708,6 +3723,9 @@ do
         local dl = pcs_safe_call(imgui.GetForegroundDrawList)
             or pcs_safe_call(imgui.GetOverlayDrawList)
             or pcs_safe_call(imgui.GetBackgroundDrawList)
+        if cfg.toastDebugLog then
+            print("[toast] draw: dl=" .. tostring(dl ~= nil) .. " ntype=" .. tostring(n.ntype))
+        end
         if dl then
             pcs_safe_call(function()
                 local fscale = mcfg.font_scale or 1.0
@@ -3926,11 +3944,36 @@ do
     -- Публичная точка входа для всего остального скрипта:
     -- pcs_notify("текст в UTF-8", "info"/"success"/"warning"/"error"/"payday", длительность_сек)
     function pcs_notify(text, ntype, duration)
+        -- ДИАГНОСТИКА (временная, см. cfg.toastDebugLog): пишет в
+        -- moonloader.log сам факт вызова + успешно ли добавился тост в
+        -- очередь. Нужна, чтобы при следующем "тост не появился" было
+        -- видно, где именно обрыв: pcs_notify вообще не вызывается,
+        -- вызывается но не добавляется в active/pending, или добавляется,
+        -- но _draw_toast не смог получить draw list (см. вторую метку
+        -- в _render/_draw_toast). Включается вручную: /pcstoastlog
+        if cfg.toastDebugLog then
+            print("[toast] pcs_notify called: enabled=" .. tostring(cfg.toastEnabled) ..
+                " ntype=" .. tostring(ntype) .. " text=" .. tostring(text):sub(1, 80))
+        end
         if cfg.toastEnabled == false then return end
         -- Тосты не зависят от открытия меню (ForegroundDrawList + OnFrame).
         if St then St._toastSessionActive = true end
-        return PcsNotifyManager.add(text, ntype, duration)
+        local n = PcsNotifyManager.add(text, ntype, duration)
+        if cfg.toastDebugLog then
+            print("[toast] after add: active=" .. #PcsNotifyManager.active ..
+                " pending=" .. #PcsNotifyManager.pending)
+        end
+        return n
     end
+
+    -- команда для включения диагностики тостов на время одной сессии —
+    -- не трогает cfg.json, просто ставит флаг в памяти
+    pcall(function()
+        sampRegisterChatCommand("pcstoastlog", function()
+            cfg.toastDebugLog = not cfg.toastDebugLog
+            print("[PC Stats] toast debug log: " .. tostring(cfg.toastDebugLog))
+        end)
+    end)
 
     -- Публичная точка входа: мгновенно убрать с экрана ВСЕ текущие
     -- уведомления (используется при закрытии главного меню, см.
