@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.4"
+local SCRIPT_VER = "1.8.5"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -220,6 +220,20 @@ PCS_GUARD = (function()
             if n <= 0 then return end
             r.PopStyleVar(n)
             G.v = G.v - n
+        end
+
+        -- жирный шрифт для ВСЕХ кнопок скрипта: PushFont/PopFont стоят вплотную
+        -- к r.Button (под pcall), поэтому стек шрифтов не может остаться
+        -- несбалансированным. PCS_BOLD_FONT грузится в imgui.OnInitialize
+        local _rBtn = r.Button
+        P.Button = function(...)
+            local f = PCS_BOLD_FONT
+            local pushed = false
+            if f then pushed = pcall(r.PushFont, f) end
+            local ok, res = pcall(_rBtn, ...)
+            if pushed then pcall(r.PopFont) end
+            if not ok then error(res, 0) end
+            return res
         end
 
         local function opener(kind, fname, always)
@@ -1106,643 +1120,896 @@ end
 
 
 -- ============================================================
---  AIS: Auto-Interaction Securities (особисті охоронці / pet)
---  Префікс ais_ — без конфліктів з PC Stats
---  Залежності: samp.events (sampev), lua_thread, raknet*,
---    encodeJson/decodeJson (опційно), doesFileExist/createDirectory
---  Команди: /sppet 1|2, /offpet 1|2, /fasteat 1|2,
---           /aisallsppet, /aisallclear, /aisreload, /ais
+--  AIS: Auto-Interaction Securities (личные охранники)
+--  Точный порт скрипта Auto-Interaction Securities 2.0.6 (yargoff)
+--  внутрь PC Stats. Всё лежит в таблице AIS (одна локальная
+--  переменная на весь модуль — в файле почти исчерпан лимит
+--  LuaJIT на 200 локальных). Настройки хранятся отдельно:
+--  moonloader/config/PCStats/ais_settings.json
+--  Команды: /ais (окно), /sppet 1|2, /offpet 1|2, /fasteat 1|2,
+--           /aisallsppet, /aisallclear, /aisreload
+--  ВАЖНО: отдельный скрипт Auto-Interaction Securities нужно
+--  выгрузить, иначе оба будут отвечать на одни и те же пакеты.
 -- ============================================================
 
 local AIS = {}
 
--- ── типи їжі в інвентарі CEF ────────────────────────────────
-AIS.FOOD = {
-    [512]  = "chips",   -- Чипсы
-    [783]  = "meat",    -- Мясо
-    [1513] = "coins",   -- Монеты охотника
-}
+AIS.TAG   = "{c99732}[AIS]{ffffff}"
+AIS.SMILE = ":man:"
+AIS.COLOR = 0xFFe69f35
 
--- ── стан (критичні прапорці) ────────────────────────────────
+-- типы еды (id предмета -> название)
+AIS.FOOD = {
+    [512]  = "\xd7\xe8\xef\xf1\xfb",
+    [783]  = "\xcc\xff\xf1\xee",
+    [1513] = "\xcc\xee\xed\xe5\xf2\xfb \xee\xf5\xee\xf2\xed\xe8\xea\xe0",
+}
+AIS.FOOD_ORDER = { 512, 783, 1513 }
+
+-- флаги процессов (как локальные переменные в оригинале)
 AIS.st = {
     sppet1 = false, sppet2 = false,
     offpet1 = false, offpet2 = false,
     eatpet1 = false, eatpet2 = false,
+    checkAllPet = false,
+    CheckAutoSpawn = false,
+    SpawnProcessing = false,
+    OffProcessing = false,
     checkinv = false,
     checksecurityinv = false,
-    checkAllPet = false,
+    StopedUpdateInfo = false,
     AddVerifi = false,
-    SpawnProcessing = false,
-    freezeUntil = 0,
-    lastInvJson = "",
-    pets = {},
-    securityList = {},
-    food = {},
-    enabled = true,
-    autoSpawn = false,
-    autoEat = false,
-    reducedCooldown = false,
-    sotg = false, -- spawn of two guards
-    reducedAudio = false,
+    FreezePlayer = false,
 }
+AIS.times = {}
+AIS.buf = {}
 
--- ── JSON-конфіг (як у AIS): merge з дефолтами ───────────────
--- Залежності: encodeJson, decodeJson (MoonLoader). Якщо немає —
--- fallback на простий ручний формат через inicfg-стиль не робимо;
--- просто не зберігаємо.
-local function ais_cfgPath()
-    local dir = "moonloader/config"
-    pcall(function()
-        if getWorkingDirectory then
-            local w = getWorkingDirectory()
-            if type(w) == "string" and w ~= "" then
-                dir = w .. "/config"
-            end
-        end
-    end)
-    return dir, dir .. "/ais_pets.json"
+function AIS.defaults()
+    return {
+        enabled = true,
+        AutoSpawnPet = false,
+        ReducedCooldown = false,
+        CheckingSecurityForSpawn = false,
+        SOTG = false,
+        InfoEat = {
+            FirstSecurity  = { autoeat = false, slot = 0, type = 0, quantity = 0 },
+            SecondSecurity = { autoeat = false, slot = 0, type = 0, quantity = 0 },
+        },
+        Security = {},
+        SpPet1 = { name = "", id = "", slot = "", spawned = 0 },
+        SpPet2 = { name = "", id = "", slot = "", spawned = 0 },
+        TimeUsePet = 0,
+        TimeUseEat = 0,
+        debug_msg = false,
+    }
 end
 
-local function ais_deepMerge(dst, src)
-    if type(dst) ~= "table" or type(src) ~= "table" then return dst end
-    for k, v in pairs(src) do
-        if type(v) == "table" then
-            if type(dst[k]) ~= "table" then dst[k] = {} end
-            ais_deepMerge(dst[k], v)
-        elseif dst[k] == nil then
-            dst[k] = v
+-- ── файл настроек (JSON, как в оригинале: merge с дефолтами) ──
+function AIS.path()
+    local wd = "moonloader"
+    pcall(function()
+        local w = getWorkingDirectory()
+        if type(w) == "string" and w ~= "" then wd = w end
+    end)
+    local dir = wd .. "/config/PCStats"
+    pcall(function()
+        if doesDirectoryExist and createDirectory then
+            if not doesDirectoryExist(wd .. "/config") then createDirectory(wd .. "/config") end
+            if not doesDirectoryExist(dir) then createDirectory(dir) end
+        end
+    end)
+    return dir .. "/ais_settings.json"
+end
+
+function AIS.merge(dst, def)
+    for k, v in pairs(def) do
+        if dst[k] == nil then
+            if type(v) == "table" then
+                dst[k] = {}
+                AIS.merge(dst[k], v)
+            else
+                dst[k] = v
+            end
+        elseif type(v) == "table" and type(dst[k]) == "table" then
+            AIS.merge(dst[k], v)
         end
     end
-    return dst
 end
 
-function AIS.jsonLoad()
-    local defaults = {
-        enabled = true,
-        autoSpawn = false,
-        autoEat = false,
-        reducedAudio = false,
-        foodPrefer = { 783, 512, 1513 }, -- м'ясо → чіпси → монети
-    }
-    local dir, path = ais_cfgPath()
+function AIS.load()
+    local data
     pcall(function()
-        if doesDirectoryExist and not doesDirectoryExist(dir) then
-            createDirectory(dir)
-        end
-    end)
-    local data = nil
-    pcall(function()
-        if doesFileExist and doesFileExist(path) and decodeJson then
+        local path = AIS.path()
+        if doesFileExist and doesFileExist(path) then
             local f = io.open(path, "rb")
             if f then
-                local body = f:read("*a"); f:close()
-                if body and #body > 2 then
-                    data = decodeJson(body)
+                local body = f:read("*a")
+                f:close()
+                if body and body ~= "" then
+                    local ok, res = pcall(decodeJson, body)
+                    if ok and type(res) == "table" then data = res end
                 end
             end
         end
     end)
-    if type(data) ~= "table" then data = {} end
-    ais_deepMerge(data, defaults)
-    AIS.st.enabled = data.enabled and true or false
-    AIS.st.autoSpawn = data.autoSpawn and true or false
-    AIS.st.autoEat = data.autoEat and true or false
-    AIS.st.reducedAudio = data.reducedAudio and true or false
-    AIS.cfg = data
+    if type(data) ~= "table" then data = AIS.defaults() end
+    AIS.merge(data, AIS.defaults())
+    AIS.s = data
+    AIS.buf = {} -- буферы слайдеров пересоздадутся из новых значений
     return data
 end
 
-function AIS.jsonSave()
-    if not AIS.cfg then AIS.jsonLoad() end
-    AIS.cfg.enabled = AIS.st.enabled
-    AIS.cfg.autoSpawn = AIS.st.autoSpawn
-    AIS.cfg.autoEat = AIS.st.autoEat
-    AIS.cfg.reducedAudio = AIS.st.reducedAudio
-    local dir, path = ais_cfgPath()
+function AIS.save()
+    if not AIS.s then return end
     pcall(function()
-        if doesDirectoryExist and not doesDirectoryExist(dir) then
-            createDirectory(dir)
-        end
-        if not encodeJson then return end
-        local body = encodeJson(AIS.cfg)
+        local body = encodeJson(AIS.s)
         if type(body) ~= "string" then return end
-        local f = io.open(path, "wb")
+        local f = io.open(AIS.path(), "wb")
         if f then f:write(body); f:close() end
     end)
 end
 
--- ── CEF: sendCEF(str) ───────────────────────────────────────
--- Формат бітстріму: packet 220, opcode 18, len uint16, str, 0 uint32
-function AIS.sendCEF(str)
-    str = tostring(str or "")
-    if str == "" then return false end
-    local ok = pcall(function()
-        local bs = raknetNewBitStream()
-        raknetBitStreamWriteInt8(bs, 220)
-        raknetBitStreamWriteInt8(bs, 18)
-        raknetBitStreamWriteInt16(bs, #str)
-        raknetBitStreamWriteString(bs, str)
-        raknetBitStreamWriteInt32(bs, 0)
-        raknetSendBitStream(bs)
-        raknetDeleteBitStream(bs)
-    end)
-    return ok and true or false
+function AIS.on()
+    return AIS.s ~= nil and AIS.s.enabled ~= false
 end
 
--- ── emul_num: емуляція натискання (Y = інвентар) ────────────
--- array = байти віртуального коду / пакету; для Y використовуємо
--- setVirtualKeyDown якщо є, інакше CEF requestShowingInventory
+-- ── сообщения ──
+function AIS.msg(text, color)
+    if not text or text == "" then return end
+    pcall(sampAddChatMessage, AIS.SMILE .. " " .. AIS.TAG .. " " .. text, color or AIS.COLOR)
+end
+
+function AIS.dbg(text)
+    if not (AIS.s and AIS.s.debug_msg) then return end
+    if not text or text == "" then return end
+    print("[AIS] " .. tostring(text))
+end
+
+-- ── низкоуровневые отправки ──
+function AIS.sendCEF(str)
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 220)
+    raknetBitStreamWriteInt8(bs, 18)
+    raknetBitStreamWriteInt16(bs, #str)
+    raknetBitStreamWriteString(bs, str)
+    raknetBitStreamWriteInt32(bs, 0)
+    raknetSendBitStream(bs)
+    raknetDeleteBitStream(bs)
+end
+
 function AIS.emul_num(array)
-    -- Основний шлях для інвентаря — CEF, бо віртуальні клавіші
-    -- на різних клієнтах поводяться по-різному
-    if type(array) == "table" and array[1] == 220 then
-        -- відкрити інвентар
-        AIS.sendCEF("requestShowingInventory|28")
-        return true
+    local bs = raknetNewBitStream()
+    for _, byte in ipairs(array) do
+        raknetBitStreamWriteInt8(bs, byte)
     end
-    pcall(function()
-        if setVirtualKeyDown and type(array) == "table" then
-            local vk = array[#array] or 89 -- Y
-            setVirtualKeyDown(vk, true)
-            wait(50)
-            setVirtualKeyDown(vk, false)
-        end
+    raknetSendBitStream(bs)
+    raknetDeleteBitStream(bs)
+end
+
+function AIS.getById(id)
+    id = tonumber(id)
+    if not id then return nil end
+    for _, pet in ipairs((AIS.s and AIS.s.Security) or {}) do
+        if tonumber(pet.id) == id then return pet end
+    end
+    return nil
+end
+
+-- запуск функции в отдельном потоке с защитой от ошибок
+function AIS.run(fn, ...)
+    local args = { ... }
+    lua_thread.create(function()
+        local ok, err = pcall(fn, unpack(args))
+        if not ok then print("[AIS] error: " .. tostring(err)) end
     end)
+end
+
+-- ── обновление информации о состоянии охранников ──
+function AIS.AddVerifiSecurity(action)
+    local st, s = AIS.st, AIS.s
+    action = tostring(action or "")
+
+    if st.AddVerifi then
+        AIS.dbg("[AddVer] \xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5 \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xe8 \xf3\xe6\xe5 \xe7\xe0\xef\xf3\xf9\xe5\xed\xee! \xce\xe6\xe8\xe4\xe0\xe9\xf2\xe5 \xe7\xe0\xe2\xe5\xf0\xf8\xe5\xed\xe8\xff...")
+        return false
+    end
+
+    if action == "spawn" then
+        wait(s.ReducedCooldown and 3000 or 15000)
+    elseif action == "off" then
+        wait(1200)
+    else
+        wait(1000)
+    end
+
+    if not sampIsLocalPlayerSpawned() then
+        AIS.dbg("[AddVer] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3! \xce\xf2\xec\xe5\xed\xff\xfe \xef\xf0\xee\xe2\xe5\xf0\xea\xf3...")
+        return false
+    end
+
+    st.AddVerifi = true
+    st.checkinv = false
+    st.checksecurityinv = true
+
+    local updated = false
+
+    for i = 1, 40 do
+        if st.StopedUpdateInfo then st.StopedUpdateInfo = false; st.AddVerifi = false; return false end
+        if not sampIsLocalPlayerSpawned() then
+            st.AddVerifi = false
+            AIS.dbg("[AddVer] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3! \xce\xf2\xec\xe5\xed\xff\xfe \xef\xf0\xee\xe2\xe5\xf0\xea\xf3...")
+            return false
+        end
+        if st.checkinv and not st.checksecurityinv then
+            AIS.dbg("[AddVer] \xc8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xff \xee \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0/\xee\xe2 \xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe0!")
+            AIS.sendCEF("inventoryClose")
+            updated = true
+            break
+        end
+
+        wait(750)
+
+        if st.StopedUpdateInfo then st.StopedUpdateInfo = false; st.AddVerifi = false; return false end
+        if not sampIsLocalPlayerSpawned() then
+            st.AddVerifi = false
+            AIS.dbg("[AddVer] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3! \xce\xf2\xec\xe5\xed\xff\xfe \xef\xf0\xee\xe2\xe5\xf0\xea\xf3...")
+            return false
+        end
+
+        AIS.dbg("[AddVer] \xce\xe1\xed\xee\xe2\xeb\xff\xfe \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xfe \xee \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 [ " .. i .. " ]")
+
+        st.checkinv = false
+        st.checksecurityinv = true
+
+        sampSendChat("/invent")
+
+        local waitTime = 0
+        while waitTime < 1500 do
+            if st.StopedUpdateInfo then st.StopedUpdateInfo = false; st.AddVerifi = false; return false end
+            if not sampIsLocalPlayerSpawned() then
+                st.AddVerifi = false
+                AIS.dbg("[AddVer] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3! \xce\xf2\xec\xe5\xed\xff\xfe \xef\xf0\xee\xe2\xe5\xf0\xea\xf3...")
+                return false
+            end
+            if st.checkinv and not st.checksecurityinv then
+                AIS.dbg("[AddVer] \xc8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xff \xee \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0/\xee\xe2 \xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe0!")
+                AIS.sendCEF("inventoryClose")
+                updated = true
+                break
+            end
+            wait(50)
+            waitTime = waitTime + 50
+        end
+
+        if updated then break end
+        AIS.dbg("[AddVer] \xce\xf2\xe2\xe5\xf2 \xed\xe5 \xef\xee\xeb\xf3\xf7\xe5\xed, \xef\xee\xe2\xf2\xee\xf0\xff\xfe \xe7\xe0\xef\xf0\xee\xf1...")
+    end
+
+    st.AddVerifi = false
+
+    if not updated then
+        AIS.dbg("[AddVer] \xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xee\xe1\xed\xee\xe2\xe8\xf2\xfc \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xfe \xee \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2!")
+        return false
+    end
     return true
 end
 
--- ── парсинг інвентаря з CEF (packet 220, opcode 17) ──────────
-function AIS.parseInventoryJson(raw)
-    if type(raw) ~= "string" or #raw < 10 then return end
-    AIS.st.lastInvJson = raw
-    AIS.st.food = {}
-    AIS.st.pets = {}
+-- ── проверка: нужно ли вообще спавнить ──
+function AIS.CheckSpawnSecurity()
+    local s = AIS.s
+    local function isSpawned(pet)
+        if not pet or not pet.id then return nil end
+        local sec = AIS.getById(pet.id)
+        if not sec then return nil end
+        return tonumber(sec.spawned) == 1
+    end
 
-    -- securities / pets: об'єкти { ... "id": N ... }
-    for obj in raw:gmatch("%b{}") do
-        local id = tonumber(obj:match('"id"%s*:%s*(%d+)'))
-        if id then
-            local low = obj:lower()
-            if low:find("security", 1, true) or low:find("pet", 1, true)
-                or obj:find('"type"%s*:%s*2') or obj:find("охран") then
-                AIS.st.pets[id] = { id = id, raw = obj }
-            end
+    local spawned1 = isSpawned(s.SpPet1)
+    if spawned1 == nil then
+        AIS.dbg("[Check Spawn Security] \xcd\xe5\xf2 \xe0\xea\xf2\xf3\xe0\xeb\xfc\xed\xee\xe9 \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xe8 \xee \xef\xe5\xf0\xe2\xee\xec \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe5.")
+        if not AIS.AddVerifiSecurity() then return false end
+        spawned1 = isSpawned(s.SpPet1)
+        if spawned1 == nil then
+            AIS.dbg("[Check Spawn Security] \xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xef\xee\xeb\xf3\xf7\xe8\xf2\xfc \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe5 \xef\xe5\xf0\xe2\xee\xe3\xee \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0.")
+            return false
         end
     end
 
-    -- їжа: точний патерн з ТЗ
-    for sl, it, am in raw:gmatch('"slot":(%d+),"available":1,"blackout":0,"item":(%d+),"amount":(%d+)') do
-        sl, it, am = tonumber(sl), tonumber(it), tonumber(am)
-        if AIS.FOOD[it] and am and am > 0 then
-            AIS.st.food[#AIS.st.food + 1] = { slot = sl, amount = am, type = it }
+    if not s.SOTG then
+        if spawned1 then
+            AIS.dbg("[Check Spawn Security] \xcf\xe5\xf0\xe2\xfb\xe9 \xee\xf5\xf0\xe0\xed\xed\xe8\xea \xf3\xe6\xe5 \xe7\xe0\xf1\xef\xe0\xe2\xed\xe5\xed.")
+            return false
+        end
+        return true
+    end
+
+    local spawned2 = isSpawned(s.SpPet2)
+    if spawned2 == nil then
+        AIS.dbg("[Check Spawn Security] \xcd\xe5\xf2 \xe0\xea\xf2\xf3\xe0\xeb\xfc\xed\xee\xe9 \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xe8 \xee \xe2\xf2\xee\xf0\xee\xec \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe5.")
+        if not AIS.AddVerifiSecurity() then return false end
+        spawned1 = isSpawned(s.SpPet1)
+        spawned2 = isSpawned(s.SpPet2)
+        if spawned1 == nil or spawned2 == nil then
+            AIS.dbg("[Check Spawn Security] \xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xef\xee\xeb\xf3\xf7\xe8\xf2\xfc \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2.")
+            return false
         end
     end
-    -- запасний патерн з пробілами
-    if #AIS.st.food == 0 then
-        for sl, it, am in raw:gmatch('"slot"%s*:%s*(%d+).-"available"%s*:%s*1.-"blackout"%s*:%s*0.-"item"%s*:%s*(%d+).-"amount"%s*:%s*(%d+)') do
-            sl, it, am = tonumber(sl), tonumber(it), tonumber(am)
-            if AIS.FOOD[it] and am and am > 0 then
-                AIS.st.food[#AIS.st.food + 1] = { slot = sl, amount = am, type = it }
-            end
-        end
+
+    if spawned1 and spawned2 then
+        AIS.dbg("[Check Spawn Security] \xce\xe1\xe0 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xf3\xe6\xe5 \xe7\xe0\xf1\xef\xe0\xe2\xed\xe5\xed\xfb.")
+        return false
     end
+    return true
 end
 
--- ── вибір їжі за пріоритетом ────────────────────────────────
-function AIS.pickFood()
-    local prefer = (AIS.cfg and AIS.cfg.foodPrefer) or { 783, 512, 1513 }
-    for _, want in ipairs(prefer) do
-        for _, f in ipairs(AIS.st.food) do
-            if f.type == want and f.amount > 0 then return f end
-        end
+-- ── призыв / скрытие / кормление ──
+function AIS.SpawnPet(arg)
+    local st = AIS.st
+    if st.SpawnProcessing then AIS.dbg("\xd1\xef\xe0\xe2\xed \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xf3\xe6\xe5 \xe7\xe0\xef\xf3\xf9\xe5\xed! \xce\xe6\xe8\xe4\xe0\xe9\xf2\xe5 \xe7\xe0\xe2\xe5\xf0\xf8\xe5\xed\xe8\xff...") return end
+
+    local n = tonumber(arg) or 1
+    if n ~= 1 and n ~= 2 then AIS.msg("\xc8\xf1\xef\xee\xeb\xfc\xe7\xee\xe2\xe0\xed\xe8\xe5: /sppet [1/2]") return end
+
+    if not sampIsLocalPlayerSpawned() then
+        AIS.dbg("[SpPet] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3! \xce\xf2\xec\xe5\xed\xff\xfe \xf1\xef\xe0\xe2\xed...")
+        return false
     end
-    if AIS.st.food[1] then return AIS.st.food[1] end
-    return nil
+
+    st.SpawnProcessing = true
+    st.sppet1 = n == 1
+    st.sppet2 = n == 2
+
+    AIS.emul_num({ 220, 0, 27, 64 })
+
+    for i = 1, 40 do
+        wait(50)
+        if st.checkinv then AIS.dbg("[SpPet] \xd1\xef\xe0\xe2\xed \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xe7\xe0\xef\xf3\xf9\xe5\xed!") break end
+        if not sampIsLocalPlayerSpawned() then
+            st.SpawnProcessing = false
+            AIS.dbg("[SpPet] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3! \xce\xf2\xec\xe5\xed\xff\xfe \xf1\xef\xe0\xe2\xed...")
+            return false
+        end
+
+        wait(750)
+
+        if not sampIsLocalPlayerSpawned() then
+            st.SpawnProcessing = false
+            AIS.dbg("[SpPet] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3! \xce\xf2\xec\xe5\xed\xff\xfe \xf1\xef\xe0\xe2\xed...")
+            return false
+        end
+
+        sampSendChat("/invent")
+        AIS.dbg("[SpPet] \xcf\xee\xef\xfb\xf2\xea\xe0 \xee\xf2\xea\xf0\xfb\xf2\xfc \xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc... [ " .. i .. " ]")
+
+        wait(50)
+        if st.checkinv then AIS.dbg("[SpPet] \xd1\xef\xe0\xe2\xed \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xe7\xe0\xef\xf3\xf9\xe5\xed!") break end
+    end
+
+    st.SpawnProcessing = false
 end
 
-function AIS.firstPetId()
-    for id, _ in pairs(AIS.st.pets) do return id end
-    return nil
+function AIS.OffPet(arg)
+    local st = AIS.st
+    if st.OffProcessing then AIS.dbg("\xd1\xea\xf0\xfb\xf2\xe8\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xf3\xe6\xe5 \xe7\xe0\xef\xf3\xf9\xe5\xed\xee! \xce\xe6\xe8\xe4\xe0\xe9\xf2\xe5 \xe7\xe0\xe2\xe5\xf0\xf8\xe5\xed\xe8\xff...") return end
+
+    local n = tonumber(arg) or 1
+    if n ~= 1 and n ~= 2 then AIS.msg("\xc8\xf1\xef\xee\xeb\xfc\xe7\xee\xe2\xe0\xed\xe8\xe5: /offpet [1/2]") return end
+
+    st.OffProcessing = true
+    st.offpet1 = n == 1
+    st.offpet2 = n == 2
+
+    AIS.emul_num({ 220, 0, 27, 64 })
+
+    for i = 1, 40 do
+        wait(50)
+        if st.checkinv then AIS.dbg("\xd1\xea\xf0\xfb\xf2\xe8\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xe7\xe0\xef\xf3\xf9\xe5\xed\xee!") break end
+
+        wait(750)
+
+        sampSendChat("/invent")
+        AIS.dbg("[OffPet] \xcf\xee\xef\xfb\xf2\xea\xe0 \xee\xf2\xea\xf0\xfb\xf2\xfc \xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc [ " .. i .. " ]")
+
+        wait(50)
+        if st.checkinv then AIS.dbg("\xd1\xea\xf0\xfb\xf2\xe8\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xe7\xe0\xef\xf3\xf9\xe5\xed\xee!") break end
+    end
+
+    st.OffProcessing = false
 end
 
-function AIS.petIdByIndex(n)
-    n = tonumber(n) or 1
-    local list = {}
-    for id, _ in pairs(AIS.st.pets) do list[#list + 1] = id end
-    table.sort(list)
-    return list[n]
-end
+function AIS.EatPet(arg)
+    local st = AIS.st
+    local n = tonumber(arg) or 1
+    if n ~= 1 and n ~= 2 then AIS.msg("\xc8\xf1\xef\xee\xeb\xfc\xe7\xee\xe2\xe0\xed\xe8\xe5: /fasteat [1/2]") return end
 
--- ── дії з охоронцями ────────────────────────────────────────
-function AIS.SpawnPet(n)
-    n = tonumber(n) or 1
-    if n ~= 1 and n ~= 2 then return end
-    if AIS.st.SpawnProcessing then return end
-    AIS.st.SpawnProcessing = true
-    AIS.st.sppet1 = (n == 1)
-    AIS.st.sppet2 = (n == 2)
-    lua_thread.create(function()
-        local ok, err = pcall(function()
-            -- як у AIS 2.0.6: відкрити інвентар пакет+команда, чекати CEF
-            AIS.emul_num({ 220, 0, 27, 64 })
-            for i = 1, 40 do
-                wait(50)
-                if AIS.st.checkinv then break end
-                wait(750)
-                pcall(sampSendChat, "/invent")
-                wait(50)
-                if AIS.st.checkinv then break end
-            end
-        end)
-        AIS.st.SpawnProcessing = false
-        if not ok then print("[AIS] SpawnPet: " .. tostring(err)) end
-    end)
-end
+    st.eatpet1 = n == 1
+    st.eatpet2 = n == 2
 
-function AIS.OffPet(n)
-    n = tonumber(n) or 1
-    if n ~= 1 and n ~= 2 then return end
-    AIS.st.offpet1 = (n == 1)
-    AIS.st.offpet2 = (n == 2)
-    lua_thread.create(function()
-        pcall(function()
-            AIS.emul_num({ 220, 0, 27, 64 })
-            for i = 1, 40 do
-                wait(50)
-                if AIS.st.checkinv then break end
-                wait(750)
-                pcall(sampSendChat, "/invent")
-                wait(50)
-                if AIS.st.checkinv then break end
-            end
-        end)
-    end)
-end
-
-function AIS.EatPet(n)
-    n = tonumber(n) or 1
-    if n == 1 then AIS.st.eatpet1 = true else AIS.st.eatpet2 = true end
-    lua_thread.create(function()
-        pcall(function()
-            AIS.st.checkinv = true
-            AIS.emul_num({ 220, 0, 27, 64 })
-            wait(400)
-            AIS.sendCEF("requestShowingInventory|28")
-            wait(700)
-            local food = AIS.pickFood()
-            local petId = AIS.petIdByIndex(n) or AIS.firstPetId()
-            if food and petId then
-                local payload = string.format(
-                    'useItemOnSecurity|{"from":{"amount":1,"slot":%d,"type":1},"id":%d}',
-                    food.slot, petId
-                )
-                AIS.sendCEF(payload)
-                wait(500)
-            else
-                pcall(sampAddChatMessage,
-                    "{FFAA00}[AIS] \xcd\xe5\xf2\x20\xe5\xe4\xfb/\xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xe4\xeb\xff \xea\xee\xf0\xec\xeb\xe5\xed\xe8\xff", -1)
-            end
-            AIS.sendCEF("inventoryClose")
-        end)
-        if n == 1 then AIS.st.eatpet1 = false else AIS.st.eatpet2 = false end
-    end)
-end
-
-function AIS.AutoSpawnPet()
-    if not AIS.st.enabled or not AIS.st.autoSpawn then return end
-    if AIS.st.SpawnProcessing then return end
-    lua_thread.create(function()
-        pcall(function()
-            -- зупинка персонажа перед призовом
-            pcall(function()
-                if freezeCharPosition and PLAYER_PED then
-                    freezeCharPosition(PLAYER_PED, true)
-                    wait(200)
-                end
-            end)
-            AIS.SpawnPet(1)
-            wait(1500)
-            pcall(function()
-                if freezeCharPosition and PLAYER_PED then
-                    freezeCharPosition(PLAYER_PED, false)
-                end
-            end)
-        end)
-    end)
+    AIS.emul_num({ 220, 0, 27, 64 })
+    sampSendChat("/invent")
 end
 
 function AIS.AutoEatpet()
-    if not AIS.st.enabled or not AIS.st.autoEat then return end
+    local s = AIS.s
     AIS.EatPet(1)
+    if s.InfoEat.SecondSecurity.autoeat then
+        wait(s.ReducedCooldown and 4150 or 16150)
+        AIS.EatPet(2)
+    end
 end
 
 function AIS.CheckAllPet()
     AIS.st.checkAllPet = true
-    AIS.st.checksecurityinv = true
-    lua_thread.create(function()
-        pcall(function()
-            AIS.emul_num({ 220, 0, 27, 64 })
-            pcall(sampSendChat, "/invent")
-            wait(800)
-            local n = #(AIS.st.securityList or {})
-            pcall(sampAddChatMessage,
-                string.format("{66CCFF}[AIS] securities=%d food=%d", n, #(AIS.st.food or {})), -1)
-        end)
-        AIS.st.checksecurityinv = false
-    end)
+    AIS.emul_num({ 220, 0, 27, 64 })
+    sampSendChat("/invent")
+    wait(500)
 end
 
--- ── планувальник МСК ────────────────────────────────────────
-AIS.parsedCache = {}
-function AIS.checkMSKTimeAdvanced(timeStr, defaultMode)
-    if type(timeStr) ~= "string" or timeStr == "" then return false end
-    defaultMode = defaultMode or "once"
-    local cacheKey = timeStr .. "|" .. defaultMode
-    local now = os.time(os.date("!*t")) + 3 * 3600 -- МСК UTC+3
-    local t = os.date("*t", now)
-    local hm = string.format("%02d:%02d", t.hour, t.min)
-    local hms = string.format("%02d:%02d:%02d", t.hour, t.min, t.sec)
+-- ── автопризыв (ждёт остановки персонажа, проверяет, спавнит) ──
+function AIS._autoSpawn()
+    local s = AIS.s
 
-    local parsed = AIS.parsedCache[cacheKey]
-    if not parsed then
-        parsed = { mode = defaultMode, fired = false }
-        if timeStr:match("^@%d+") then
-            parsed.kind = "offset"
-            parsed.mm = tonumber(timeStr:match("^@(%d+)")) or 0
-            parsed.ss = tonumber(timeStr:match("^@%d+:(%d+)")) or 0
-        elseif timeStr:find("-", 1, true) then
-            parsed.kind = "range"
-            parsed.a, parsed.b = timeStr:match("([^%-]+)%-(.+)")
-        else
-            parsed.kind = "exact"
-            parsed.val = timeStr
+    local function isPlayerStopped()
+        local vx, vy, vz = getCharVelocity(PLAYER_PED)
+        return math.abs(vx) < 0.01 and math.abs(vy) < 0.01 and math.abs(vz) < 0.01
+    end
+
+    if not isPlayerStopped() then
+        AIS.msg("[ASP] \xce\xe6\xe8\xe4\xe0\xfe \xee\xf1\xf2\xe0\xed\xee\xe2\xea\xe8 \xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0...")
+        while not isPlayerStopped() do
+            AIS.dbg("[ASP] \xce\xe6\xe8\xe4\xe0\xfe \xee\xf1\xf2\xe0\xed\xee\xe2\xea\xe8 \xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0...")
+            wait(100)
         end
-        AIS.parsedCache[cacheKey] = parsed
+        wait(500)
+        if isPlayerStopped() then AIS.msg("[ASP] \xcf\xe5\xf0\xf1\xee\xed\xe0\xe6 \xee\xf1\xf2\xe0\xed\xee\xe2\xe8\xeb\xf1\xff. \xcf\xf0\xe8\xe7\xfb\xe2\xe0\xfe \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0...") end
     end
 
-    local hit = false
-    if parsed.kind == "exact" then
-        hit = (parsed.val == hm or parsed.val == hms)
-    elseif parsed.kind == "range" then
-        hit = (hm >= tostring(parsed.a) and hm <= tostring(parsed.b))
-    end
+    AIS.AddVerifiSecurity()
+    wait(1000)
 
-    if not hit then
-        if parsed.mode == "once" then parsed.fired = false end
-        return false
+    if not AIS.CheckSpawnSecurity() then return false end
+    wait(350)
+
+    AIS.SpawnPet(1)
+
+    if s.SOTG then
+        wait(s.ReducedCooldown and 5550 or 17550)
+        AIS.SpawnPet(2)
     end
-    if parsed.mode == "once" then
-        if parsed.fired then return false end
-        parsed.fired = true
-    end
-    return true
 end
 
--- ── обробники подій (викликаються З УЖЕ ІСНУЮЧИХ sampev.*) ──
-function AIS.onShowDialog(id, style, title, btn1, btn2, text)
-    if not AIS.st.enabled then return nil end
-    local t = tostring(title or "")
-    local body = tostring(text or "")
+function AIS.AutoSpawnPet()
+    local st = AIS.st
+    if st.CheckAutoSpawn then AIS.dbg("[ASP] \xc0\xe2\xf2\xee\xec\xe0\xf2\xe8\xf7\xe5\xf1\xea\xe8\xe9 \xf1\xef\xe0\xe2\xed \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xf3\xe6\xe5 \xe7\xe0\xef\xf3\xf9\xe5\xed! \xce\xe6\xe8\xe4\xe0\xe9\xf2\xe5 \xe7\xe0\xe2\xe5\xf0\xf8\xe5\xed\xe8\xff...") return end
+    st.CheckAutoSpawn = true
+    local ok, err = pcall(AIS._autoSpawn)
+    st.CheckAutoSpawn = false
+    if not ok then print("[AIS] AutoSpawnPet error: " .. tostring(err)) end
+end
 
-    -- Призыв охранника → закрити
-    if t:find("Призыв охранника", 1, true) or t:find("\xcf\xf0\xe8\xe7\xfb\xe2 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0", 1, true) then
-        pcall(sampSendDialogResponse, id, 0, 0, "")
-        return false
+-- ── разбор списка охранников из пакета инвентаря ──
+-- fullReset=true — список пересобирается с нуля (кнопка "Обновить список")
+function AIS.parseSecurities(str, fullReset)
+    local arr = str:match('"securities"%s*:%s*%[(.-)%]')
+    if not arr then return nil end
+
+    local s = AIS.s
+    if fullReset then s.Security = {} end
+    s.Security = s.Security or {}
+
+    local byId = {}
+    for _, sec in ipairs(s.Security) do
+        local id = tonumber(sec.id)
+        if id then
+            sec.id = id
+            sec.spawned = tonumber(sec.spawned) or 0
+            byId[id] = sec
+        end
     end
-    -- Покормить охранника → підтвердити
-    if t:find("Покормить охранника", 1, true) or t:find("\xcf\xee\xea\xee\xf0\xec\xe8\xf2\xfc \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0", 1, true) then
-        pcall(sampSendDialogResponse, id, 1, 0, "")
-        return false
-    end
-    -- спавн поруч
-    if body:find("%[1%].-Заспавнить рядом с собой") or body:find("Заспавнить рядом") then
-        if AIS.st.sppet1 or AIS.st.sppet2 or AIS.st.SpawnProcessing then
-            local idx = 0
-            for i, line in ipairs({}) do end
-            -- шукаємо рядок
-            local n = 0
-            for line in (body .. "\n"):gmatch("(.-)\n") do
-                if line:find("Заспавнить рядом") then
-                    pcall(sampSendDialogResponse, id, 1, n, "")
-                    return false
+
+    local changed = false
+    for obj in arr:gmatch("%b{}") do
+        local name    = obj:match('"name"%s*:%s*"([^"]*)"')
+        local id      = tonumber(obj:match('"id"%s*:%s*(%d+)'))
+        local slot    = tonumber(obj:match('"slot"%s*:%s*(%d+)'))
+        local spawned = tonumber(obj:match('"spawned"%s*:%s*(%d+)'))
+
+        if name and id and slot then
+            spawned = spawned or 0
+            local sec = byId[id]
+            if not sec then
+                sec = { name = name, id = id, slot = slot, spawned = spawned }
+                table.insert(s.Security, sec)
+                byId[id] = sec
+                changed = true
+            else
+                if sec.spawned ~= spawned then
+                    sec.spawned = spawned
+                    changed = true
                 end
-                n = n + 1
+                sec.name = name
+                sec.slot = slot
+            end
+            if fullReset then
+                AIS.dbg(string.format("\xce\xf5\xf0\xe0\xed\xed\xe8\xea: %s | ID: %d | Slot: %d | Spawned: %d", name, id, slot, spawned))
             end
         end
     end
-    -- відправити за доставкою (off)
-    if body:find("Отправить за доставкой") and (AIS.st.offpet1 or AIS.st.offpet2) then
-        local n = 0
-        for line in (body .. "\n"):gmatch("(.-)\n") do
-            if line:find("Отправить за доставкой") then
-                pcall(sampSendDialogResponse, id, 1, n, "")
-                return false
-            end
-            n = n + 1
+    return changed
+end
+
+-- скрыть открытый инвентарь (эмуляция пакета "закрыть окно")
+function AIS.hideInventory()
+    local code = "window.executeEvent('event.setActiveView', `[ null ]`);"
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 17)
+    raknetBitStreamWriteInt32(bs, 0)
+    raknetBitStreamWriteInt16(bs, #code)
+    raknetBitStreamWriteInt8(bs, 0)
+    raknetBitStreamWriteString(bs, code)
+    raknetEmulPacketReceiveBitStream(220, bs)
+    raknetDeleteBitStream(bs)
+end
+
+-- действие над охранником после открытия инвентаря (в потоке)
+function AIS.performAction(flag, n, kind)
+    local st, s = AIS.st, AIS.s
+    local sp   = (n == 1) and s.SpPet1 or s.SpPet2
+    local info = (n == 1) and s.InfoEat.FirstSecurity or s.InfoEat.SecondSecurity
+    local who  = (n == 1) and "\xce\xf1\xed\xee\xe2\xed\xee\xe9" or "\xc2\xf2\xee\xf0\xee\xe9"
+    local pet  = AIS.getById(sp and sp.id)
+
+    if not pet then
+        AIS.msg(who .. " \xee\xf5\xf0\xe0\xed\xed\xe8\xea \xed\xe5 \xed\xe0\xe9\xe4\xe5\xed \xe2 \xf1\xef\xe8\xf1\xea\xe5.")
+        st[flag] = false
+        AIS.sendCEF("inventoryClose")
+        return
+    end
+
+    if kind == "spawn" then
+        if tonumber(pet.spawned) == 1 then
+            AIS.msg(who .. " \xee\xf5\xf0\xe0\xed\xed\xe8\xea {e0b42f}\xf3\xe6\xe5{ffffff} \xef\xf0\xe8\xe7\xe2\xe0\xed.")
+            st[flag] = false
+            AIS.sendCEF("inventoryClose")
+        else
+            AIS.sendCEF('clickOnMenu|{"id": ' .. tonumber(pet.id) .. "}")
+            AIS.sendCEF("inventoryClose")
+            AIS.AddVerifiSecurity("spawn")
+        end
+    elseif kind == "off" then
+        AIS.sendCEF('clickOnMenu|{"id": ' .. tonumber(pet.id) .. "}")
+        AIS.sendCEF("inventoryClose")
+        AIS.AddVerifiSecurity("off")
+    elseif kind == "eat" then
+        if tonumber(pet.spawned) ~= 1 then
+            AIS.msg(who .. " \xee\xf5\xf0\xe0\xed\xed\xe8\xea \xed\xe5 \xef\xf0\xe8\xe7\xe2\xe0\xed. \xca\xee\xf0\xec\xeb\xe5\xed\xe8\xe5 \xee\xf2\xec\xe5\xed\xe5\xed\xee.")
+            st[flag] = false
+            AIS.sendCEF("inventoryClose")
+        else
+            AIS.sendCEF('useItemOnSecurity|{"from":{"amount":' .. tonumber(info.quantity or 0)
+                .. ',"slot":' .. tonumber(info.slot or 0) .. ',"type":1},"id":' .. tonumber(pet.id) .. "}")
+            AIS.sendCEF("inventoryClose")
         end
     end
-    return nil -- не обробляли
 end
 
-function AIS.onServerMessage(color, text)
-    if not AIS.st.enabled then return end
-    local msg = tostring(text or "")
-    local clean = msg:gsub("{%x%x%x%x%x%x}", ""):gsub("{%x%x%x%x%x%x%x%x}", "")
+AIS.ACTIONS = {
+    { flag = "sppet1",  n = 1, kind = "spawn" },
+    { flag = "sppet2",  n = 2, kind = "spawn" },
+    { flag = "offpet1", n = 1, kind = "off"   },
+    { flag = "offpet2", n = 2, kind = "off"   },
+    { flag = "eatpet1", n = 1, kind = "eat"   },
+    { flag = "eatpet2", n = 2, kind = "eat"   },
+}
 
-    if clean:find("На сервере есть инвентарь, используйте клавишу Y", 1, true)
-        or clean:find("\xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc", 1, true) and clean:find("Y", 1, true) then
-        if AIS.st.autoSpawn then
-            AIS.AutoSpawnPet()
-        end
-        return
-    end
-    if clean:find("накормил", 1, true) and clean:find("охранник", 1, true) then
-        AIS.st.eatpet1 = false
-        AIS.st.eatpet2 = false
-        return
-    end
-    if clean:find("охранник голоден", 1, true) or clean:find("голоден", 1, true) and clean:find("охранник", 1, true) then
-        AIS.AutoEatpet()
-        return
-    end
-    if clean:find("У вас нету охранников", 1, true) or clean:find("нет охранников", 1, true) then
-        AIS.st.autoSpawn = false
-        AIS.st.autoEat = false
-        pcall(sampAddChatMessage, "{FF6666}[AIS] no securities — auto off", -1)
-        return
-    end
-end
-
-function AIS.onDisplayGameText(text, time, style)
-    if not AIS.st.enabled then return end
-    local s = tostring(text or "")
-    if s:find("2 sec", 1, true) then
-        local ms = AIS.st.reducedAudio and 5550 or 17550
-        pcall(function()
-            if freezeCharPosition and PLAYER_PED then
-                freezeCharPosition(PLAYER_PED, true)
-                AIS.st.freezeUntil = os.clock() + (ms / 1000)
-                lua_thread.create(function()
-                    wait(ms)
-                    pcall(freezeCharPosition, PLAYER_PED, false)
-                end)
-            end
-        end)
-    end
-end
-
--- ── onReceivePacket: CEF inventory opcode 17 ────────────────
+-- ── обработка пакета 220 (CEF): инвентарь и список охранников ──
 function AIS.onReceivePacket(id, bs)
     if id ~= 220 then return end
-    if not AIS.st.enabled then return end
-    local raw = nil
-    pcall(function()
-        -- layout як у AIS 2.0.6: skip 8 bit, opcode 17, skip 32, len, encoded, string
-        if raknetBitStreamIgnoreBits then
-            raknetBitStreamIgnoreBits(bs, 8)
-            local op = raknetBitStreamReadInt8(bs)
-            if op ~= 17 then return end
-            raknetBitStreamIgnoreBits(bs, 32)
-            local length = raknetBitStreamReadInt16(bs)
-            local encoded = raknetBitStreamReadInt8(bs)
-            if encoded ~= 0 and raknetBitStreamDecodeString then
-                raw = raknetBitStreamDecodeString(bs, length + encoded)
-            else
-                raw = raknetBitStreamReadString(bs, length)
-            end
-        else
-            local op = raknetBitStreamReadInt8(bs)
-            if op ~= 17 then return end
-            local length = raknetBitStreamReadInt16(bs)
-            if length and length > 0 and length < 500000 then
-                raw = raknetBitStreamReadString(bs, length)
-            end
-        end
-    end)
-    if type(raw) ~= "string" or #raw < 10 then return end
-    AIS.st.checkinv = true
-    pcall(AIS.parseInventoryJson, raw)
+    if not AIS.on() then return end
 
-    -- список охранників з "securities":[ ... ]
-    if AIS.st.checkAllPet or (raw:find('"securities"', 1, true)) then
-        local arr = raw:match('"securities"%s*:%s*%[(.-)%]')
-        if arr then
-            AIS.st.securityList = {}
-            for obj in arr:gmatch("%b{}") do
-                local name = obj:match('"name"%s*:%s*"([^"]*)"')
-                local pid = tonumber(obj:match('"id"%s*:%s*(%d+)'))
-                local slot = tonumber(obj:match('"slot"%s*:%s*(%d+)'))
-                local spawned = tonumber(obj:match('"spawned"%s*:%s*(%d+)')) or 0
-                if name and pid then
-                    AIS.st.securityList[#AIS.st.securityList + 1] = {
-                        name = name, id = pid, slot = slot, spawned = spawned
-                    }
-                    AIS.st.pets[pid] = { id = pid, name = name, slot = slot, spawned = spawned }
+    local st, s = AIS.st, AIS.s
+
+    raknetBitStreamIgnoreBits(bs, 8)
+    if raknetBitStreamReadInt8(bs) ~= 17 then return end
+    raknetBitStreamIgnoreBits(bs, 32)
+    local length  = raknetBitStreamReadInt16(bs)
+    local encoded = raknetBitStreamReadInt8(bs)
+    local str = (encoded ~= 0) and raknetBitStreamDecodeString(bs, length + encoded)
+        or raknetBitStreamReadString(bs, length)
+    if type(str) ~= "string" then return end
+
+    -- запоминаем слот и количество выбранной еды в инвентаре
+    local eatInfo = { s.InfoEat.FirstSecurity, s.InfoEat.SecondSecurity }
+    local eatChanged = false
+    for i = 1, 2 do
+        local info = eatInfo[i]
+        if info then
+            local slot, quantity = str:match('"slot":(%d+),"available":1,"blackout":0,"item":'
+                .. tostring(info.type) .. ',"amount":(%d+)')
+            if slot then
+                slot, quantity = tonumber(slot), tonumber(quantity) or 0
+                if info.slot ~= slot or info.quantity ~= quantity then
+                    info.slot, info.quantity = slot, quantity
+                    eatChanged = true
                 end
             end
-            AIS.st.checkAllPet = false
-            pcall(AIS.jsonSave)
+        end
+    end
+    if eatChanged then AIS.save() end
+
+    if str:find("event.setActiveView", 1, true) and str:find("Inventory", 1, true) then
+        if not st.checkinv then st.checkinv = true; AIS.dbg("\xc8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc \xee\xf2\xea\xf0\xfb\xf2") end
+        if not (st.checkAllPet or st.sppet1 or st.sppet2 or st.offpet1 or st.offpet2
+                or st.eatpet1 or st.eatpet2 or st.AddVerifi) then
+            return
+        end
+
+        lua_thread.create(function()
+            local ok, err = pcall(function()
+                wait(450)
+                AIS.sendCEF("requestShowingInventory|28")
+                wait(250)
+                for _, a in ipairs(AIS.ACTIONS) do
+                    if st[a.flag] then
+                        AIS.performAction(a.flag, a.n, a.kind)
+                        break
+                    end
+                end
+            end)
+            if not ok then print("[AIS] inventory action error: " .. tostring(err)) end
+        end)
+
+        AIS.hideInventory()
+    end
+
+    if str:match("event.setActiveView") and str:match("null") and st.checkinv then
+        st.checkinv = false
+        AIS.dbg("\xc8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc \xe7\xe0\xea\xf0\xfb\xf2.")
+    end
+
+    if str:find("event.inventory.playerInventory", 1, true) and str:find("securities", 1, true) then
+        if AIS.parseSecurities(str, false) then AIS.save() end
+
+        if st.checksecurityinv then
+            st.checksecurityinv = false
+            AIS.sendCEF("inventoryClose")
+        end
+
+        if st.checkAllPet then
+            AIS.msg("\xd1\xea\xe0\xed\xe8\xf0\xf3\xfe \xe2\xf1\xe5\xf5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2...")
+            if AIS.parseSecurities(str, true) == nil then
+                AIS.msg("\xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xef\xee\xeb\xf3\xf7\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2.")
+                return
+            end
+            AIS.save()
+            AIS.msg("\xc8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xff \xee\xe1\xee \xe2\xf1\xe5\xf5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0\xf5 {40e348}\xf3\xf1\xef\xe5\xf8\xed\xee{ffffff} \xef\xee\xeb\xf3\xf7\xe5\xed\xe0!")
+            st.checkAllPet = false
+            AIS.sendCEF("inventoryClose")
+        end
+    end
+end
+
+-- ── диалоги охранников ──
+function AIS.onShowDialog(id, style, tit, btn1, btn2, text)
+    if not AIS.on() then return nil end
+    local st = AIS.st
+    tit  = tostring(tit or "")
+    text = tostring(text or "")
+
+    if tit:match("{BFBBBA}\xcf\xf0\xe8\xe7\xfb\xe2 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0") then
+        lua_thread.create(function()
+            wait(1)
+            sampCloseCurrentDialogWithButton(0)
+        end)
+        AIS.dbg("[SpPet] \xce\xf5\xf0\xe0\xed\xed\xe8\xea \xf3\xf1\xef\xe5\xf8\xed\xee \xe7\xe0\xf1\xef\xe0\xe2\xed\xe5\xed!")
+    end
+
+    if tit:match("{BFBBBA}.+") then
+        if st.sppet1 or st.sppet2 then
+            lua_thread.create(function()
+                wait(1)
+                if text:match("%{C0C0C0%}%[1%] %{FFFFFF%}\xc7\xe0\xf1\xef\xe0\xe2\xed\xe8\xf2\xfc \xf0\xff\xe4\xee\xec \xf1 \xf1\xee\xe1\xee\xe9") then
+                    sampSendDialogResponse(id, 1, 0, "")
+                elseif text:match("%{C0C0C0%}%[%d+%] %{FFFFFF%}\xd1\xef\xf0\xff\xf2\xe0\xf2\xfc") then
+                    AIS.msg("\xc2\xe0\xf8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea {e0b42f}\xf3\xe6\xe5{ffffff} \xe7\xe0\xf1\xef\xe0\xe2\xed\xe5\xed!")
+                end
+                st.sppet1, st.sppet2 = false, false
+                sampCloseCurrentDialogWithButton(0)
+            end)
+        end
+
+        if st.offpet1 or st.offpet2 then
+            lua_thread.create(function()
+                wait(1)
+                if text:match("%[%d+%] {.-}\xce\xf2\xef\xf0\xe0\xe2\xe8\xf2\xfc \xe7\xe0 \xe4\xee\xf1\xf2\xe0\xe2\xea\xee\xe9") then
+                    sampSendDialogResponse(id, 1, 1, "")
+                elseif text:match("%{C0C0C0%}%[%d+%] %{FFFFFF%}\xd1\xef\xf0\xff\xf2\xe0\xf2\xfc") then
+                    sampSendDialogResponse(id, 1, 0, "")
+                else
+                    AIS.msg("\xc2\xe0\xf8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea {e0b42f}\xf3\xe6\xe5{ffffff} \xf1\xea\xf0\xfb\xf2!")
+                end
+                st.offpet1, st.offpet2 = false, false
+                sampCloseCurrentDialogWithButton(0)
+            end)
+            AIS.dbg("[OffPet] \xce\xf5\xf0\xe0\xed\xed\xe8\xea \xf3\xf1\xef\xe5\xf8\xed\xee \xf1\xea\xf0\xfb\xf2!")
         end
     end
 
-    -- клік по меню при призові/знятті (як у AIS після requestShowingInventory|28)
-    if AIS.st.sppet1 or AIS.st.sppet2 or AIS.st.offpet1 or AIS.st.offpet2 or AIS.st.eatpet1 or AIS.st.eatpet2 then
+    if tit:match("{BFBBBA}\xcf\xee\xea\xee\xf0\xec\xe8\xf2\xfc \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0") then
         lua_thread.create(function()
-            wait(450)
-            pcall(function()
-                AIS.sendCEF("requestShowingInventory|28")
-                wait(250)
-                local n = (AIS.st.sppet1 or AIS.st.offpet1 or AIS.st.eatpet1) and 1 or 2
-                local petId = nil
-                if AIS.cfg and AIS.cfg["spPet" .. n] then
-                    petId = tonumber(AIS.cfg["spPet" .. n].id)
-                end
-                petId = petId or AIS.petIdByIndex(n) or AIS.firstPetId()
-                if AIS.st.eatpet1 or AIS.st.eatpet2 then
-                    local food = AIS.pickFood()
-                    if food and petId then
-                        AIS.sendCEF(string.format(
-                            'useItemOnSecurity|{"from":{"amount":1,"slot":%d,"type":1},"id":%d}',
-                            food.slot, petId))
-                    end
-                    AIS.st.eatpet1, AIS.st.eatpet2 = false, false
-                elseif petId then
-                    AIS.sendCEF(string.format('clickOnMenu|{"id": %d}', petId))
-                end
-                wait(200)
-                AIS.sendCEF("inventoryClose")
-                AIS.st.sppet1, AIS.st.sppet2 = false, false
-                AIS.st.offpet1, AIS.st.offpet2 = false, false
-            end)
+            wait(1)
+            sampSendDialogResponse(id, 1, nil, "")
         end)
+    end
+
+    return nil
+end
+
+-- ── сообщения сервера ──
+function AIS.onServerMessage(color, text)
+    if not AIS.on() then return end
+    local st, s = AIS.st, AIS.s
+    text = tostring(text or "")
+
+    local nick = ""
+    pcall(function()
+        nick = sampGetPlayerNickname(select(2, sampGetPlayerIdByCharHandle(PLAYER_PED))) or ""
+    end)
+
+    if text:find("{DFCFCF}%[\xcf\xee\xe4\xf1\xea\xe0\xe7\xea\xe0%] {DC4747}\xcd\xe0 \xf1\xe5\xf0\xe2\xe5\xf0\xe5 \xe5\xf1\xf2\xfc \xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc, \xe8\xf1\xef\xee\xeb\xfc\xe7\xf3\xe9\xf2\xe5 \xea\xeb\xe0\xe2\xe8\xf8\xf3 Y \xe4\xeb\xff \xf0\xe0\xe1\xee\xf2\xfb \xf1 \xed\xe8\xec.") then
+        if s.AutoSpawnPet then
+            AIS.run(function()
+                wait((tonumber(s.TimeUsePet) or 0) * 1000)
+                AIS.AutoSpawnPet()
+            end)
+        end
+    end
+
+    if nick ~= "" then
+        local esc = nick:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")
+        if text:match(esc .. " \xed\xe0\xea\xee\xf0\xec\xe8\xeb%(\xe0%) \xf1\xe2\xee\xe5\xe3\xee \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0") then
+            if s.InfoEat.FirstSecurity.autoeat or s.InfoEat.SecondSecurity.autoeat then
+                st.eatpet1, st.eatpet2 = false, false
+                AIS.msg("\xc2\xfb \xef\xee\xea\xee\xf0\xec\xe8\xeb\xe8 \xf1\xe2\xee\xe5\xe3\xee \xe4\xf0\xf3\xe3\xe0! \xd3\xf5\xee\xe6\xf3 \xe2 \xca\xc4 \xe4\xee \xf1\xeb\xe5\xe4\xf3\xfe\xf9\xe5\xe3\xee \xef\xf0\xe8\xec\xe5\xed\xe5\xed\xe8\xff...")
+            end
+        end
+    end
+
+    if text:match("\xc2\xe0\xf8 \xeb\xe8\xf7\xed\xfb\xe9 \xee\xf5\xf0\xe0\xed\xed\xe8\xea \xe3\xee\xeb\xee\xe4\xe5\xed, \xe5\xe3\xee \xed\xe5\xee\xe1\xf5\xee\xe4\xe8\xec\xee \xef\xee\xea\xee\xf0\xec\xe8\xf2\xfc!") then
+        AIS.run(AIS.AutoEatpet)
+    end
+
+    if text:match("\xcf\xf0\xe8\xe7\xfb\xe2 \xeb\xe8\xf7\xed\xee\xe3\xee \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xee\xf2\xec\xe5\xed\xb8\xed!") and color == -1104335361 then
+        AIS.msg("\xc2\xfb \xee\xf2\xec\xe5\xed\xe8\xeb\xe8 \xef\xf0\xe8\xe7\xfb\xe2...")
+        st.sppet1, st.sppet2 = false, false
+        if st.checkinv then AIS.sendCEF("inventoryClose") end
+    end
+
+    if text:match("%[\xce\xf8\xe8\xe1\xea\xe0%] %{ffffff%}\xd3 \xe2\xe0\xf1 \xed\xe5\xf2\xf3 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2!") then
+        -- в оригинале скрипт выгружался; в PC Stats просто отключаем автоматику
+        AIS.dbg("\xd3 \xe2\xe0\xf1 \xed\xe5\xf2 \xed\xe8 \xee\xe4\xed\xee\xe3\xee \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0! \xce\xf2\xea\xeb\xfe\xf7\xe0\xfe \xe0\xe2\xf2\xee\xec\xe0\xf2\xe8\xea\xf3.")
+        s.AutoSpawnPet = false
+        s.InfoEat.FirstSecurity.autoeat = false
+        s.InfoEat.SecondSecurity.autoeat = false
+        AIS.save()
+    end
+
+    if text:match("%[\xce\xf8\xe8\xe1\xea\xe0%] {ffffff}\xcd\xe5 \xf4\xeb\xf3\xe4\xe8! %(2%)") then
+        if st.AddVerifi and not st.StopedUpdateInfo then st.StopedUpdateInfo = true end
+    end
+end
+
+-- ── GameText: замораживаем персонажа на время призыва ──
+function AIS.onDisplayGameText(style, time, text)
+    if not AIS.on() then return end
+    local st, s = AIS.st, AIS.s
+    if s.AutoSpawnPet and tostring(text or ""):match("2 sec") and not st.FreezePlayer then
+        st.FreezePlayer = true
+        AIS.run(function()
+            freezeCharPosition(PLAYER_PED, true)
+            AIS.dbg("\xc7\xe0\xec\xee\xf0\xe0\xe6\xe8\xe2\xe0\xfe \xea\xee\xee\xf0\xe4\xe8\xed\xe0\xf2\xfb \xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0")
+            wait(s.ReducedCooldown and 5550 or 17550)
+            freezeCharPosition(PLAYER_PED, false)
+            AIS.dbg("\xd0\xe0\xe7\xec\xee\xf0\xe0\xe6\xe8\xe2\xe0\xfe \xea\xee\xee\xf0\xe4\xe8\xed\xe0\xf2\xfb \xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0")
+            st.FreezePlayer = false
+        end)
+    end
+end
+
+-- ── планировщик: срабатывает один раз в начале нужной минуты (МСК = UTC+3,
+-- смещение целое в часах, поэтому минута одна и та же) ──
+function AIS.minuteHit(list, key)
+    local minute = os.date("!*t").min
+    local matched = false
+    for part in tostring(list):gmatch("%d+") do
+        if tonumber(part) == minute then matched = true end
+    end
+    if matched then
+        if not AIS.times[key] then
+            AIS.times[key] = true
+            return true
+        end
+    else
+        AIS.times[key] = false
+    end
+    return false
+end
+
+function AIS.tick()
+    if not AIS.on() then return end
+    local st, s = AIS.st, AIS.s
+
+    local spawned = false
+    pcall(function() spawned = sampIsLocalPlayerSpawned() end)
+
+    local checkNow = AIS.minuteHit("29, 59", "spawncheck")
+    if s.AutoSpawnPet and s.CheckingSecurityForSpawn and checkNow and spawned then
+        AIS.run(AIS.AutoSpawnPet)
+    end
+
+    if not spawned and (st.sppet1 or st.sppet2 or st.CheckAutoSpawn or st.SpawnProcessing) then
+        AIS.msg("\xc2\xfb\xea\xeb\xfe\xf7\xe0\xfe \xe7\xe0\xef\xf3\xf9\xe5\xed\xed\xfb\xe9 \xef\xf0\xee\xf6\xe5\xf1\xf1, \xf2.\xea. \xef\xe5\xf0\xf1\xee\xed\xe0\xe6 \xed\xe5 \xef\xee\xe4\xea\xeb\xfe\xf7\xe5\xed \xea \xf1\xe5\xf0\xe2\xe5\xf0\xf3")
+        st.sppet1, st.sppet2 = false, false
+        st.CheckAutoSpawn = false
+        st.SpawnProcessing = false
+    end
+
+    if s.InfoEat.FirstSecurity.autoeat then
+        if AIS.minuteHit(tostring(tonumber(s.TimeUseEat) or 0), "eat") then
+            AIS.msg("\xc7\xe0\xef\xf3\xf1\xea\xe0\xfe \xe0\xe2\xf2\xee\xea\xee\xf0\xec\xe5\xe6\xea\xf3 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xef\xee \xf3\xea\xe0\xe7\xe0\xed\xed\xee\xec\xf3 \xe2\xf0\xe5\xec\xe5\xed\xe8!")
+            AIS.run(AIS.AutoEatpet)
+        end
+    end
+end
+
+function AIS.loop()
+    while true do
+        wait(250)
+        local ok, err = pcall(AIS.tick)
+        if not ok then print("[AIS] tick error: " .. tostring(err)) end
     end
 end
 
 function AIS.registerCommands()
-    local function reg(cmd, fn)
-        pcall(sampRegisterChatCommand, cmd, fn)
-    end
-    reg("sppet", function(arg)
-        local n = tonumber(tostring(arg or "1"):match("%d")) or 1
-        AIS.SpawnPet(n)
-    end)
-    reg("offpet", function(arg)
-        local n = tonumber(tostring(arg or "1"):match("%d")) or 1
-        AIS.OffPet(n)
-    end)
-    reg("fasteat", function(arg)
-        local n = tonumber(tostring(arg or "1"):match("%d")) or 1
-        AIS.EatPet(n)
-    end)
-    reg("aisallsppet", function()
-        AIS.SpawnPet(1); wait(0)
-        lua_thread.create(function()
-            wait(2000)
-            AIS.SpawnPet(2)
-        end)
-    end)
+    local function reg(cmd, fn) pcall(sampRegisterChatCommand, cmd, fn) end
+    reg("sppet",   function(arg) if AIS.on() then AIS.run(AIS.SpawnPet, tonumber(arg)) end end)
+    reg("offpet",  function(arg) if AIS.on() then AIS.run(AIS.OffPet, tonumber(arg)) end end)
+    reg("fasteat", function(arg) if AIS.on() then AIS.EatPet(arg) end end)
+    reg("aisallsppet", function() if AIS.on() then AIS.run(AIS.AutoSpawnPet) end end)
     reg("aisallclear", function()
-        AIS.OffPet(1)
-        lua_thread.create(function()
-            wait(1500)
-            AIS.OffPet(2)
-        end)
+        AIS.s.Security = {}
+        AIS.s.SpPet1 = { name = "", id = "", slot = "", spawned = 0 }
+        AIS.s.SpPet2 = { name = "", id = "", slot = "", spawned = 0 }
+        AIS.save()
+        AIS.msg("\xd1\xef\xe8\xf1\xee\xea \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 \xee\xf7\xe8\xf9\xe5\xed.")
     end)
     reg("aisreload", function()
-        AIS.jsonLoad()
-        pcall(sampAddChatMessage, "{00FF88}[AIS] config reloaded", -1)
+        AIS.load()
+        AIS.msg("\xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 \xef\xe5\xf0\xe5\xe7\xe0\xe3\xf0\xf3\xe6\xe5\xed\xfb.")
     end)
-    reg("ais", function(arg)
-        arg = tostring(arg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-        if arg == "spawn" or arg == "autospawn" then
-            AIS.st.autoSpawn = not AIS.st.autoSpawn
-            AIS.jsonSave()
-            pcall(sampAddChatMessage, "{66CCFF}[AIS] autoSpawn=" .. tostring(AIS.st.autoSpawn), -1)
-        elseif arg == "eat" or arg == "autoeat" then
-            AIS.st.autoEat = not AIS.st.autoEat
-            AIS.jsonSave()
-            pcall(sampAddChatMessage, "{66CCFF}[AIS] autoEat=" .. tostring(AIS.st.autoEat), -1)
-        elseif arg == "off" then
-            AIS.st.enabled = false; AIS.jsonSave()
-            pcall(sampAddChatMessage, "{FFAA00}[AIS] disabled", -1)
-        elseif arg == "on" then
-            AIS.st.enabled = true; AIS.jsonSave()
-            pcall(sampAddChatMessage, "{00FF88}[AIS] enabled", -1)
-        elseif arg == "check" then
-            AIS.CheckAllPet()
-        else
-            pcall(sampAddChatMessage, "{66CCFF}[AIS] /ais on|off|spawn|eat|check | /sppet 1|2 /offpet /fasteat", -1)
-        end
+    reg("ais", function()
+        pcall(function()
+            if not St.winOpen and type(toggleMenuWindow) == "function" then toggleMenuWindow() end
+            if type(PCS_openGuardTab) == "function" then PCS_openGuardTab() end
+        end)
     end)
 end
 
 function AIS.init()
-    AIS.jsonLoad()
+    AIS.load()
     AIS.registerCommands()
-    print("[AIS] Auto-Interaction Securities loaded (prefix ais_)")
+    if not AIS._evReg then
+        AIS._evReg = true
+        pcall(addEventHandler, "onReceivePacket", function(id, bs)
+            local ok, err = pcall(AIS.onReceivePacket, id, bs)
+            if not ok then print("[AIS] packet error: " .. tostring(err)) end
+        end)
+    end
+    lua_thread.create(AIS.loop)
+    print("[AIS] Auto-Interaction Securities 2.0.6 (\xef\xee\xf0\xf2) \xe7\xe0\xe3\xf0\xf3\xe6\xe5\xed")
 end
 
--- глобальний доступ
+-- глобальный доступ
 _G.AIS = AIS
 
 
@@ -1804,6 +2071,33 @@ end
 --     (правильно: local unpack = table.unpack or unpack);
 --   - _pcsStripColorTags раньше резал только "{RRGGBB}", теперь ещё и
 --     "{RRGGBBAA}".
+-- ── СМАЙЛЫ В ЧАТЕ ARIZONA ──────────────────────────────────
+-- Родной чат SA-MP не рисует UTF-8 эмодзи (они вырезаются ниже), но клиент
+-- Arizona умеет заменять коды вида ":name:" на картинки-смайлы. Здесь
+-- лежит таблица кодов (ПОДТВЕРЖДЕНЫ: :man: — им пользуется сам AIS, :buy:
+-- приходит в сообщениях сервера). Свои коды из игрового списка смайлов
+-- можно добавлять сюда же и использовать через PCS_EMOJI.имя ──
+PCS_EMOJI = { man = ":man:", money = ":buy:" }
+-- сообщениям про налоги/PayDay (не ошибкам и не с уже стоящим смайлом)
+-- добавляет смайл денег сразу после тега вида "[PC Stats]"
+function PCS_addChatEmoji(text)
+    if type(text) ~= "string" then return text end
+    local hex, rest = text:match("^{(%x%x%x%x%x%x)}(.*)$")
+    if not hex then return text end
+    local H = hex:upper()
+    if H == "FF6666" or H == "FF4444" or H == "FFAA00" then return text end
+    if rest:find(":%a+:") then return text end
+    local close = rest:find("]", 1, true)
+    if not close or close > 30 then return text end
+    local words = { "\xed\xe0\xeb\xee\xe3", "\xcd\xe0\xeb\xee\xe3", "PayDay", "Payday", "PAYDAY", "payday" }
+    for _, w in ipairs(words) do
+        if rest:find(w, 1, true) then
+            return "{" .. hex .. "}" .. rest:sub(1, close) .. " " .. PCS_EMOJI.money .. rest:sub(close + 1)
+        end
+    end
+    return text
+end
+
 if type(sampAddChatMessage) == "function" then
     local _origAddChatMessage = sampAddChatMessage
     PCS_ORIG_CHAT = _origAddChatMessage
@@ -1838,6 +2132,10 @@ if type(sampAddChatMessage) == "function" then
         local rawText = text
         if type(text) == "string" then
             text = stripUtf8Symbols(text)
+            if type(PCS_addChatEmoji) == "function" then
+                local okE, withE = pcall(PCS_addChatEmoji, text)
+                if okE and withE then text = withE end
+            end
             -- applyCustomChatColor определяется ниже по файлу (после того,
             -- как загружен cfg) — на момент реального вызова (отправка
             -- сообщения в чат) она уже точно объявлена как глобальная
@@ -1851,6 +2149,10 @@ if type(sampAddChatMessage) == "function" then
         pcall(function()
             if type(pcs_notify) ~= "function" then return end
             local clean = _pcsStripColorTags(rawText)
+            -- коды смайлов Arizona (:man: и т.п.) в тосте не нужны
+            for _, tag in pairs(PCS_EMOJI or {}) do
+                clean = clean:gsub((tag:gsub("%p", "%%%0")) .. " ?", "")
+            end
             if type(clean) == "string" and clean:match("%S") and not _pcsIsDecorativeOnly(clean) then
                 -- ФИКС "в тосте вопросики вместо текста": rawText — это сырые
                 -- CP1251-байты (как их ожидает сам sampAddChatMessage), а
@@ -1986,6 +2288,11 @@ local function readLogTail(path, maxLines, avgLineLen)
     local lines = {}
     local first = true
     for line in (chunk .. "\n"):gmatch("(.-)\n") do
+        -- ФИКС "логи PayDay/налогов пропадают после обновления/перезагрузки":
+        -- записи дописываются в текстовом режиме (на Windows это \r\n), а файл
+        -- читается в бинарном — в конце каждой строки оставался \r, и паттерны
+        -- с "$" в TX.loadLog/PD.loadIncomeLog не совпадали ни с одной строкой
+        line = line:gsub("\r$", "")
         if first and seekPos > 0 then
             first = false -- первая строка после произвольного seek может быть обрезана посередине
         elseif line ~= "" then
@@ -2006,66 +2313,145 @@ end
 -- base64 в бинарные байты и один раз сохраняем как .ttf-файл рядом
 -- с настройками (moonloader/config/PCStats/) — при следующих запусках
 -- скрипт видит, что файл уже есть, и просто переиспользует его ──
-local ICON_FONT_FILE = CFG_DIR .. "/pcstats-icons.ttf"
+local ICON_FONT_FILE = CFG_DIR .. "/pcstats-icons-v2.ttf" -- v2: расширенный набор глифов (иконки FA6 solid+brands)
 local ICON_FONT_B64 = table.concat({
-    "AAEAAAAKAIAAAwAgT1MvMlFQWnEAAA3IAAAAYGNtYXDIPbtOAAAOKAAAAHRnbHlmX7YriQAAAKwAAAxQaGVhZCe8GNUAAA04AAAA",
-    "NmhoZWEETAI2AAANpAAAACRobXR4FgEAWQAADXAAAAA0bG9jYRJWFX8AAA0cAAAAHG1heHAAJAGRAAAM/AAAACBuYW1lHX04eQAA",
-    "DpwAAAGYcG9zdDw87asAABA0AAAAuAAFAAD/wAGAAcAABgANABQAGwA1AAA3Nwc3JzERFzMjMycxBzcXJxcRMQc3IzMjFzE3JTY3",
-    "MTE2NyExFhcWFxExBgcGByExJicmJxFAWlpaWiezs7NaWYBZWVlZM7Ozs1la/uYBDQ4UASAUDg0BAQ0OFP7gFA4NATqGhoaG/vQ6",
-    "hobAhoaGAQyGwIaGEBQODQEBDQ4U/mAUDg0BAQ0OFAGgAAAC//P/4ABNAaAAFQAiAAATNCcxMSYjIgcGFRExFBcWMzI3NjURAzY3",
-    "NicmJwYHBhcWF0AJCQ4OCQkJCQ4OCQkgFwwKCgwXFwwKCgwXAYAOCQkJCQ7/AA4JCQkJDgEA/mABExQUEwEBExQUEwEAAAIAAP/e",
-    "AcABoQBqAHMAABMWFzExFgcHMTMxNzE2NzYXFhcWBwcxMzEyFxYVFAcGIyMxBzEzMTIXFhUUBwYjIzEHMQYHBicmJyY3NzEjMQcx",
-    "BgcGJyYnJjc3MSMxIicmNTQ3NjMzMTcxIzEiJyY1NDc2MzMxNzE2NzYXFwc3BzMxNzEjtQ4HBwEKXwsDCgsNDgcHAgk6DgkJCQkO",
-    "RRU6DgkJCQkORQsDCgsNDgcHAglfCwMKCw0OBwcCCToOCQkJCQ5FFToOCQkJCQ5FCwMKCw0GFRUVXxVfAaADCgsNO0UOBwcBAwoL",
-    "DTsJCQ4OCQmACQkODgkJRQ4HBwEDCgsNO0UOBwgCAwoLDTsJCQ4OCQmACQkODgkJRQ4HBwGggICAgAAAAQAK/8ABNAHAAH4AABMy",
-    "FzExFhUVMTIzMDEWMRcxFhcWBwYHBicnMSYHBgcGFxYXFhcXMTIxFhcWFxYXFgcGBwYHBgcVMRQHBiMiJyY1NTEwIzAxIzExMSYn",
-    "JicmJyY3Njc2FxYXFhcWNzY3NicmJyYnJzExMTAxJicmJyYnJjc2NzY3Njc1MTQ3NjOgDgkJAgMBMA0HCAIDCwoOLzAeHAEDBAIL",
-    "GDEDARYXGBQWDgwGBhESGRQYCQkODgkJAQETGRoVDAUEBQYMCw0RFRUQMRsZAgIDAwoZMQMWGBgUFg0NBwUTExkUFwkJDgHACQkO",
-    "JAEIAwsKDg0HBwIIBw0MEA8FBgcPDAEFCAgMDhobIB0TEwoIAyEOCQkJCQ4jAwcHCQYMDA0MBAUFBwYGAwYLCxIQBQYHDwsBBggH",
-    "DQ4aGyAcExMKCAMjDgkJAAACAAD/wAHAAcAAGgAwAAA3MjcxMTY3NjU0JyYnJiMiBwYHBhUUFxYXFjMHBgcxMQYHFBcWMyExMjc2",
-    "NSYnJicj4CMdHRIRERIdHSMjHR0SERESHR0jLkszMgIJCA0BhA0ICQIyM0tcwBERHh4iIh4eERERER4eIiIeHhERMAIyM0sNCAkJ",
-    "CA1LMzICAAIAEP/QAfABwAAVAEwAAAE0JzExJiMiBwYVFTEUFxYzMjc2NTUHNjcxMTYnJicmBwYHBhUWFxYXFhc2NzY3Njc0JyYn",
-    "JgcGBwYXFhcWFxYVBgcGByYnJic0NzY3ASAJCQ4OCQkJCQ4OCQmQCgEBCAkNDQopFxcBICA2NkNDNjYgIAEXGCgKDQ0JCAEBCh4R",
-    "EQIyMUtLMjECEREdAaAOCQkJCQ7gDgkJCQkO4FkJDQ0KCwEBCCIvMDhDNjYgIAEBICA2NkM4MC8iCAEBCgsNDQkYIyMpSzEyAgIy",
-    "MUspIyMYAAACAAz/wAH0AcAAYABtAAABFgcHMRYVFAcXMRYHBgcHMQYHBicnMQYHBzEGBwYjIicmJycxJicHMQYnJicnMSYnJjc3",
-    "MSY1NDcnMSY3Njc3MTY3NhcXMTY3NzE2NzYzMhcWFxcxFhc3MTYXFhcXMRYXBzY3NicmJwYHBhcWFwHwBAosAgIsCgQHCQUKDAoO",
-    "OBQYDAQPFBYWFQ4EDBgUOA4KDQkFCQcECiwCAiwKBAcJBQkNCg44FBgMBA8UFhYVDgQMGBQ4DgoNCgQJB/AtGBYWGC0tGBYWGC0B",
-    "GQ4KKAwNDQwoCg4SEQgQDwsEEhAJOg4DBAQDDjoJEBIECw8QCBERDwonDQ0NDCgKDhIRCBAPCwQSEAo5DgMEBAMOOQoQEgQLDxAI",
-    "ERKpAScoKCcBAScoKCcBAAIAEP/ZAfABpwA8AH8AADc2NzYzMhcXMSMxIgcGFRQXFjMzMTAxMDExMTI3NjU1MTQnJiMiBwYVFTEn",
-    "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",
-    "AAABywBLAAAAAQAAAAABQQGvAAAAIAAAAAAAAgAAAAMAAAAUAAMAAQAAABQABABgAAAAFAAQAAMABPAH8BHwE/Ah8Frw4vH49t74",
-    "Hf//AADwB/AR8BPwIfBa8OLx+Pbe+B3//w/9D/QP8w/mD64PJw4SCS0H7wABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHAFoAAwAB",
-    "BAkAAAA0AAAAAwABBAkAAQAyADQAAwABBAkAAgAKAGYAAwABBAkAAwA+AHAAAwABBAkABAAyADQAAwABBAkABQBkAK4AAwABBAkA",
-    "BgAsARIAQwBvAHAAeQByAGkAZwBoAHQAIAAoAGMAKQAgAEYAbwBuAHQAIABBAHcAZQBzAG8AbQBlAEYAbwBuAHQAIABBAHcAZQBz",
-    "AG8AbQBlACAANgAgAEYAcgBlAGUAIABTAG8AbABpAGQAUwBvAGwAaQBkAEYAbwBuAHQAIABBAHcAZQBzAG8AbQBlACAANgAgAEYA",
-    "cgBlAGUAIABTAG8AbABpAGQALQA2AC4ANQAuADEAVgBlAHIAcwBpAG8AbgAgADcANwAzAC4AMAAxADEANwAxADgANwA1ACAAKABG",
-    "AG8AbgB0ACAAQQB3AGUAcwBvAG0AZQAgAHYAZQByAHMAaQBvAG4AOgAgADYALgA1AC4AMQApAEYAbwBuAHQAQQB3AGUAcwBvAG0A",
-    "ZQA2AEYAcgBlAGUALQBTAG8AbABpAGQAAgAAAAAAAP/bABkAAAAAAAAAAAAAAAAAAAAAAAAAAAANAAABAgEDAQQBBQEGAQcBCAEJ",
-    "AQoBCwEMAQ0LZXhjbGFtYXRpb24HaGFzaHRhZwtkb2xsYXItc2lnbgR1c2VyCXBvd2VyLW9mZgRnZWFyDWFycm93cy1yb3RhdGUL",
-    "Y2lyY2xlLWluZm8RYXJyb3ctcm90YXRlLWxlZnQFdHJhc2gJaGFuZC1maXN0C3NhY2stZG9sbGFy",
+    "AAEAAAAJAIAAAwAQT1MvMlFNWmUAAAEYAAAAYGNtYXANQAIWAAACHAAAAUxnbHlmskFB1gAAA7wAACRAaGVhZDJJAV8AAACcAAAA",
+    "NmhoZWEESAJaAAAA1AAAACRobXR4UDQAzgAAAXgAAACkbG9jYaWmryYAAANoAAAAVG1heHAAMgCtAAAA+AAAACBuYW1lAAYAAAAA",
+    "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",
+    "NjYgIAEBICA2NkM4MC8iCAEBCgsNDQkYIyMpSzEyAgIyMUspIyMYAAACAAz/wAH0AcAAYABtAAABFgcHMRYVFAcXMRYHBgcHMQYH",
+    "BicnMQYHBzEGBwYjIicmJycxJicHMQYnJicnMSYnJjc3MSY1NDcnMSY3Njc3MTY3NhcXMTY3NzE2NzYzMhcWFxcxFhc3MTYXFhcX",
+    "MRYXBzY3NicmJwYHBhcWFwHwBAosAgIsCgQHCQUKDAoOOBQYDAQPFBYWFQ4EDBgUOA4KDQkFCQcECiwCAiwKBAcJBQkNCg44FBgM",
+    "BA8UFhYVDgQMGBQ4DgoNCgQJB/AtGBYWGC0tGBYWGC0BGQ4KKAwNDQwoCg4SEQgQDwsEEhAJOg4DBAQDDjoJEBIECw8QCBERDwon",
+    "DQ0NDCgKDhIRCBAPCwQSEAo5DgMEBAMOOQoQEgQLDxAIERKpAScoKCcBAScoKCcBAAIAAP/AAgABwAAaAC4AAAEWFzExFhcWFRQH",
+    "BgcGByYnJicmNTQ3Njc2NwcVNRUUFxcxFjc2JycxNTEmJwYHAQBGOjokIiIkOjpGRjo6JCIiJDo6RhgLYBMOCxJVAhYWAgHAASEi",
+    "PD1DQz08IiEBASEiPD1DQz08IiEBeIiIiA0HQAsSEw45exYCAhYAAgAQ/9kB8AGnADwAfwAANzY3NjMyFxcxIzEiBwYVFBcWMzMx",
+    "MDEwOQIyNzY1NTE0JyYjIgcGFRUxJzEmJyYHBgcGBwYXFhcWNzY3BwYHBgcUBxQVFTEUFxYzMjc2NTUxFzEwMRYXFjc2NzY3Nicm",
+    "JyYHBgcGBwYjIicxMScxMzEyNzY1NCcmIyMxIiMGI2kMGjFAQDERIg4JCQkJDnAOCQkJCQ4OCQkSLDk5OTksJRAEBQYMDQwLBUII",
+    "BgYCAQkJDg4JCRIsOTk5OSwlEAQFBgwNDAsFDBoxQEAxESIOCQkJCQ5wAgIDAvUiGi8vEQkJDg4JCQkJDnAOCQkJCQ4jESwPDg4P",
+    "LCUuDQwLBQQFBgxWAwYGCAECAwJwDgkJCQkOIxEsDw4ODywlLg0MCwUEBQYMIRsvLxEJCQ4OCQkBAAACAAD/wAIAAcAAGgA7AAAF",
+    "NjcxMTY3NjU0JyYnJicGBwYHBhUUFxYXFhcDNhcXMTcxNhcWBwcxFzEWBwYnJzEHMQYnJjc3MScxJjcBAEY6OiQiIiQ6OkZGOjok",
+    "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",
+    "CQkODgkJCQkODgkJDhEBARFu/q0TDQ0NDRMBUwADAAD/wAKAAcAAGgAxAFMAABM0NzExNjc2MzIXFhcWFRQHBgcGIyInJicmNQM2",
+    "NzExNjczMRYXFhcUBwYjITEiJyY1JTUVNSMxJic2NzMxNTE2NxYXFTEzMRYXBgcjMRUxBgcmJ2ARER4eIiIeHhEREREeHiIiHh4R",
+    "EWACMjNLXEszMgIJCA3+fA0ICQH4QBYCAhZAAhYWAkAWAgIWQAIWFgIBQCMdHRIRERIdHSMjHR0SERESHR0j/p5LMzICAjIzSw0I",
+    "CQkIDapAQEACFhYCQBYCAhZAAhYWAkAWAgIWAAMAAP/AAcABwQAmAF4AZwAAASYHMTEGBzExBgcVMRYXFhczMRUxFBcWMzI3NjU1",
+    "MTUxNTE0JyYjBSYnIgcHMQYVFhcWFxUxFBcWMzI3NjU1MTY3Njc0JycxJiMGBxUxBgcmJycxJicGBwcxBgcmJzUXOQQ1MRUBoAoe",
+    "HxscAgESEhsgCQkODgkJCQkO/qABDQ4EHgIBFhciCQkODgkJIhcWAQIeBA4NAQEJCAIMAg4OAgwCCAkBMAHAAQ8OJidHcBsSEgGA",
+    "DgkJCQkOgHDQDgkJEA0DDYgJCiMYGQTgDgkJCQkO4AQZGCMKCYgNAw2GCQEBCIgOAQEOiAgBAQmGmAEBAAIAEP/ZAfABpwAuAF4A",
+    "ABMGBwYHBicmJyY3Njc2NzYXFhc3MTYXFhcVMQYHIzEwMTAxIzEmJyY3NzEmIyIHBzY3MzkCMzEWFxYHBzEWMzI3Njc2NzYXFhcW",
+    "BwYHBgcGJyYnBzEGJyYnNTkCNY8aDAULDA0MBgUEECUsOTg5OSwqDA4OAQIWCHgQBgYLKTFAPzF/AhYIeBAGBgspMUA/MRoMBQsM",
+    "DQwGBgUQJSw5ODk5LCoMDg4BATEbIQwGBQQFCwwNLiUsDw4ODiwqCwYGEIAWAgEODgwpLi+pFgIBDg4MKS4vGyEMBgUEBQsMDS4l",
+    "LA8ODg4sKgsGBhB4CAAAAgAP/70B8QHAAB4ALgAAATIXFzEWFxYVFgcGBwYHBicmJyYnJjc0NzY3NzE2MxUZAjY3Njc2NScxMDEw",
+    "MQEABwa9EQoLARISLy5WGhpWLi8SEgELChG9BgdEJyYQD7ABwANQBw8PFDNFRUFCKwwMK0JBRUUzFA8PB1ADQ/6GAXr+hiM2Njk6",
+    "LkoAAwAA/8ACQgHAAF8AlAChAAABFTUVFhcWBwYnJiMiBwYVIhUUMTAxMDEUFxYXMzEwMTAxFhcWFwYHBgcVMQYHJic1MSYnIiMm",
+    "IyYjJjc2FxYzFhcWFzI3NjU2NTExNicmJycxJicmJzY3Njc1MTY3FhcBFgcxMQYHBzEGKwIiJyY1NTE0NzYzMzE3MTY7AjIXFhUU",
+    "BwYrAgYHFhczMTcxNhcWFwUwOQIwMSMxMDEwMwE4CggVBAcWEQ0MCAMBAwkTARITGAMCGQoLAhYWAg4KAQEBAQICFAUJFQICAgIT",
+    "DwwHAwEBBQgTAhITFwMDGQkLAhYWAgEACgIDDX8kLaCgDgkJCQkOJS0jLU5QDgkJCQkOQBAPAQEPeXcOEBAK/ooBAQGoCwsLAQMH",
+    "FhUEBQUCAQIBAQIEBgQLDSAiDwYCCxYCAhYLBAQBAQkWFAUBAQEHAQQCAQEDAQQFBQEECgwgIw0FAwsWAgIW/sgOEBAKXhoJCQ5A",
+    "DgkJJBwJCQ4OCQkBDw8BWAoCAw0wAAQAAP/AAoABwAAaADEASwBcAAATNDcxMTY3NjMyFxYXFhUUBwYHBiMiJyYnJjUDNjcxMTY3",
+    "MzEWFxYXFAcGIyExIicmNQUjMyM2NTUxNCcmJzAzMjMzMRYXFhcUBwYjAyYnNjc0JzY3FhcWFwYHBgdgEREeHiIiHh4RERERHh4i",
+    "Ih4eERFgAjIzS1xLMzICCQgN/nwNCAkCYYmJiQgTEiEBAwM+RC4tAgkJDbEwHx4BEhwmMB8gAQEgHzABQCMdHRIRERIdHSMjHR0S",
+    "ERESHR0j/p5LMzICAjIzSw0ICQkIDR4OEgguJyccAi0uRA0JCQEAASApNikhFQEBIB8wMB8gAQAAAwAA/74BQgHGAAwAVgBtAAAT",
+    "Njc2FxYXBgcGJyYnBwYjMTEiFQcxBgcHMQYHBicmJyY3NzE2NzcxNjMyFxYXFzEXMRYXFgcGBwYnJzEmJycxBzEXMRYXFzEWBwYH",
+    "BicmJycxJzEmNzcHNwc3FhcXMQcxBgcHMQYjIicmNTQ3N6ABFxgYFwEBFxgYFwEhAQEBCBoJAwQMCw0NBgUEAhMzCB8jIhsbDg8V",
+    "DAQEBQcMDAwbEAcJFDIIAxcDBwYNDgsKBBZHFggQORkZGQMEKA4EBz0KDQ0KCQk8AZAbDwwMDxsbDwwMDxuXAQEDDBoIDQUGBAQM",
+    "Cw0INRgDDhITHyUKBwwMDAwEBAUOCBAXQTYJDFwNCwsEAwcGDVhOGiFAxz4+PgQELSQJBz4JCQoNDQo7AAUAAP/AAYABwAAdACQA",
+    "MQA+AKsAABMGBzExBgcRMRYXFhchMTY3NjcRMSMxIicmNTUxIzMVNRUzMScHNjczMRYXBgcjMSYnFTY3MzEWFwYHIzEmJxcWFxUx",
+    "FhcWBwYnJiMiBwYVBhcWFzExMDEwMTAxMDEwMRYXFhcGBwYHFTEGByYnNTEmJzAxMDEwMSYnJjc2FxYXMDEwMTAxMDEwMTAxMDEy",
+    "FRYXMjc2NTQnJicnMTAxMDEmJyYnNjc2NzUxNjdAGxISAQESEhsBABsSEgGADgkJoMCAgMABD0APAQEPQA8BAQ9ADwEBD0APAYAP",
+    "AQ0LDgMFDhEPDgoIAQgLExISFQIBFgwNAQ8PAREOAwMOBAYOBAMBExAPCQgIChMBEhEUAwIWCw0BDwHAARISG/6AGxISAQESEhsB",
+    "IAkJDoCAgICAUA8BAQ8PAQEPQA8BAQ8PAQEPSAEPEQIDBQ8OAwUGBAgFBQYFBQoLGx0NBwIRDwEBDxIDBgEBBg4NAwEBAQcBBQUJ",
+    "BwUGBQEECQsbHQsHAhEPAQADAAD/wAIAAcAAPgBYAHIAAAEGBzExBgcVMQYHJic1MTY3Njc2NxYXFhcWFxUxBgcGByMxBgcjMSYn",
+    "Jic2NzY3MzEWFzMxMjc2NTUxJicmJwczIzMyFxYVFTEUBwYjIzEmJyYnNTE2NzY3MxYXMTEWFxUxBgcGByMxIicmNTUxNDc2MzMB",
+    "AFg7OwICFhYCASIiOjlISDk6IiIBARkZJW4OHCAUDg0BAQ0OFCAcDm4RCwwCOztYcBAQEA4JCQkJDhAbEhIBARISG+AbEhIBARIS",
+    "GxAOCQkJCQ4QAZACOztYKBYCAhYoSDk6IiIBASIiOjlIkCUZGQEXAQENDhQUDg0BARcMCxGQWDs7AqAJCQ5wDgkJARISGzAbEhIB",
+    "ARISGzAbEhIBCQkOcA4JCQABAAAAIAJAAWAARgAAExYXMTEWMzMxMjc2NzY3NjMWFxYXBgcGFRQXFhcGBwYHIicmJyYnJiMjMSIH",
+    "BgcGBwYjJicmJzY3NjU0JyYnNjc2NzIXFheaBQoKDcANCgoFChMUGSIXFgECKAYGKAIBFhciGRQTCgUKCg3ADQoKBQoTFBkiFxYB",
+    "AigGBigCARYXIhkUEwoBLwwKCQkKDBYNDgEWFyIwFgQGBgQWMCIXFgEODRYMCgkJCgwWDQ4BFhciMBYEBgYEFjAiFxYBDg0WAAP/",
+    "/v/AAkABwAAeAFMAXAAAATcHNzY3MhcXMTMxMhcXMTMxFhcVMQYHBgcjIwcxJxcVNRUUBwYjIzEiJyY1NTEGIyInFTEUBwYjIzEi",
+    "JyY1NTEmJycxJjc2NzYXFhcXMRYXMzMXNyYnBgcWFzY3ATYXFxcEEwwHETQUDhI4FgIBFhciICUFcGoJCQ4gDgkJJCwsJAkJDiAO",
+    "CQktDgQDBwYNDgsKBAQHGB6wcDABDw8BAQ8PAQEhi4uLEwEKFg4SAhYYIhcWAR9AYeDg4A4JCQkJDnMTE3MOCQkJCQ7mEjEPDQsL",
+    "BAMHBg0QFwFAsA8BAQ8PAQEPAAEAAP/AAf4BwABDAAA3FAcHMQYjBicmIwYHBgcWFxYXFhcWFxYXNjc2NzQnJjc0NzcxNjMzMTI3",
+    "Njc2JyY1Njc2NzIXFjc2JyYnJicGBwYHFaAJGwoNDg0GCBkREQEBEREZCwEBEREZGRERAQIDAQkbCg1ZCQoJAgMEDQEgHzAMCwkH",
+    "BwEMLzBCSzEyArcNChsJAQMCARERGRkREQEBCxkREQEBEREZBwcODQ0KGwkBAggICBgdMB8gAQICBQUJPygpAQIyMUtZAAAFACD/",
+    "wAGgAcAAEAAgADYATACQAAATMhcxMRYVFTEjMTUxNDc2Mwc0NzExNjMyFxYVFTEjMTUzNDcxMTYzMhcWFRUxFAcGIyInJjU1FzQ3",
+    "MTE2MzIXFhUVMRQHBiMiJyY1NQc1FTUWMzI3FhcWMzI3FTEUBwYHFTEUBwYjIzEiJyY1NTEmJycxJic1MTY3NjczMTIXFhUUBwYj",
+    "IzEGBxYXMzE2NzY3wA4JCUAJCQ6ACQkODgkJQMAJCQ4OCQkJCQ4OCQlgCQkODgkJCQkODgkJYA4SFBAGERAVEg4RER4JCQ6gDgkJ",
+    "GhULJQEBEhIbWBELDAwLETgPAQEPOB8UFAEBwAkJDnBwDgkJQA4JCQkJDlBQDgkJCQkOYA4JCQkJDmBADgkJCQkOQA4JCQkJDkBY",
+    "AQEBCQsTDAwJCSghIRZgDgkJCQkOTgwVCyY1GxsSEgEMCxERCwwBDw8BARQUHwAAAwAA/8ACAAHAABAAPACQAAABIzMjJzEmNzY3",
+    "MzEWFxYPAjMjMxYXMDEWFxYXFhcGBwYHITEmJyYnNjc2NzY3MDEwMTAxMDEwMTY3NjcXJicGBxUxBgcGBxYXFhcXMRYXFgcUBwYj",
+    "JicmJyYHBhcWFzAxMDEwMTAxFhcVMRYXNjc1MTY3NjcmJyYnMDEwOQImJyY3Jjc2MzIXFjc2JyYnNQFAgICALwUEBArECgQEBS+A",
+    "gICABgceKikgIAIBGxsp/sApGxsBAiAgKSoeAgMEBFQCEhICDAoYAgMWEhECEwkHAQYIDRATBAQSBwQRAwMMEAISEgIMCxcCAxYS",
+    "ExMKBgEBBwkNDhESBgMRCgsBYEcJCAcBAQcICUcgBAQSIiM3OFIpGxsBARsbKVI4NyMiEgECAgNYEgICEg4CBwwfHgsKBAEFBQUE",
+    "BwMFAQgBAQQQEggBAQUDDxICAhIOAgcNIB4MCgUFBQUCBQQFBQMREgcCAg4ABQAA/8ABgAHAAAYADQAUABsANQAANzcHNycxERcz",
+    "IzMnMQc3FycXETEHNyMzIxcxNyU2NzExNjchMRYXFhcRMQYHBgchMSYnJicRQFpaWlons7OzWlmAWVlZWTOzs7NZWv7mAQ0OFAEg",
+    "FA4NAQENDhT+4BQODQE6hoaGhv70OoaGwIaGhgEMhsCGhhAUDg0BAQ0OFP5gFA4NAQENDhQBoAAAAgAA/8gB8AG4ABwAWwAAEwYH",
+    "MTEGBzExBgcWFxYXFhc2NzY3NjcmJyYnJicXBgcxMQYHMTEGBwYnIicmJyYnJicmNzY3Njc2NzY3Njc2JyYHBgcGJyInJicmIyY1",
+    "Njc2NzY3NjMyFxYXFBX4RTg4ISEBASEhODhFRTg4ISEBASEhODhFcwIFBQYGBAYLEA8EBBEMDA8PAwIKAwMBChATFAIBAgMCBGUP",
+    "DAcLCwkDAxUBEW0kMhITBQUFAwEBuAEhITg4RUU4OCEhAQEhITg4RUU4OCEhAakUIiEiIhcaAQwDAwsJCAkLBwgIAwMCCA8TEgUB",
+    "AwIBAUUKAQMCBAEFCgcHLw8VBgcDAwQFBQAAAwAU/+ACcwGgAEgAWwBuAAABJjEmJyIHBgcmByYnJiMGBzAHBgcGFxYVFhcyNzY3",
+    "MDU0IyYnJjU0MzY3NjMWMzI3MhUWFzAVFAcGByIHFDMWFxQzNjc0NTYnASYnMTEmNTQ3NjcWFxYVFAcGBzMmJzExJic2NzY3FhcW",
+    "FwYHBgcCDQE6PgEBCAdDQwcIAQE+OgE4FBMIAUNQAQERDQEYFgEBBQQBAUlLTEgBBQUBFhcBAQENEQJPRBBm/tEWDw8PDxYXDw8P",
+    "DxfEFg8PAQEODxcXDw4BAQ8OFwF6ARoLAQ8QCwsQDwELGgFVVFNSAQExGQEXGgEBCQ0BAQEEAwEhIQEDBAEBAQ0JAQEaFwEZMQEB",
+    "vZH+9AERERkZERABAREQGRkREQEBEREZGREQAQEREBkZEREBAAAAAAAGAAA=",
 })
 
 -- UTF-8 байты нужных иконок (кодовые точки Private Use Area
@@ -2082,6 +2468,55 @@ local ICON_POWER = "\239\128\145" -- fa-power-off       -- "Выключить"
 local ICON_TRASH = "\239\135\184" -- fa-trash           -- "Удалить"
 local ICON_UNDO  = "\239\131\162" -- fa-arrow-rotate-left -- "Сброс данных"
 local ICON_SYNC  = "\239\128\161" -- fa-arrows-rotate   -- "Перезагрузить"
+local ICON_TAX     = "\239\149\177" -- fa-file-invoice-dollar -- раздел "Налоги"
+local ICON_TG_FB   = "\239\139\134" -- fa-telegram
+local ICON_DC_FB   = "\239\142\146" -- fa-discord
+local ICON_TG      = ICON_TG_FB
+local ICON_DISCORD = ICON_DC_FB
+local ICON_CALENDAR = "\239\129\179" -- fa-calendar-days
+local ICON_CARD    = "\239\147\128" -- fa-hand-holding-dollar
+-- ── иконки FontAwesome 6 Free (набор глифов зашит в ICON_FONT_B64 выше);
+-- глобальная таблица, чтобы не тратить локальные переменные файла ──
+PCS_IC = {
+    telegram = "\239\139\134", -- fa-telegram
+    discord = "\239\142\146", -- fa-discord
+    taxes = "\239\149\177", -- fa-file-invoice-dollar
+    calendar = "\239\129\179", -- fa-calendar-days
+    shield = "\239\143\173", -- fa-shield-halved
+    star = "\239\128\133", -- fa-star
+    userplus = "\239\136\180", -- fa-user-plus
+    usergroup = "\239\148\128", -- fa-user-group
+    walk = "\239\149\148", -- fa-person-walking
+    check = "\239\129\152", -- fa-circle-check
+    xcircle = "\239\129\151", -- fa-circle-xmark
+    bolt = "\239\131\167", -- fa-bolt
+    clock = "\239\128\151", -- fa-clock
+    terminal = "\239\132\160", -- fa-terminal
+    food = "\239\155\151", -- fa-drumstick-bite
+    paw = "\239\134\176", -- fa-paw
+    bone = "\239\151\151", -- fa-bone
+    arrowleft = "\239\129\160", -- fa-arrow-left
+    xmark = "\239\128\141", -- fa-xmark
+    search = "\239\128\130", -- fa-magnifying-glass
+    download = "\239\131\173", -- fa-cloud-arrow-down
+    handdollar = "\239\147\128", -- fa-hand-holding-dollar
+    headset = "\239\150\144", -- fa-headset
+    save = "\239\131\135", -- fa-floppy-disk
+    tick = "\239\128\140", -- fa-check
+    listcheck = "\239\130\174", -- fa-list-check
+    utensils = "\239\139\167", -- fa-utensils
+    rotate = "\239\139\177", -- fa-rotate
+    sync = "\239\128\161", -- fa-arrows-rotate
+    power = "\239\128\145", -- fa-power-off
+    warn = "\239\129\177", -- fa-triangle-exclamation
+    gear = "\239\128\147", -- fa-gear
+    user = "\239\128\135", -- fa-user
+    info = "\239\129\154", -- fa-circle-info
+    trash = "\239\135\184", -- fa-trash
+    undo = "\239\131\162", -- fa-arrow-rotate-left
+    sack = "\239\160\157", -- fa-sack-dollar
+    fist = "\239\155\158", -- fa-hand-fist
+}
 
 -- простой чистый Lua base64-декодер (без внешних зависимостей —
 -- на скрипт с mimgui нельзя рассчитывать, что будет доступна bit32/bit)
@@ -2160,6 +2595,31 @@ imgui.OnInitialize(function()
         -- держим диапазон глобально (ImGui хранит указатель)
         PCS_ICON_RANGES = imgui.new.ImWchar[3](0xf000, 0xf8ff, 0)
         fonts:AddFontFromFileTTF(ICON_FONT_FILE, baseSize, config, PCS_ICON_RANGES)
+        -- жирный шрифт для кнопок (Arial Bold с кириллицей + те же иконки
+        -- поверх него). Если файла нет — PCS_BOLD_FONT остаётся nil и кнопки
+        -- рисуются обычным шрифтом
+        pcall(function()
+            local fdir
+            pcall(function() fdir = getFolderPath(0x14) end)
+            if type(fdir) ~= "string" or fdir == "" then
+                fdir = (os.getenv("WINDIR") or "C:\\Windows") .. "\\Fonts"
+            end
+            for _, fn in ipairs({ "arialbd.ttf", "segoeuib.ttf", "tahomabd.ttf", "verdanab.ttf", "calibrib.ttf" }) do
+                local pth = fdir .. "\\" .. fn
+                if doesFileExist(pth) then
+                    local bf = fonts:AddFontFromFileTTF(pth, baseSize, nil, fonts:GetGlyphRangesCyrillic())
+                    if bf then
+                        local cfgB = imgui.ImFontConfig()
+                        cfgB.MergeMode  = true
+                        cfgB.PixelSnapH = true
+                        PCS_ICON_RANGES_B = imgui.new.ImWchar[3](0xf000, 0xf8ff, 0)
+                        fonts:AddFontFromFileTTF(ICON_FONT_FILE, baseSize, cfgB, PCS_ICON_RANGES_B)
+                        PCS_BOLD_FONT = bf
+                    end
+                    break
+                end
+            end
+        end)
         -- пересобираем атлас, если API доступен
         pcall(function()
             if fonts.Build then fonts:Build() end
@@ -4275,8 +4735,9 @@ local SECTION_DEFS = {
         { tab=1, label = ICON_USER.." "..u8"\xcf\xe5\xf0\xf1\xee\xed\xe0\xe6" },
         { tab=2, label = ICON_FIST.." "..u8"\xc1\xee\xe9" },
         { tab=3, label = ICON_SACK.." "..u8"\xd4\xe8\xed\xe0\xed\xf1\xfb" },
+        { tab=7, hidden=true }, -- "Охранник": открывается кнопкой на вкладке "Финансы"
       } },
-    { label = ICON_SACK.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8",             icon=ICON_SACK, name=u8"\xcd\xe0\xeb\xee\xe3\xe8",             r=1.0,g=0.65,b=0.15,
+    { label = ICON_TAX.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8",             icon=ICON_TAX, name=u8"\xcd\xe0\xeb\xee\xe3\xe8",             r=1.0,g=0.65,b=0.15,
       tabs = {
         { tab=6, label = u8"\xcd\xe0\xeb\xee\xe3\xe8" },
       } },
@@ -4296,7 +4757,9 @@ local function flattenTabs()
     local out = {}
     for _, sec in ipairs(SECTION_DEFS) do
         for _, td in ipairs(sec.tabs) do
-            table.insert(out, { tab = td.tab, label = td.label or sec.label, r = sec.r, g = sec.g, b = sec.b })
+            if not td.hidden then
+                table.insert(out, { tab = td.tab, label = td.label or sec.label, r = sec.r, g = sec.g, b = sec.b })
+            end
         end
     end
     return out
@@ -6143,11 +6606,25 @@ function drawFinanceSettingsBlock(r, g, b)
     imgui.PushStyleColor(imgui.Col.Button,        iv4(sbc[1]*0.55,sbc[2]*0.55,sbc[3]*0.55,1.0))
     imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(sbc[1]*0.80,sbc[2]*0.80,sbc[3]*0.80,1.0))
     imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(sbc[1],sbc[2],sbc[3],1.0))
+    local _halfW = math.floor((avW - S(6)) / 2)
     do local _pb = prettyBtnPush(10.0)
-    if imgui.Button(u8"  \xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8##financeSettingsBtn", imgui.ImVec2(avW, S(36))) then
+    if imgui.Button(PCS_IC.gear .. u8"  \xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8##financeSettingsBtn", imgui.ImVec2(_halfW, S(36))) then
         St._financeSettingsOpen = not St._financeSettingsOpen
     end
     prettyBtnPop(_pb) end
+    imgui.PopStyleColor(3)
+
+    -- ── кнопка "Охранник": открывает вкладку управления личными охранниками
+    -- (модуль AIS, порт Auto-Interaction Securities 2.0.6) ──
+    imgui.SameLine(0, S(6))
+    imgui.PushStyleColor(imgui.Col.Button,        iv4(0.09,0.33,0.16,1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.14,0.50,0.25,1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.20,0.70,0.36,1.0))
+    do local _pbg = prettyBtnPush(10.0)
+    if imgui.Button(PCS_IC.shield .. u8"  \xce\xf5\xf0\xe0\xed\xed\xe8\xea##financeGuardBtn", imgui.ImVec2(_halfW, S(36))) then
+        PCS_openGuardTab()
+    end
+    prettyBtnPop(_pbg) end
     imgui.PopStyleColor(3)
 end
 
@@ -6670,7 +7147,7 @@ function PD.drawIncomeSection()
         dl:AddRect(p0, imgui.ImVec2(p0.x + btnW, p0.y + btnH),
             imgui.ColorConvertFloat4ToU32(iv4(1, 1, 1, hovered and 0.25 or 0.12)), rounding, 0, 1.5)
 
-        local title = u8"\xca\xe0\xeb\xe5\xed\xe4\xe0\xf0\xfc\x20\xe8\x20\xeb\xee\xe3\xe8\x20PayDay"
+        local title = PCS_IC.calendar .. "  " .. u8"\xca\xe0\xeb\xe5\xed\xe4\xe0\xf0\xfc\x20\xe8\x20\xeb\xee\xe3\xe8\x20PayDay"
         local subtitle = PD.fmtDateRu(shownDate) .. "   (" .. tostring(St._pdDateIdx) .. " " ..
             u8"\xe8\xe7" .. " " .. tostring(#dateList) .. ")"
 
@@ -6833,178 +7310,9 @@ end
 
 -- ФИКС (п.7): тот же паттерн — drawTotalInner под pcall, EndChild/
 -- PopStyleColor гарантированы
-
--- ============================================================
---  UI: панель "Охранник" (стиль PC Stats, логіка AIS 2.0.6)
---  Відкривається з вкладки Финансы кнопкою "Охранник"
--- ============================================================
-local function drawAisPanel(h)
-    if not AIS then
-        imgui.TextColored(thDim(), "AIS module missing")
-        return
-    end
-    AIS.st = AIS.st or {}
-    AIS.cfg = AIS.cfg or {}
-
-    local r, g, b = getAcc()
-
-    -- назад до фінансів
-    imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.25, g*0.25, b*0.25, 1.0))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.40, g*0.40, b*0.40, 1.0))
-    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r*0.55, g*0.55, b*0.55, 1.0))
-    do local _pb = prettyBtnPush(8.0)
-    if imgui.Button(u8"\x3c\x20\xcd\xe0\xe7\xe0\xe4 \xea \xf4\xe8\xed\xe0\xed\xf1\xe0\xec##aisBack", imgui.ImVec2(S(200), S(28))) then
-        St.aisView = false
-    end
-    prettyBtnPop(_pb) end
-    imgui.PopStyleColor(3)
-
-    imgui.Spacing()
-    secTitle(u8"\xce\xf5\xf0\xe0\xed\xed\xe8\xea")
-
-    -- тумблери
-    do
-        local aw = imgui.GetContentRegionAvail().x
-        local function rowToggle(label, key, tip)
-            imgui.TextColored(iv4(0.85, 0.87, 0.92, 1), label)
-            imgui.SameLine(aw - S(40))
-            local on = AIS.st[key] and true or false
-            if drawToggleSwitch("##ais_" .. key, on) then
-                AIS.st[key] = not on
-                if key == "autoSpawn" then AIS.st.autoSpawn = AIS.st[key] end
-                if key == "autoEat" then AIS.st.autoEat = AIS.st[key] end
-                if key == "sotg" then AIS.st.sotg = AIS.st[key] end
-                if key == "reducedCooldown" then AIS.st.reducedCooldown = AIS.st[key] end
-                if key == "enabled" then AIS.st.enabled = AIS.st[key] end
-                pcall(function() if AIS.jsonSave then AIS.jsonSave() end end)
-            end
-            if tip and imgui.IsItemHovered and imgui.IsItemHovered() then
-                imgui.SetTooltip(tip)
-            end
-            imgui.Spacing()
-        end
-        rowToggle(u8"\xcc\xee\xe4\xf3\xeb\xfc \xe2\xea\xeb\xfe\xf7\xb8\xed", "enabled")
-        rowToggle(u8"\xc0\xe2\xf2\xee\xef\xf0\xe8\xe7\xfb\xe2", "autoSpawn")
-        rowToggle(u8"\xc4\xe2\xe0 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0", "sotg")
-        rowToggle(u8"\xc0\xe2\xf2\xee\xea\xee\xf0\xec", "autoEat")
-        rowToggle(u8"\xd3\xec\xe5\xed\xfc\xf8\xe5\xed\xed\xee\xe5 \xca\xc4 (3 \xf1\xe5\xea)", "reducedCooldown")
-    end
-
-    imgui.Spacing()
-    secTitle(u8"\xc4\xe5\xe9\xf1\xf2\xe2\xe8\xff")
-
-    local btnH = S(32)
-    local gap = S(8)
-    local aw = imgui.GetContentRegionAvail().x
-    local bw = (aw - gap) * 0.5
-
-    local function actBtn(label, col, fn)
-        imgui.PushStyleColor(imgui.Col.Button,        iv4(col[1]*0.55, col[2]*0.55, col[3]*0.55, 1))
-        imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(col[1]*0.75, col[2]*0.75, col[3]*0.75, 1))
-        imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(col[1], col[2], col[3], 1))
-        do local _p = prettyBtnPush(8.0)
-        if imgui.Button(label, imgui.ImVec2(bw, btnH)) then
-            pcall(fn)
-        end
-        prettyBtnPop(_p) end
-        imgui.PopStyleColor(3)
-    end
-
-    actBtn(u8"\xcf\xf0\xe8\xe7\xe2\xe0\xf2\xfc 1##aisSp1", {0.25, 0.75, 0.40}, function() AIS.SpawnPet(1) end)
-    imgui.SameLine(0, gap)
-    actBtn(u8"\xcf\xf0\xe8\xe7\xe2\xe0\xf2\xfc 2##aisSp2", {0.25, 0.65, 0.85}, function()
-        if AIS.st.sotg then AIS.SpawnPet(2) else
-            pcall(sampAddChatMessage, "{FFAA00}[AIS] enable SOTG (two guards)", -1)
-        end
-    end)
-
-    actBtn(u8"\xd3\xe1\xf0\xe0\xf2\xfc 1##aisOff1", {0.85, 0.35, 0.30}, function() AIS.OffPet(1) end)
-    imgui.SameLine(0, gap)
-    actBtn(u8"\xd3\xe1\xf0\xe0\xf2\xfc 2##aisOff2", {0.85, 0.45, 0.25}, function() AIS.OffPet(2) end)
-
-    actBtn(u8"\xcf\xee\xea\xee\xf0\xec\xe8\xf2\xfc 1##aisEat1", {0.90, 0.70, 0.20}, function() AIS.EatPet(1) end)
-    imgui.SameLine(0, gap)
-    actBtn(u8"\xcf\xee\xea\xee\xf0\xec\xe8\xf2\xfc 2##aisEat2", {0.90, 0.60, 0.15}, function() AIS.EatPet(2) end)
-
-    imgui.Spacing()
-    imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.30, g*0.30, b*0.30, 1))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.48, g*0.48, b*0.48, 1))
-    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r*0.62, g*0.62, b*0.62, 1))
-    do local _p = prettyBtnPush(8.0)
-    if imgui.Button(u8"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2##aisRefresh", imgui.ImVec2(-1, btnH)) then
-        AIS.CheckAllPet()
-    end
-    prettyBtnPop(_p) end
-    imgui.PopStyleColor(3)
-
-    imgui.Spacing()
-    secTitle(u8"\xd1\xef\xe8\xf1\xee\xea")
-
-    local list = AIS.st.securityList or {}
-    if #list == 0 then
-        imgui.TextColored(thDim(), u8"\xd1\xef\xe8\xf1\xee\xea \xef\xf3\xf1\xf2 \x97 \xed\xe0\xe6\xec\xe8\xf2\xe5 \"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc\"")
-        imgui.TextColored(thDim(), u8"\xea\xee\xec\xe0\xed\xe4\xfb: /sppet /offpet /fasteat /ais")
-    else
-        for i, pet in ipairs(list) do
-            local spawned = tonumber(pet.spawned) == 1
-            if spawned then
-                imgui.TextColored(iv4(0.35, 1.0, 0.45, 1), u8"[ON]")
-            else
-                imgui.TextColored(iv4(1.0, 0.40, 0.40, 1), u8"[OFF]")
-            end
-            imgui.SameLine(0, 8)
-            imgui.TextColored(iv4(0.95, 0.95, 0.98, 1),
-                string.format("%s  ID:%s  slot:%s", tostring(pet.name or "?"), tostring(pet.id or "?"), tostring(pet.slot or "?")))
-            imgui.SameLine(aw - S(200))
-            if imgui.SmallButton(u8"\xee\xf1\xed##m" .. tostring(pet.id)) then
-                AIS.cfg.spPet1 = { name = pet.name, id = pet.id, slot = pet.slot, spawned = pet.spawned }
-                pcall(AIS.jsonSave)
-                pcall(sampAddChatMessage, "{00FF88}[AIS] main=" .. tostring(pet.name), -1)
-            end
-            imgui.SameLine()
-            if imgui.SmallButton(u8"2##s" .. tostring(pet.id)) then
-                AIS.cfg.spPet2 = { name = pet.name, id = pet.id, slot = pet.slot, spawned = pet.spawned }
-                pcall(AIS.jsonSave)
-                pcall(sampAddChatMessage, "{00FF88}[AIS] second=" .. tostring(pet.name), -1)
-            end
-        end
-    end
-
-    -- вибрані
-    imgui.Spacing()
-    local p1 = AIS.cfg and AIS.cfg.spPet1
-    local p2 = AIS.cfg and AIS.cfg.spPet2
-    imgui.TextColored(iv4(1.0, 0.85, 0.30, 1), u8"\xce\xf1\xed\xee\xe2\xed\xee\xe9: " .. (p1 and tostring(p1.name) or "-"))
-    if AIS.st.sotg then
-        imgui.TextColored(iv4(0.45, 0.80, 1.0, 1), u8"\xc2\xf2\xee\xf0\xee\xe9: " .. (p2 and tostring(p2.name) or "-"))
-    end
-end
-
-
 function drawTotalInner(s, h)
     if St._resetCharScroll then imgui.SetScrollY(0) end
         local r,g,b = getAcc()
-
-        -- ── панель охранника (з кнопки на Финансах) ──
-        if St.aisView then
-            drawAisPanel(h)
-            return
-        end
-
-        -- кнопка переходу до охранника
-        do
-            imgui.PushStyleColor(imgui.Col.Button,        iv4(0.55, 0.40, 0.12, 1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.75, 0.55, 0.18, 1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.90, 0.68, 0.22, 1.0))
-            do local _pb = prettyBtnPush(9.0)
-            local lbl = u8"  Îõðàííèê  ##aisOpenFin"
-            if imgui.Button(lbl, imgui.ImVec2(imgui.GetContentRegionAvail().x, S(34))) then
-                St.aisView = true
-            end
-            prettyBtnPop(_pb) end
-            imgui.PopStyleColor(3)
-            imgui.Spacing()
-        end
 
         -- ── кнопка управления вкладкой "Всего": подписана текстом, читаемый
         -- шрифт, толщина рамки 4px ──────────────────────────────────────
@@ -8627,7 +8935,7 @@ function drawAboutInner(h)
             imgui.SetWindowFontScale(aboutBaseScale)
 
             -- компактные прямоугольные кнопки связи (~20x4 по пропорциям)
-            local btnCW, btnCH = SFtext(116), SFtext(22)
+            local btnCW, btnCH = SFtext(142), SFtext(24)
             local gapC = SFtext(10)
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(94)))
             do
@@ -8638,7 +8946,7 @@ function drawAboutInner(h)
                 imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.13,0.58,0.90,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.18,0.72,1.00,1.0))
                 do local _pbtg = prettyBtnPush(6.0)
-                if imgui.Button((ICON_TG or "")..u8" Support##tgopen", imgui.ImVec2(btnCW, btnCH)) then
+                if imgui.Button(PCS_IC.telegram .. "  " .. u8"\xd2\xe5\xf5. \xef\xee\xe4\xe4\xe5\xf0\xe6\xea\xe0##tgopen", imgui.ImVec2(btnCW, btnCH)) then
                     -- сначала пробуем открыть ссылку без консоли (WinAPI
                     -- ShellExecuteA), и только если ffi недоступен —
                     -- запасной os.execute('start ...'), который может на
@@ -8661,9 +8969,6 @@ function drawAboutInner(h)
                     end
                 end
                 prettyBtnPop(_pbtg) end
-                -- белая иконка Telegram поверх кнопки
-                pcall(PCS_UPDATE.drawTgIcon, imgui.GetWindowDrawList(),
-                    tgBp.x + SFtext(12), tgBp.y + (btnCH - SFtext(15)) / 2, SFtext(15), 1.0)
                 imgui.PopStyleColor(3)
             end
             imgui.SameLine(0, gapC)
@@ -8675,7 +8980,7 @@ function drawAboutInner(h)
                 imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.22,0.68,0.96,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.30,0.78,1.00,1.0))
                 do local _pbch = prettyBtnPush(6.0)
-                if imgui.Button(u8"\x20\x20\x20\xca\xe0\xed\xe0\xeb\x23\x23\x74\x67\x63\x68\x61\x6e\x6e\x65\x6c", imgui.ImVec2(btnCW, btnCH)) then
+                if imgui.Button(PCS_IC.telegram .. "  " .. u8"\xca\xe0\xed\xe0\xeb##tgchannel", imgui.ImVec2(btnCW, btnCH)) then
                     -- ссылку открываем без консоли (WinAPI), запасной вариант —
                     -- os.execute('start ...'); ссылка ещё и копируется в буфер
                     local opened = winOpenUrl(chUrl)
@@ -8694,8 +8999,6 @@ function drawAboutInner(h)
                     end
                 end
                 prettyBtnPop(_pbch) end
-                pcall(PCS_UPDATE.drawTgIcon, imgui.GetWindowDrawList(),
-                    chBp.x + SFtext(12), chBp.y + (btnCH - SFtext(15)) / 2, SFtext(15), 1.0)
                 imgui.PopStyleColor(3)
             end
             imgui.SameLine(0, gapC)
@@ -8705,7 +9008,7 @@ function drawAboutInner(h)
                 imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.29,0.33,0.86,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.37,0.42,1.00,1.0))
                 do local _pbdc = prettyBtnPush(6.0)
-                if imgui.Button((ICON_DISCORD or "")..u8" Discord##dccopy", imgui.ImVec2(btnCW, btnCH)) then
+                if imgui.Button(PCS_IC.discord .. "  Discord##dccopy", imgui.ImVec2(btnCW, btnCH)) then
                     local copied = false
                     pcall(function()
                         if imgui.SetClipboardText then
@@ -8773,8 +9076,8 @@ function drawAboutInner(h)
             do local _pbu = prettyBtnPush(6.0)
             local checkLabel = (U and U.state.checking)
                 and (u8"\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0\x2e\x2e\x2e\x23\x23\x75\x70\x64\x63\x68\x65\x63\x6b")
-                or  (u8"\xcf\xf0\xee\xe2\xe5\xf0\xe8\xf2\xfc\x23\x23\x75\x70\x64\x63\x68\x65\x63\x6b")
-            if imgui.Button(checkLabel, imgui.ImVec2(SFtext(130), btnH)) then
+                or  (PCS_IC.search .. "  " .. u8"\xcf\xf0\xee\xe2\xe5\xf0\xe8\xf2\xfc\x23\x23\x75\x70\x64\x63\x68\x65\x63\x6b")
+            if imgui.Button(checkLabel, imgui.ImVec2(SFtext(150), btnH)) then
                 if U and not U.state.checking and not U.state.installing then
                     U.check(false)
                 end
@@ -8790,8 +9093,8 @@ function drawAboutInner(h)
                 do local _pbi = prettyBtnPush(6.0)
                 local instLabel = U.state.installing
                     and (u8"\xd3\xf1\xf2\xe0\xed\xe0\xe2\xeb\xe8\xe2\xe0\xfe\x2e\x2e\x2e" .. "##updinstall")
-                    or  (u8"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc\x20\xe4\xee\x20\x76" .. (U.state.ver_remote or "?") .. "##updinstall")
-                if imgui.Button(instLabel, imgui.ImVec2(SFtext(160), btnH)) then
+                    or  (PCS_IC.download .. "  " .. u8"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc\x20\xe4\xee\x20\x76" .. (U.state.ver_remote or "?") .. "##updinstall")
+                if imgui.Button(instLabel, imgui.ImVec2(SFtext(190), btnH)) then
                     if not U.state.installing then U.install() end
                 end
                 prettyBtnPop(_pbi) end
@@ -9284,7 +9587,7 @@ function TX.drawLogSection()
         dl:AddRect(p0, imgui.ImVec2(p0.x + btnW, p0.y + btnH),
             imgui.ColorConvertFloat4ToU32(iv4(1, 1, 1, hovered and 0.25 or 0.12)), rounding, 0, 1.5)
 
-        local title = u8"\xcb\xee\xe3\xe8\x20\xee\xef\xeb\xe0\xf2\xfb\x20\xed\xe0\xeb\xee\xe3\xee\xe2"
+        local title = PCS_IC.calendar .. "  " .. u8"\xcb\xee\xe3\xe8\x20\xee\xef\xeb\xe0\xf2\xfb\x20\xed\xe0\xeb\xee\xe3\xee\xe2"
         local subtitle = PD.fmtDateRu(shownDate) .. "   (" .. tostring(shownIdx) .. " " ..
             u8"\xe8\xe7" .. " " .. tostring(#dateList) .. ")"
 
@@ -9433,7 +9736,7 @@ function drawTaxesInner(h)
     imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.55,g*0.55,b*0.55,1.0))
     imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.78,g*0.78,b*0.78,1.0))
     imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r,g,b,1.0))
-    if imgui.Button(u8"  \xce\xef\xeb\xe0\xf2\xe8\xf2\xfc\x20\xed\xe0\xeb\xee\xe3\xe8\x20\xf1\xe5\xe9\xf7\xe0\xf1  ", imgui.ImVec2(-1, S(38))) then
+    if imgui.Button(PCS_IC.handdollar .. u8"  \xce\xef\xeb\xe0\xf2\xe8\xf2\xfc\x20\xed\xe0\xeb\xee\xe3\xe8\x20\xf1\xe5\xe9\xf7\xe0\xf1  ", imgui.ImVec2(-1, S(38))) then
         payTaxesThenHotel(false)
     end
     if imgui.IsItemHovered and imgui.IsItemHovered() then
@@ -9652,6 +9955,317 @@ local function drawTaxes(h)
         St._taxLogEntriesOpenedOnce = false
         pcall(sampAddChatMessage, "{FF6666}[PC Stats] " ..
             "\xee\xf8\xe8\xe1\xea\xe0\x20\xee\xf2\xf0\xe8\xf1\xee\xe2\xea\xe8\x20\xe2\xea\xeb\xe0\xe4\xea\xe8\x20\xcd\xe0\xeb\xee\xe3\xe8: " .. tostring(err), -1)
+    end
+end
+
+-- ============================================================
+--  ВКЛАДКА "ОХРАННИК" (St.activeTab == 7)
+-- ------------------------------------------------------------
+-- Открывается кнопкой "Охранник" на вкладке "Финансы" (см.
+-- drawFinanceSettingsBlock) или командой /ais. Управление как в
+-- Auto-Interaction Securities 2.0.6 (модуль AIS выше по файлу), но в
+-- оформлении PC Stats: карточки, тумблеры и слайдеры в цвет акцента.
+-- Всё сделано глобальными функциями (PCS_gd*) — в файле почти
+-- исчерпан лимит LuaJIT на 200 локальных переменных.
+-- ============================================================
+function PCS_openGuardTab()
+    St._resetCharScroll = true; St._resetSettScroll = true; St.accPopupOpen = false
+    St._financeSettingsOpen = false
+    St._taxLogEntriesPopupOpen = false; St._taxLogEntriesOpenedOnce = false
+    St.activeTab = 7
+    if cfg.lastTab ~= 7 then cfg.lastTab = 7; saveCfg() end
+end
+
+-- кнопка в цвет col={r,g,b}: тёмная заливка, при наведении светлее
+function PCS_gdButton(label, w, h, col, round)
+    local r, g, b = col[1], col[2], col[3]
+    imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.30, g*0.30, b*0.30, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.55, g*0.55, b*0.55, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r*0.80, g*0.80, b*0.80, 1.0))
+    local pb = prettyBtnPush(round or 8.0)
+    local clicked = imgui.Button(label, imgui.ImVec2(w, h))
+    prettyBtnPop(pb)
+    imgui.PopStyleColor(3)
+    return clicked
+end
+
+-- тумблер + подпись + серое пояснение (как taxToggleRow, но сохраняет AIS)
+function PCS_gdToggle(id, labelU8, isOn, descU8, onToggle)
+    if drawToggleSwitch(id, isOn) then
+        onToggle(not isOn)
+        AIS.save()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1,1,1,1), labelU8)
+    if descU8 then
+        imgui.TextColored(thDim(), "  " .. descU8)
+    end
+    imgui.Dummy(imgui.ImVec2(0, S(4)))
+end
+
+-- слайдер в цвет акцента (on=true — push, on=false — pop)
+function PCS_gdSliderStyle(on)
+    if not on then imgui.PopStyleColor(5) return end
+    local r, g, b = getAcc()
+    imgui.PushStyleColor(imgui.Col.FrameBg,         iv4(r*0.16, g*0.16, b*0.16, 1.0))
+    imgui.PushStyleColor(imgui.Col.FrameBgHovered,  iv4(r*0.24, g*0.24, b*0.24, 1.0))
+    imgui.PushStyleColor(imgui.Col.FrameBgActive,   iv4(r*0.30, g*0.30, b*0.30, 1.0))
+    imgui.PushStyleColor(imgui.Col.SliderGrab,      iv4(r, g, b, 1.0))
+    imgui.PushStyleColor(imgui.Col.SliderGrabActive, iv4(math.min(1, r*1.2), math.min(1, g*1.2), math.min(1, b*1.2), 1.0))
+end
+
+-- блок выбора еды для одного охранника
+function PCS_gdFoodBlock(avW, whoRaw, info, key)
+    local ic = PCS_IC
+    local r, g, b = getAcc()
+    imgui.TextColored(thAcc(), "  " .. ic.utensils .. "  " .. u8(whoRaw))
+    local sel = AIS.FOOD[tonumber(info.type)]
+    imgui.TextColored(thDim(), "  " .. u8"\xc2\xfb\xe1\xf0\xe0\xed\xee:")
+    imgui.SameLine(0, S(6))
+    if sel then
+        imgui.TextColored(thGold(), u8(sel))
+    else
+        imgui.TextColored(thDim(), u8"\xed\xe5 \xe2\xfb\xe1\xf0\xe0\xed\xee")
+    end
+    if (tonumber(info.quantity) or 0) > 0 then
+        imgui.SameLine(0, S(10))
+        imgui.TextColored(thDim(), u8"\xe2 \xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xe5: " .. tostring(info.quantity))
+    end
+    imgui.Spacing()
+    local gap = S(6)
+    local bw = math.floor((avW - gap * 2) / 3)
+    for k, fid in ipairs(AIS.FOOD_ORDER) do
+        if k > 1 then imgui.SameLine(0, gap) end
+        local on = tonumber(info.type) == fid
+        local col = on and { r, g, b } or { 0.55, 0.58, 0.66 }
+        local lbl = (on and ic.check or ic.bone) .. "  " .. u8(AIS.FOOD[fid]) .. "##gdf" .. key .. tostring(fid)
+        if PCS_gdButton(lbl, bw, S(30), col, 8.0) then
+            info.type = fid
+            AIS.save()
+            AIS.msg(whoRaw .. ": \xf2\xe8\xef \xe5\xe4\xfb \x97 " .. AIS.FOOD[fid])
+        end
+    end
+    imgui.Dummy(imgui.ImVec2(0, S(8)))
+end
+
+-- карточка одного охранника из списка
+function PCS_gdPetCard(i, pet, avW)
+    local s = AIS.s
+    local ic = PCS_IC
+    local r, g, b = getAcc()
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local pet1, pet2 = s.SpPet1 or {}, s.SpPet2 or {}
+    local id = tonumber(pet.id)
+    local spawned = tonumber(pet.spawned) == 1
+    local isMain   = id ~= nil and tonumber(pet1.id) == id
+    local isSecond = id ~= nil and tonumber(pet2.id) == id
+
+    local cardH = S(88)
+    local dl = imgui.GetWindowDrawList()
+    local p = imgui.GetCursorScreenPos()
+    local e = spawned and { 0.25, 0.92, 0.48 } or { 0.55, 0.58, 0.66 }
+    dl:AddRectFilled(p, V2(p.x + avW, p.y + cardH), U32(iv4(r*0.07, g*0.07, b*0.07, 0.92)), 10)
+    dl:AddRect(p, V2(p.x + avW, p.y + cardH), U32(iv4(e[1], e[2], e[3], 0.55)), 10, 0, 1.2)
+    dl:AddRectFilled(V2(p.x, p.y + 6), V2(p.x + 4, p.y + cardH - 6), U32(iv4(e[1], e[2], e[3], 1.0)), 2)
+
+    -- строка 1: статус-иконка, имя, ID/Slot, метка роли
+    imgui.SetCursorScreenPos(V2(p.x + S(14), p.y + S(8)))
+    if spawned then
+        imgui.TextColored(thGreen(), ic.check)
+    else
+        imgui.TextColored(thRed(), ic.xcircle)
+    end
+    imgui.SameLine(0, S(6))
+    imgui.TextColored(iv4(1,1,1,1), u8(tostring(pet.name or "?")))
+    imgui.SameLine(0, S(10))
+    imgui.TextColored(thDim(), "ID: " .. tostring(id or "?") .. "   Slot: " .. tostring(pet.slot or "?"))
+    if isMain then
+        imgui.SameLine(0, S(10))
+        imgui.TextColored(thGold(), ic.star .. " " .. u8"\xce\xd1\xcd\xce\xc2\xcd\xce\xc9")
+    elseif isSecond then
+        imgui.SameLine(0, S(10))
+        imgui.TextColored(iv4(0.45, 0.80, 1.0, 1.0), ic.userplus .. " " .. u8"\xc2\xd2\xce\xd0\xce\xc9")
+    end
+
+    -- строка 2: состояние
+    imgui.SetCursorScreenPos(V2(p.x + S(14), p.y + S(28)))
+    if spawned then
+        imgui.TextColored(thGreen(), u8"\xef\xf0\xe8\xe7\xe2\xe0\xed")
+    else
+        imgui.TextColored(thRed(), u8"\xed\xe5 \xef\xf0\xe8\xe7\xe2\xe0\xed")
+    end
+
+    -- кнопки
+    local gap = S(6)
+    local bw = math.floor((avW - S(14) * 2 - gap * 2) / 3)
+    imgui.SetCursorScreenPos(V2(p.x + S(14), p.y + cardH - S(34)))
+    if PCS_gdButton(ic.star .. "  " .. u8"\xce\xf1\xed\xee\xe2\xed\xee\xe9" .. "##gdm" .. i, bw, S(26), { 1.0, 0.82, 0.20 }, 6.0) then
+        s.SpPet1 = { name = pet.name, id = pet.id, slot = pet.slot, spawned = pet.spawned }
+        AIS.save()
+        AIS.msg("\xce\xf1\xed\xee\xe2\xed\xfb\xec \xe2\xfb\xe1\xf0\xe0\xed: " .. tostring(pet.name))
+    end
+    imgui.SameLine(0, gap)
+    if PCS_gdButton(ic.userplus .. "  " .. u8"\xc2\xf2\xee\xf0\xee\xe9" .. "##gds" .. i, bw, S(26), { 0.45, 0.80, 1.0 }, 6.0) then
+        s.SpPet2 = { name = pet.name, id = pet.id, slot = pet.slot, spawned = pet.spawned }
+        AIS.save()
+        AIS.msg("\xc2\xf2\xee\xf0\xfb\xec \xe2\xfb\xe1\xf0\xe0\xed: " .. tostring(pet.name))
+    end
+    imgui.SameLine(0, gap)
+    if spawned then
+        if PCS_gdButton(ic.walk .. "  " .. u8"\xd3\xe1\xf0\xe0\xf2\xfc" .. "##gdo" .. i, bw, S(26), { 1.0, 0.40, 0.40 }, 6.0) then
+            if isMain then
+                AIS.run(AIS.OffPet, 1)
+            elseif isSecond then
+                AIS.run(AIS.OffPet, 2)
+            else
+                AIS.msg("\xd1\xed\xe0\xf7\xe0\xeb\xe0 \xed\xe0\xe7\xed\xe0\xf7\xfc\xf2\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xee\xf1\xed\xee\xe2\xed\xfb\xec \xe8\xeb\xe8 \xe2\xf2\xee\xf0\xfb\xec.")
+            end
+        end
+    else
+        if PCS_gdButton(ic.paw .. "  " .. u8"\xcf\xf0\xe8\xe7\xe2\xe0\xf2\xfc" .. "##gdp" .. i, bw, S(26), { 0.30, 0.90, 0.50 }, 6.0) then
+            if isMain then
+                AIS.run(AIS.SpawnPet, 1)
+            elseif isSecond then
+                if s.SOTG then
+                    AIS.run(AIS.SpawnPet, 2)
+                else
+                    AIS.msg("\xc2\xea\xeb\xfe\xf7\xe8\xf2\xe5 \xf0\xe5\xe6\xe8\xec \xe4\xe2\xf3\xf5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2.")
+                end
+            else
+                AIS.msg("\xd1\xed\xe0\xf7\xe0\xeb\xe0 \xed\xe0\xe7\xed\xe0\xf7\xfc\xf2\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xee\xf1\xed\xee\xe2\xed\xfb\xec \xe8\xeb\xe8 \xe2\xf2\xee\xf0\xfb\xec.")
+            end
+        end
+    end
+
+    imgui.SetCursorScreenPos(V2(p.x, p.y + cardH + S(6)))
+    imgui.Dummy(V2(avW, S(2)))
+end
+
+function PCS_drawGuardInner(h)
+    if not AIS.s then AIS.load() end
+    local s = AIS.s
+    local ic = PCS_IC
+    local r, g, b = getAcc()
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local avW = imgui.GetContentRegionAvail().x
+
+    -- назад к финансам
+    if PCS_gdButton(ic.arrowleft .. "  " .. u8"\xcd\xe0\xe7\xe0\xe4 \xea \xf4\xe8\xed\xe0\xed\xf1\xe0\xec" .. "##gdBack", avW, S(32), { 0.62, 0.68, 0.85 }, 8.0) then
+        St._resetCharScroll = true
+        St.activeTab = 3
+        if cfg.lastTab ~= 3 then cfg.lastTab = 3; saveCfg() end
+    end
+    imgui.Dummy(V2(0, S(6)))
+
+    -- шапка: заголовок + счётчики
+    do
+        local dl = imgui.GetWindowDrawList()
+        local p = imgui.GetCursorScreenPos()
+        local cardH = S(64)
+        local total, spawnedN = 0, 0
+        for _, pet in ipairs(s.Security or {}) do
+            total = total + 1
+            if tonumber(pet.spawned) == 1 then spawnedN = spawnedN + 1 end
+        end
+        dl:AddRectFilled(p, V2(p.x + avW, p.y + cardH), U32(iv4(r*0.08, g*0.08, b*0.08, 0.85)), 10)
+        dl:AddRect(p, V2(p.x + avW, p.y + cardH), U32(iv4(r, g, b, 0.55)), 10, 0, 1.3)
+        imgui.SetCursorScreenPos(V2(p.x + S(12), p.y + S(9)))
+        imgui.TextColored(thAcc(), ic.shield .. "  " .. u8"\xcb\xe8\xf7\xed\xfb\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe8")
+        imgui.SetCursorScreenPos(V2(p.x + S(12), p.y + S(32)))
+        imgui.TextColored(thDim(), u8"\xc2\xf1\xe5\xe3\xee: " .. tostring(total) .. u8"    \xcf\xf0\xe8\xe7\xe2\xe0\xed\xee: " .. tostring(spawnedN))
+        imgui.SetCursorScreenPos(V2(p.x, p.y + cardH + S(8)))
+        imgui.Dummy(V2(avW, S(2)))
+    end
+
+    -- ── автоматизация ──
+    secTitle(u8"\xc0\xe2\xf2\xee\xec\xe0\xf2\xe8\xe7\xe0\xf6\xe8\xff")
+    PCS_gdToggle("##gdEnabled", ic.power .. "  " .. u8"\xcc\xee\xe4\xf3\xeb\xfc \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2", s.enabled ~= false,
+        u8"\xe2\xfb\xea\xeb\xfe\xf7\xe8\xf2\xe5, \xe5\xf1\xeb\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe8 \xe2\xe0\xec \xed\xe5 \xed\xf3\xe6\xed\xfb", function(v) s.enabled = v end)
+    PCS_gdToggle("##gdAuto", ic.paw .. "  " .. u8"\xc0\xe2\xf2\xee\xef\xf0\xe8\xe7\xfb\xe2 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0", s.AutoSpawnPet,
+        u8"\xef\xf0\xe8\xe7\xfb\xe2\xe0\xe5\xf2 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xef\xee\xf1\xeb\xe5 \xe2\xf5\xee\xe4\xe0 \xe2 \xe8\xe3\xf0\xf3", function(v) s.AutoSpawnPet = v end)
+    PCS_gdToggle("##gdTwo", ic.usergroup .. "  " .. u8"\xcf\xf0\xe8\xe7\xfb\xe2 \xe4\xe2\xf3\xf5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2", s.SOTG,
+        u8"\xe2\xec\xe5\xf1\xf2\xe5 \xf1 \xee\xf1\xed\xee\xe2\xed\xfb\xec \xef\xf0\xe8\xe7\xfb\xe2\xe0\xe5\xf2\xf1\xff \xe8 \xe2\xf2\xee\xf0\xee\xe9", function(v) s.SOTG = v end)
+    PCS_gdToggle("##gdCheck", ic.check .. "  " .. u8"\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2", s.CheckingSecurityForSpawn,
+        u8"\xe2 29 \xe8 59 \xec\xe8\xed\xf3\xf2\xf3 \xf7\xe0\xf1\xe0 \xef\xf0\xee\xe2\xe5\xf0\xff\xe5\xf2, \xef\xf0\xe8\xe7\xe2\xe0\xed\xfb \xeb\xe8 \xe2\xfb\xe1\xf0\xe0\xed\xed\xfb\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe8",
+        function(v) s.CheckingSecurityForSpawn = v end)
+    PCS_gdToggle("##gdCd", ic.bolt .. "  " .. u8"\xd3\xec\xe5\xed\xfc\xf8\xe5\xed\xed\xee\xe5 \xca\xc4 \xed\xe0 \xf1\xef\xe0\xe2\xed", s.ReducedCooldown,
+        u8"\xe2\xea\xeb\xfe\xf7\xe8\xf2\xe5, \xe5\xf1\xeb\xe8 \xca\xc4 \xef\xf0\xe8\xe7\xfb\xe2\xe0 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xf3 \xe2\xe0\xf1 3 \xf1\xe5\xea\xf3\xed\xe4\xfb", function(v) s.ReducedCooldown = v end)
+
+    -- задержка призыва
+    if not AIS.buf.delay then AIS.buf.delay = imgui.new.int(tonumber(s.TimeUsePet) or 0) end
+    imgui.TextColored(thDim(), "  " .. ic.clock .. "  " .. u8"\xc7\xe0\xe4\xe5\xf0\xe6\xea\xe0 \xef\xf0\xe8\xe7\xfb\xe2\xe0 \xef\xee\xf1\xeb\xe5 \xe2\xf5\xee\xe4\xe0")
+    imgui.SameLine(0, S(6))
+    imgui.TextColored(thAcc(), tostring(AIS.buf.delay[0]) .. " " .. u8"\xf1")
+    PCS_gdSliderStyle(true)
+    imgui.PushItemWidth(-1)
+    if imgui.SliderInt("##gdDelay", AIS.buf.delay, 0, 20, "%d " .. u8"\xf1") then
+        s.TimeUsePet = AIS.buf.delay[0]
+        AIS.save()
+    end
+    imgui.PopItemWidth()
+    PCS_gdSliderStyle(false)
+    imgui.Dummy(V2(0, S(6)))
+
+    -- ── список охранников ──
+    secTitle(u8"\xd1\xef\xe8\xf1\xee\xea \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2")
+    if #(s.Security or {}) == 0 then
+        imgui.TextColored(thDim(), "  " .. u8"\xd1\xef\xe8\xf1\xee\xea \xef\xf3\xf1\xf2. \xcd\xe0\xe6\xec\xe8\xf2\xe5 \xab\xce\xe1\xed\xee\xe2\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea\xbb \xe2\xed\xe8\xe7\xf3 \x97 \xee\xf2\xea\xf0\xee\xe5\xf2\xf1\xff \xe8 \xe7\xe0\xea\xf0\xee\xe5\xf2\xf1\xff \xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc.")
+    else
+        for i, pet in ipairs(s.Security) do
+            PCS_gdPetCard(i, pet, avW)
+        end
+    end
+    imgui.Dummy(V2(0, S(4)))
+
+    -- ── питание ──
+    secTitle(u8"\xcf\xe8\xf2\xe0\xed\xe8\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2")
+    PCS_gdFoodBlock(avW, "\xce\xf1\xed\xee\xe2\xed\xee\xe9 \xee\xf5\xf0\xe0\xed\xed\xe8\xea", s.InfoEat.FirstSecurity, "1")
+    if s.SOTG then
+        PCS_gdFoodBlock(avW, "\xc2\xf2\xee\xf0\xee\xe9 \xee\xf5\xf0\xe0\xed\xed\xe8\xea", s.InfoEat.SecondSecurity, "2")
+    end
+
+    PCS_gdToggle("##gdEat1", ic.food .. "  " .. u8"\xc0\xe2\xf2\xee\xea\xee\xf0\xec\xeb\xe5\xed\xe8\xe5 \xee\xf1\xed\xee\xe2\xed\xee\xe3\xee",
+        s.InfoEat.FirstSecurity.autoeat, nil,
+        function(v) s.InfoEat.FirstSecurity.autoeat = v end)
+    if s.SOTG then
+        PCS_gdToggle("##gdEat2", ic.food .. "  " .. u8"\xc0\xe2\xf2\xee\xea\xee\xf0\xec\xeb\xe5\xed\xe8\xe5 \xe2\xf2\xee\xf0\xee\xe3\xee",
+            s.InfoEat.SecondSecurity.autoeat, nil,
+            function(v) s.InfoEat.SecondSecurity.autoeat = v end)
+    end
+
+    if not AIS.buf.eat then AIS.buf.eat = imgui.new.int(tonumber(s.TimeUseEat) or 0) end
+    imgui.TextColored(thDim(), "  " .. ic.clock .. "  " .. u8"\xcc\xe8\xed\xf3\xf2\xe0 \xf7\xe0\xf1\xe0 \xe4\xeb\xff \xea\xee\xf0\xec\xeb\xe5\xed\xe8\xff")
+    imgui.SameLine(0, S(6))
+    imgui.TextColored(thAcc(), tostring(AIS.buf.eat[0]))
+    PCS_gdSliderStyle(true)
+    imgui.PushItemWidth(-1)
+    if imgui.SliderInt("##gdEatMin", AIS.buf.eat, 0, 59) then
+        s.TimeUseEat = AIS.buf.eat[0]
+        AIS.save()
+    end
+    imgui.PopItemWidth()
+    PCS_gdSliderStyle(false)
+    imgui.Dummy(V2(0, S(6)))
+
+    -- ── прочее ──
+    PCS_gdToggle("##gdDebug", ic.terminal .. "  " .. u8"DEBUG-\xf1\xee\xee\xe1\xf9\xe5\xed\xe8\xff \xe2 \xea\xee\xed\xf1\xee\xeb\xfc", s.debug_msg,
+        nil, function(v) s.debug_msg = v end)
+
+    imgui.TextColored(thDim(), "  " .. u8"\xca\xee\xec\xe0\xed\xe4\xfb: /ais, /sppet 1|2, /offpet 1|2, /fasteat 1|2")
+    imgui.TextColored(thDim(), "  " .. u8"\xce\xf2\xe4\xe5\xeb\xfc\xed\xfb\xe9 \xf1\xea\xf0\xe8\xef\xf2 Auto-Interaction Securities \xeb\xf3\xf7\xf8\xe5 \xe2\xfb\xe3\xf0\xf3\xe7\xe8\xf2\xfc.")
+    imgui.Dummy(V2(0, S(30)))
+end
+
+function PCS_drawGuardTab(h)
+    imgui.PushStyleColor(imgui.Col.ChildBg, iv4(0,0,0,0))
+    imgui.BeginChild("##sguard", imgui.ImVec2(0, h), false)
+    local ok, err = PCS_GUARD.call(PCS_drawGuardInner, h)
+    imgui.EndChild()
+    imgui.PopStyleColor()
+    if not ok and St._gdLastErr ~= tostring(err) then
+        St._gdLastErr = tostring(err)
+        pcall(sampAddChatMessage, "{FF6666}[PC Stats] " ..
+            "\xee\xf8\xe8\xe1\xea\xe0 \xee\xf2\xf0\xe8\xf1\xee\xe2\xea\xe8 \xe2\xea\xeb\xe0\xe4\xea\xe8 \xce\xf5\xf0\xe0\xed\xed\xe8\xea: " .. tostring(err), -1)
     end
 end
 
@@ -10007,13 +10621,20 @@ local _okSC, _errSC = pcall(function()
         if not oldLayout then
         do
             local sec = SECTION_DEFS[sectionOfTab(St.activeTab)]
-            if sec and #sec.tabs > 1 then
+            local visTabs = {}
+            if sec then
+                for _, td0 in ipairs(sec.tabs) do
+                    if not td0.hidden then visTabs[#visTabs+1] = td0 end
+                end
+            end
+            if sec and #visTabs > 1 then
                 local avSub = imgui.GetContentRegionAvail().x
-                local nSub  = #sec.tabs
+                local nSub  = #visTabs
                 local twSub = (avSub - (nSub-1)*S(4)) / nSub
-                for i, td in ipairs(sec.tabs) do
+                for i, td in ipairs(visTabs) do
                     if i > 1 then imgui.SameLine(0,S(4)) end
-                    if tabButton(td.label, St.activeTab==td.tab, twSub, sec.r,sec.g,sec.b) then
+                    -- вкладка "Охранник" (7) считается частью "Финансов" (3)
+                    if tabButton(td.label, St.activeTab==td.tab or (St.activeTab==7 and td.tab==3), twSub, sec.r,sec.g,sec.b) then
                         if St.activeTab ~= td.tab then
                             St._resetCharScroll = true; St._resetSettScroll = true; St.accPopupOpen = false
                             St._financeSettingsOpen = false
@@ -10207,18 +10828,16 @@ local _okSC, _errSC = pcall(function()
         local bottomBarH = (St.activeTab == 5) and (46 + S(50)) or 46
         local contentH = imgui.GetContentRegionAvail().y - bottomBarH - 20
 
-        if St.activeTab ~= 3 then St.aisView = false end
         if St.activeTab == 4 then
             drawSettings(contentH, sw, sh)
         elseif St.activeTab == 5 then
             drawAbout(contentH)
         elseif St.activeTab == 6 then
             drawTaxes(contentH)
+        elseif St.activeTab == 7 then
+            PCS_drawGuardTab(contentH)
         elseif St.activeTab == 3 and St.statsData then
             drawTotal(St.statsData, contentH)
-        elseif St.activeTab == 3 and St.aisView then
-            -- фінанси без statsData, але панель охранника доступна
-            drawTotal({ }, contentH)
         elseif not St.statsData then
             imgui.Spacing()
             if St.waitingStats then
@@ -10258,7 +10877,7 @@ local _okSC, _errSC = pcall(function()
                     imgui.PushStyleColor(imgui.Col.Button,        iv4(0.55,0.12,0.12,1.0))
                     imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.78,0.18,0.18,1.0))
                     imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(1.0, 0.25,0.25,1.0))
-                    if imgui.Button(u8"  \xd1\xe1\xf0\xee\xf1  ##taxReset", imgui.ImVec2(bw, S(40))) then
+                    if imgui.Button(PCS_IC.undo .. u8"  \xd1\xe1\xf0\xee\xf1  ##taxReset", imgui.ImVec2(bw, S(40))) then
                         cfg.taxAutoEnabled       = false
                         cfg.taxAutoIntervalHours = 1
                         cfg.taxPayOnLogin        = false
@@ -10326,12 +10945,21 @@ local _okSC, _errSC = pcall(function()
                         pcall(sampAddChatMessage, "{FFAA00}[Stats] \xe2\x9a\xa0\xef\xb8\x8f \xea\xf3\xf0\xf1\xfb \xe2\xe0\xeb\xfe\xf2 \xf1\xe1\xf0\xee\xf8\xe5\xed\xfb \xea \xe7\xed\xe0\xf7\xe5\xed\xe8\xff\xec \xef\xee \xf3\xec\xee\xeb\xf7\xe0\xed\xe8\xfe", -1)
                     end
                     imgui.PopStyleColor(3)
+                elseif St.activeTab == 7 then
+                    -- Вкладка "Охранник": обновить список охранников из инвентаря
+                    imgui.PushStyleColor(imgui.Col.Button,        iv4(r4*0.18,g4*0.18,b4*0.18,1.0))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r4*0.40,g4*0.40,b4*0.40,1.0))
+                    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r4*0.62,g4*0.62,b4*0.62,1.0))
+                    if imgui.Button(PCS_IC.sync .. u8"  \xce\xe1\xed\xee\xe2\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea##gdRefreshBottom", imgui.ImVec2(bw, S(40))) then
+                        AIS.run(AIS.CheckAllPet)
+                    end
+                    imgui.PopStyleColor(3)
                 else
                     -- ŠŸŠµŃ€Ń�Š¾Š½Š°Š¶/Š‘Š¾Ń¹: ŠŗŠ½Š¾ŠæŠŗŠ° Š˛Š±Š½Š¾Š²ŠøŃ‚Ń�
                     imgui.PushStyleColor(imgui.Col.Button,        iv4(r4*0.18,g4*0.18,b4*0.18,1.0))
                     imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r4*0.40,g4*0.40,b4*0.40,1.0))
                     imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r4*0.62,g4*0.62,b4*0.62,1.0))
-                    if imgui.Button(u8"  \xce\xe1\xed\xee\xe2\xe8\xf2\xfc  ", imgui.ImVec2(bw, S(40))) then
+                    if imgui.Button(PCS_IC.sync .. u8"  \xce\xe1\xed\xee\xe2\xe8\xf2\xfc  ", imgui.ImVec2(bw, S(40))) then
                         requestStats()
                     end
                     imgui.PopStyleColor(3)
@@ -10340,7 +10968,7 @@ local _okSC, _errSC = pcall(function()
                 imgui.PushStyleColor(imgui.Col.Button,        iv4(0.35,0.06,0.06,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.58,0.12,0.12,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.80,0.22,0.22,1.0))
-                if imgui.Button(u8"  \xc7\xe0\xea\xf0\xfb\xf2\xfc  ", imgui.ImVec2(bw, S(40))) then
+                if imgui.Button(PCS_IC.xmark .. u8"  \xc7\xe0\xea\xf0\xfb\xf2\xfc  ", imgui.ImVec2(bw, S(40))) then
                     requestCloseMenu()
                 end
                 imgui.PopStyleColor(3)
@@ -10922,18 +11550,15 @@ end
 -- ============================================================
 
 -- ── AIS: CEF-інвентар (packet 220) і GameText ────────────────
-function sampev.onReceivePacket(id, bs)
-    pcall(function()
-        if AIS and AIS.onReceivePacket then
-            AIS.onReceivePacket(id, bs)
-        end
-    end)
-end
+-- пакеты CEF (инвентарь) AIS слушает сам: addEventHandler("onReceivePacket")
+-- в AIS.init(), как в оригинальном скрипте (raw-событие MoonLoader)
 
-function sampev.onDisplayGameText(text, time, style)
+-- ФИКС порядка аргументов: у samp.events это (style, time, text), раньше
+-- сюда передавалось (text, time, style) и текст "2 sec" никогда не находился
+function sampev.onDisplayGameText(style, time, text)
     pcall(function()
         if AIS and AIS.onDisplayGameText then
-            AIS.onDisplayGameText(text, time, style)
+            AIS.onDisplayGameText(style, time, text)
         end
     end)
 end
