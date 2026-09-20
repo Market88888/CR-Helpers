@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.2"
+local SCRIPT_VER = "1.8.5"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -2019,6 +2019,13 @@ local ICON_POWER = "\239\128\145" -- fa-power-off       -- "Выключить"
 local ICON_TRASH = "\239\135\184" -- fa-trash           -- "Удалить"
 local ICON_UNDO  = "\239\131\162" -- fa-arrow-rotate-left -- "Сброс данных"
 local ICON_SYNC  = "\239\128\161" -- fa-arrows-rotate   -- "Перезагрузить"
+local ICON_TAX     = ICON_SACK -- вкладка Налоги (пока = sack)
+local ICON_TG_FB   = "â"
+local ICON_DC_FB   = "ð®"
+local ICON_TG      = ICON_TG_FB
+local ICON_DISCORD = ICON_DC_FB
+local ICON_CALENDAR = "ð"
+local ICON_CARD    = "ð³"
 
 -- простой чистый Lua base64-декодер (без внешних зависимостей —
 -- на скрипт с mimgui нельзя рассчитывать, что будет доступна bit32/bit)
@@ -4213,7 +4220,7 @@ local SECTION_DEFS = {
         { tab=2, label = ICON_FIST.." "..u8"\xc1\xee\xe9" },
         { tab=3, label = ICON_SACK.." "..u8"\xd4\xe8\xed\xe0\xed\xf1\xfb" },
       } },
-    { label = ICON_SACK.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8",             icon=ICON_SACK, name=u8"\xcd\xe0\xeb\xee\xe3\xe8",             r=1.0,g=0.65,b=0.15,
+    { label = ICON_TAX.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8",             icon=ICON_TAX, name=u8"\xcd\xe0\xeb\xee\xe3\xe8",             r=1.0,g=0.65,b=0.15,
       tabs = {
         { tab=6, label = u8"\xcd\xe0\xeb\xee\xe3\xe8" },
       } },
