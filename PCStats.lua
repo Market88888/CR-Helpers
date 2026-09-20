@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.1"
+local SCRIPT_VER = "1.8.0"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -1043,6 +1043,585 @@ PCS_UPDATE = {
 
 function pcsCheckForUpdate(silent) pcs_ver.check(silent) end
 function pcsInstallUpdate() pcs_ver.install() end
+
+-- ============================================================
+--  AIS: Auto-Interaction Securities (особисті охоронці / pet)
+--  Префікс ais_ — без конфліктів з PC Stats
+--  Залежності: samp.events (sampev), lua_thread, raknet*,
+--    encodeJson/decodeJson (опційно), doesFileExist/createDirectory
+--  Команди: /sppet 1|2, /offpet 1|2, /fasteat 1|2,
+--           /aisallsppet, /aisallclear, /aisreload, /ais
+-- ============================================================
+
+local AIS = {}
+
+-- ── типи їжі в інвентарі CEF ────────────────────────────────
+AIS.FOOD = {
+    [512]  = "chips",   -- Чипсы
+    [783]  = "meat",    -- Мясо
+    [1513] = "coins",   -- Монеты охотника
+}
+
+-- ── стан (критичні прапорці) ────────────────────────────────
+AIS.st = {
+    sppet1 = false, sppet2 = false,
+    offpet1 = false, offpet2 = false,
+    eatpet1 = false, eatpet2 = false,
+    checkinv = false,
+    checksecurityinv = false,
+    AddVerifi = false,
+    SpawnProcessing = false,
+    freezeUntil = 0,
+    lastInvJson = "",
+    pets = {},          -- id -> { name, hungry, ... }
+    food = {},          -- { {slot=, amount=, type=}, ... }
+    enabled = true,
+    autoSpawn = false,
+    autoEat = false,
+    reducedAudio = false,
+}
+
+-- ── JSON-конфіг (як у AIS): merge з дефолтами ───────────────
+-- Залежності: encodeJson, decodeJson (MoonLoader). Якщо немає —
+-- fallback на простий ручний формат через inicfg-стиль не робимо;
+-- просто не зберігаємо.
+local function ais_cfgPath()
+    local dir = "moonloader/config"
+    pcall(function()
+        if getWorkingDirectory then
+            local w = getWorkingDirectory()
+            if type(w) == "string" and w ~= "" then
+                dir = w .. "/config"
+            end
+        end
+    end)
+    return dir, dir .. "/ais_pets.json"
+end
+
+local function ais_deepMerge(dst, src)
+    if type(dst) ~= "table" or type(src) ~= "table" then return dst end
+    for k, v in pairs(src) do
+        if type(v) == "table" then
+            if type(dst[k]) ~= "table" then dst[k] = {} end
+            ais_deepMerge(dst[k], v)
+        elseif dst[k] == nil then
+            dst[k] = v
+        end
+    end
+    return dst
+end
+
+function AIS.jsonLoad()
+    local defaults = {
+        enabled = true,
+        autoSpawn = false,
+        autoEat = false,
+        reducedAudio = false,
+        foodPrefer = { 783, 512, 1513 }, -- м'ясо → чіпси → монети
+    }
+    local dir, path = ais_cfgPath()
+    pcall(function()
+        if doesDirectoryExist and not doesDirectoryExist(dir) then
+            createDirectory(dir)
+        end
+    end)
+    local data = nil
+    pcall(function()
+        if doesFileExist and doesFileExist(path) and decodeJson then
+            local f = io.open(path, "rb")
+            if f then
+                local body = f:read("*a"); f:close()
+                if body and #body > 2 then
+                    data = decodeJson(body)
+                end
+            end
+        end
+    end)
+    if type(data) ~= "table" then data = {} end
+    ais_deepMerge(data, defaults)
+    AIS.st.enabled = data.enabled and true or false
+    AIS.st.autoSpawn = data.autoSpawn and true or false
+    AIS.st.autoEat = data.autoEat and true or false
+    AIS.st.reducedAudio = data.reducedAudio and true or false
+    AIS.cfg = data
+    return data
+end
+
+function AIS.jsonSave()
+    if not AIS.cfg then AIS.jsonLoad() end
+    AIS.cfg.enabled = AIS.st.enabled
+    AIS.cfg.autoSpawn = AIS.st.autoSpawn
+    AIS.cfg.autoEat = AIS.st.autoEat
+    AIS.cfg.reducedAudio = AIS.st.reducedAudio
+    local dir, path = ais_cfgPath()
+    pcall(function()
+        if doesDirectoryExist and not doesDirectoryExist(dir) then
+            createDirectory(dir)
+        end
+        if not encodeJson then return end
+        local body = encodeJson(AIS.cfg)
+        if type(body) ~= "string" then return end
+        local f = io.open(path, "wb")
+        if f then f:write(body); f:close() end
+    end)
+end
+
+-- ── CEF: sendCEF(str) ───────────────────────────────────────
+-- Формат бітстріму: packet 220, opcode 18, len uint16, str, 0 uint32
+function AIS.sendCEF(str)
+    str = tostring(str or "")
+    if str == "" then return false end
+    local ok = pcall(function()
+        local bs = raknetNewBitStream()
+        raknetBitStreamWriteInt8(bs, 220)
+        raknetBitStreamWriteInt8(bs, 18)
+        raknetBitStreamWriteInt16(bs, #str)
+        raknetBitStreamWriteString(bs, str)
+        raknetBitStreamWriteInt32(bs, 0)
+        raknetSendBitStream(bs)
+        raknetDeleteBitStream(bs)
+    end)
+    return ok and true or false
+end
+
+-- ── emul_num: емуляція натискання (Y = інвентар) ────────────
+-- array = байти віртуального коду / пакету; для Y використовуємо
+-- setVirtualKeyDown якщо є, інакше CEF requestShowingInventory
+function AIS.emul_num(array)
+    -- Основний шлях для інвентаря — CEF, бо віртуальні клавіші
+    -- на різних клієнтах поводяться по-різному
+    if type(array) == "table" and array[1] == 220 then
+        -- відкрити інвентар
+        AIS.sendCEF("requestShowingInventory|28")
+        return true
+    end
+    pcall(function()
+        if setVirtualKeyDown and type(array) == "table" then
+            local vk = array[#array] or 89 -- Y
+            setVirtualKeyDown(vk, true)
+            wait(50)
+            setVirtualKeyDown(vk, false)
+        end
+    end)
+    return true
+end
+
+-- ── парсинг інвентаря з CEF (packet 220, opcode 17) ──────────
+function AIS.parseInventoryJson(raw)
+    if type(raw) ~= "string" or #raw < 10 then return end
+    AIS.st.lastInvJson = raw
+    AIS.st.food = {}
+    AIS.st.pets = {}
+
+    -- securities / pets: об'єкти { ... "id": N ... }
+    for obj in raw:gmatch("%b{}") do
+        local id = tonumber(obj:match('"id"%s*:%s*(%d+)'))
+        if id then
+            local low = obj:lower()
+            if low:find("security", 1, true) or low:find("pet", 1, true)
+                or obj:find('"type"%s*:%s*2') or obj:find("охран") then
+                AIS.st.pets[id] = { id = id, raw = obj }
+            end
+        end
+    end
+
+    -- їжа: точний патерн з ТЗ
+    for sl, it, am in raw:gmatch('"slot":(%d+),"available":1,"blackout":0,"item":(%d+),"amount":(%d+)') do
+        sl, it, am = tonumber(sl), tonumber(it), tonumber(am)
+        if AIS.FOOD[it] and am and am > 0 then
+            AIS.st.food[#AIS.st.food + 1] = { slot = sl, amount = am, type = it }
+        end
+    end
+    -- запасний патерн з пробілами
+    if #AIS.st.food == 0 then
+        for sl, it, am in raw:gmatch('"slot"%s*:%s*(%d+).-"available"%s*:%s*1.-"blackout"%s*:%s*0.-"item"%s*:%s*(%d+).-"amount"%s*:%s*(%d+)') do
+            sl, it, am = tonumber(sl), tonumber(it), tonumber(am)
+            if AIS.FOOD[it] and am and am > 0 then
+                AIS.st.food[#AIS.st.food + 1] = { slot = sl, amount = am, type = it }
+            end
+        end
+    end
+end
+
+-- ── вибір їжі за пріоритетом ────────────────────────────────
+function AIS.pickFood()
+    local prefer = (AIS.cfg and AIS.cfg.foodPrefer) or { 783, 512, 1513 }
+    for _, want in ipairs(prefer) do
+        for _, f in ipairs(AIS.st.food) do
+            if f.type == want and f.amount > 0 then return f end
+        end
+    end
+    if AIS.st.food[1] then return AIS.st.food[1] end
+    return nil
+end
+
+function AIS.firstPetId()
+    for id, _ in pairs(AIS.st.pets) do return id end
+    return nil
+end
+
+function AIS.petIdByIndex(n)
+    n = tonumber(n) or 1
+    local list = {}
+    for id, _ in pairs(AIS.st.pets) do list[#list + 1] = id end
+    table.sort(list)
+    return list[n]
+end
+
+-- ── дії з охоронцями ────────────────────────────────────────
+function AIS.SpawnPet(n)
+    n = tonumber(n) or 1
+    if AIS.st.SpawnProcessing then return end
+    AIS.st.SpawnProcessing = true
+    if n == 1 then AIS.st.sppet1 = true else AIS.st.sppet2 = true end
+    lua_thread.create(function()
+        local ok, err = pcall(function()
+            AIS.emul_num({ 220, 0, 27, 64 })
+            wait(400)
+            AIS.sendCEF("requestShowingInventory|28")
+            wait(600)
+            local petId = AIS.petIdByIndex(n) or AIS.firstPetId()
+            if not petId then
+                -- ще раз попросити інвентар і почекати пакет
+                AIS.st.checkinv = true
+                wait(800)
+                petId = AIS.petIdByIndex(n) or AIS.firstPetId()
+            end
+            if petId then
+                AIS.sendCEF(string.format('clickOnMenu|{"id": %d}', petId))
+                wait(400)
+            end
+            AIS.sendCEF("inventoryClose")
+        end)
+        if n == 1 then AIS.st.sppet1 = false else AIS.st.sppet2 = false end
+        AIS.st.SpawnProcessing = false
+        if not ok then
+            print("[AIS] SpawnPet error: " .. tostring(err))
+        end
+    end)
+end
+
+function AIS.OffPet(n)
+    n = tonumber(n) or 1
+    if n == 1 then AIS.st.offpet1 = true else AIS.st.offpet2 = true end
+    lua_thread.create(function()
+        pcall(function()
+            AIS.emul_num({ 220, 0, 27, 64 })
+            wait(400)
+            AIS.sendCEF("requestShowingInventory|28")
+            wait(600)
+            local petId = AIS.petIdByIndex(n) or AIS.firstPetId()
+            if petId then
+                AIS.sendCEF(string.format('clickOnMenu|{"id": %d}', petId))
+                wait(400)
+            end
+            AIS.sendCEF("inventoryClose")
+        end)
+        if n == 1 then AIS.st.offpet1 = false else AIS.st.offpet2 = false end
+    end)
+end
+
+function AIS.EatPet(n)
+    n = tonumber(n) or 1
+    if n == 1 then AIS.st.eatpet1 = true else AIS.st.eatpet2 = true end
+    lua_thread.create(function()
+        pcall(function()
+            AIS.st.checkinv = true
+            AIS.emul_num({ 220, 0, 27, 64 })
+            wait(400)
+            AIS.sendCEF("requestShowingInventory|28")
+            wait(700)
+            local food = AIS.pickFood()
+            local petId = AIS.petIdByIndex(n) or AIS.firstPetId()
+            if food and petId then
+                local payload = string.format(
+                    'useItemOnSecurity|{"from":{"amount":1,"slot":%d,"type":1},"id":%d}',
+                    food.slot, petId
+                )
+                AIS.sendCEF(payload)
+                wait(500)
+            else
+                pcall(sampAddChatMessage,
+                    "{FFAA00}[AIS] \xcd\xe5\xf2\x20\xe5\xe4\xfb/\xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0 \xe4\xeb\xff \xea\xee\xf0\xec\xeb\xe5\xed\xe8\xff", -1)
+            end
+            AIS.sendCEF("inventoryClose")
+        end)
+        if n == 1 then AIS.st.eatpet1 = false else AIS.st.eatpet2 = false end
+    end)
+end
+
+function AIS.AutoSpawnPet()
+    if not AIS.st.enabled or not AIS.st.autoSpawn then return end
+    if AIS.st.SpawnProcessing then return end
+    lua_thread.create(function()
+        pcall(function()
+            -- зупинка персонажа перед призовом
+            pcall(function()
+                if freezeCharPosition and PLAYER_PED then
+                    freezeCharPosition(PLAYER_PED, true)
+                    wait(200)
+                end
+            end)
+            AIS.SpawnPet(1)
+            wait(1500)
+            pcall(function()
+                if freezeCharPosition and PLAYER_PED then
+                    freezeCharPosition(PLAYER_PED, false)
+                end
+            end)
+        end)
+    end)
+end
+
+function AIS.AutoEatpet()
+    if not AIS.st.enabled or not AIS.st.autoEat then return end
+    AIS.EatPet(1)
+end
+
+function AIS.CheckAllPet()
+    AIS.st.checksecurityinv = true
+    lua_thread.create(function()
+        pcall(function()
+            AIS.sendCEF("requestShowingInventory|28")
+            wait(800)
+            AIS.sendCEF("inventoryClose")
+            local n = 0
+            for _ in pairs(AIS.st.pets) do n = n + 1 end
+            pcall(sampAddChatMessage,
+                string.format("{66CCFF}[AIS] pets=%d food=%d", n, #AIS.st.food), -1)
+        end)
+        AIS.st.checksecurityinv = false
+    end)
+end
+
+-- ── планувальник МСК ────────────────────────────────────────
+AIS.parsedCache = {}
+function AIS.checkMSKTimeAdvanced(timeStr, defaultMode)
+    if type(timeStr) ~= "string" or timeStr == "" then return false end
+    defaultMode = defaultMode or "once"
+    local cacheKey = timeStr .. "|" .. defaultMode
+    local now = os.time(os.date("!*t")) + 3 * 3600 -- МСК UTC+3
+    local t = os.date("*t", now)
+    local hm = string.format("%02d:%02d", t.hour, t.min)
+    local hms = string.format("%02d:%02d:%02d", t.hour, t.min, t.sec)
+
+    local parsed = AIS.parsedCache[cacheKey]
+    if not parsed then
+        parsed = { mode = defaultMode, fired = false }
+        if timeStr:match("^@%d+") then
+            parsed.kind = "offset"
+            parsed.mm = tonumber(timeStr:match("^@(%d+)")) or 0
+            parsed.ss = tonumber(timeStr:match("^@%d+:(%d+)")) or 0
+        elseif timeStr:find("-", 1, true) then
+            parsed.kind = "range"
+            parsed.a, parsed.b = timeStr:match("([^%-]+)%-(.+)")
+        else
+            parsed.kind = "exact"
+            parsed.val = timeStr
+        end
+        AIS.parsedCache[cacheKey] = parsed
+    end
+
+    local hit = false
+    if parsed.kind == "exact" then
+        hit = (parsed.val == hm or parsed.val == hms)
+    elseif parsed.kind == "range" then
+        hit = (hm >= tostring(parsed.a) and hm <= tostring(parsed.b))
+    end
+
+    if not hit then
+        if parsed.mode == "once" then parsed.fired = false end
+        return false
+    end
+    if parsed.mode == "once" then
+        if parsed.fired then return false end
+        parsed.fired = true
+    end
+    return true
+end
+
+-- ── обробники подій (викликаються З УЖЕ ІСНУЮЧИХ sampev.*) ──
+function AIS.onShowDialog(id, style, title, btn1, btn2, text)
+    if not AIS.st.enabled then return nil end
+    local t = tostring(title or "")
+    local body = tostring(text or "")
+
+    -- Призыв охранника → закрити
+    if t:find("Призыв охранника", 1, true) or t:find("\xcf\xf0\xe8\xe7\xfb\xe2 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0", 1, true) then
+        pcall(sampSendDialogResponse, id, 0, 0, "")
+        return false
+    end
+    -- Покормить охранника → підтвердити
+    if t:find("Покормить охранника", 1, true) or t:find("\xcf\xee\xea\xee\xf0\xec\xe8\xf2\xfc \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0", 1, true) then
+        pcall(sampSendDialogResponse, id, 1, 0, "")
+        return false
+    end
+    -- спавн поруч
+    if body:find("%[1%].-Заспавнить рядом с собой") or body:find("Заспавнить рядом") then
+        if AIS.st.sppet1 or AIS.st.sppet2 or AIS.st.SpawnProcessing then
+            local idx = 0
+            for i, line in ipairs({}) do end
+            -- шукаємо рядок
+            local n = 0
+            for line in (body .. "\n"):gmatch("(.-)\n") do
+                if line:find("Заспавнить рядом") then
+                    pcall(sampSendDialogResponse, id, 1, n, "")
+                    return false
+                end
+                n = n + 1
+            end
+        end
+    end
+    -- відправити за доставкою (off)
+    if body:find("Отправить за доставкой") and (AIS.st.offpet1 or AIS.st.offpet2) then
+        local n = 0
+        for line in (body .. "\n"):gmatch("(.-)\n") do
+            if line:find("Отправить за доставкой") then
+                pcall(sampSendDialogResponse, id, 1, n, "")
+                return false
+            end
+            n = n + 1
+        end
+    end
+    return nil -- не обробляли
+end
+
+function AIS.onServerMessage(color, text)
+    if not AIS.st.enabled then return end
+    local msg = tostring(text or "")
+    local clean = msg:gsub("{%x%x%x%x%x%x}", ""):gsub("{%x%x%x%x%x%x%x%x}", "")
+
+    if clean:find("На сервере есть инвентарь, используйте клавишу Y", 1, true)
+        or clean:find("\xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc", 1, true) and clean:find("Y", 1, true) then
+        if AIS.st.autoSpawn then
+            AIS.AutoSpawnPet()
+        end
+        return
+    end
+    if clean:find("накормил", 1, true) and clean:find("охранник", 1, true) then
+        AIS.st.eatpet1 = false
+        AIS.st.eatpet2 = false
+        return
+    end
+    if clean:find("охранник голоден", 1, true) or clean:find("голоден", 1, true) and clean:find("охранник", 1, true) then
+        AIS.AutoEatpet()
+        return
+    end
+    if clean:find("У вас нету охранников", 1, true) or clean:find("нет охранников", 1, true) then
+        AIS.st.autoSpawn = false
+        AIS.st.autoEat = false
+        pcall(sampAddChatMessage, "{FF6666}[AIS] no securities — auto off", -1)
+        return
+    end
+end
+
+function AIS.onDisplayGameText(text, time, style)
+    if not AIS.st.enabled then return end
+    local s = tostring(text or "")
+    if s:find("2 sec", 1, true) then
+        local ms = AIS.st.reducedAudio and 5550 or 17550
+        pcall(function()
+            if freezeCharPosition and PLAYER_PED then
+                freezeCharPosition(PLAYER_PED, true)
+                AIS.st.freezeUntil = os.clock() + (ms / 1000)
+                lua_thread.create(function()
+                    wait(ms)
+                    pcall(freezeCharPosition, PLAYER_PED, false)
+                end)
+            end
+        end)
+    end
+end
+
+-- ── onReceivePacket: CEF inventory opcode 17 ────────────────
+function AIS.onReceivePacket(id, bs)
+    if id ~= 220 then return end
+    if not AIS.st.enabled then return end
+    local ok, opcode = pcall(raknetBitStreamReadInt8, bs)
+    if not ok or opcode ~= 17 then return end
+    local ok2, raw = pcall(function()
+        -- після opcode: часто length + string; різні клієнти — різний layout.
+        -- Читаємо залишок як рядок евристично.
+        local len = raknetBitStreamReadInt16(bs)
+        if type(len) == "number" and len > 0 and len < 500000 then
+            return raknetBitStreamReadString(bs, len)
+        end
+        return nil
+    end)
+    if ok2 and type(raw) == "string" and #raw > 20 then
+        AIS.st.checkinv = false
+        pcall(AIS.parseInventoryJson, raw)
+    end
+end
+
+function AIS.registerCommands()
+    local function reg(cmd, fn)
+        pcall(sampRegisterChatCommand, cmd, fn)
+    end
+    reg("sppet", function(arg)
+        local n = tonumber(tostring(arg or "1"):match("%d")) or 1
+        AIS.SpawnPet(n)
+    end)
+    reg("offpet", function(arg)
+        local n = tonumber(tostring(arg or "1"):match("%d")) or 1
+        AIS.OffPet(n)
+    end)
+    reg("fasteat", function(arg)
+        local n = tonumber(tostring(arg or "1"):match("%d")) or 1
+        AIS.EatPet(n)
+    end)
+    reg("aisallsppet", function()
+        AIS.SpawnPet(1); wait(0)
+        lua_thread.create(function()
+            wait(2000)
+            AIS.SpawnPet(2)
+        end)
+    end)
+    reg("aisallclear", function()
+        AIS.OffPet(1)
+        lua_thread.create(function()
+            wait(1500)
+            AIS.OffPet(2)
+        end)
+    end)
+    reg("aisreload", function()
+        AIS.jsonLoad()
+        pcall(sampAddChatMessage, "{00FF88}[AIS] config reloaded", -1)
+    end)
+    reg("ais", function(arg)
+        arg = tostring(arg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+        if arg == "spawn" or arg == "autospawn" then
+            AIS.st.autoSpawn = not AIS.st.autoSpawn
+            AIS.jsonSave()
+            pcall(sampAddChatMessage, "{66CCFF}[AIS] autoSpawn=" .. tostring(AIS.st.autoSpawn), -1)
+        elseif arg == "eat" or arg == "autoeat" then
+            AIS.st.autoEat = not AIS.st.autoEat
+            AIS.jsonSave()
+            pcall(sampAddChatMessage, "{66CCFF}[AIS] autoEat=" .. tostring(AIS.st.autoEat), -1)
+        elseif arg == "off" then
+            AIS.st.enabled = false; AIS.jsonSave()
+            pcall(sampAddChatMessage, "{FFAA00}[AIS] disabled", -1)
+        elseif arg == "on" then
+            AIS.st.enabled = true; AIS.jsonSave()
+            pcall(sampAddChatMessage, "{00FF88}[AIS] enabled", -1)
+        elseif arg == "check" then
+            AIS.CheckAllPet()
+        else
+            pcall(sampAddChatMessage, "{66CCFF}[AIS] /ais on|off|spawn|eat|check | /sppet 1|2 /offpet /fasteat", -1)
+        end
+    end)
+end
+
+function AIS.init()
+    AIS.jsonLoad()
+    AIS.registerCommands()
+    print("[AIS] Auto-Interaction Securities loaded (prefix ais_)")
+end
+
+-- глобальний доступ
+_G.AIS = AIS
+
+
 
 -- ============================================================
 --  ФИКС "КАРАКУЛЬ" В ЧАТЕ ВМЕСТО ЭМОДЗИ
@@ -9550,6 +10129,11 @@ end
 
 function sampev.onShowDialog(id, style, title, btn1, btn2, text)
     PCS_GUARD.mark("onShowDialog id=" .. tostring(id))
+    -- ── AIS (охоронці): якщо обробили діалог — не йдемо в податки ──
+    if AIS and AIS.onShowDialog then
+        local aisRet = AIS.onShowDialog(id, style, title, btn1, btn2, text)
+        if aisRet == false then return false end
+    end
     -- ── автоматизация оплаты налогов (см. payTaxesNow) ──
     -- ФИКС (по жалобе "открывает телефон и диалог, но не жмёт Оплатить"):
     -- раньше здесь была проверка "id == _taxExpectedDialogId" (см. историю
@@ -9925,6 +10509,13 @@ function sampev.onServerMessage(color, text)
             return
         end
     end)
+
+    -- ── AIS: повідомлення про охоронців / інвентар ──
+    pcall(function()
+        if AIS and AIS.onServerMessage then
+            AIS.onServerMessage(color, text)
+        end
+    end)
 end
 
 function sampev.onShowTextDraw(id, data)
@@ -9986,6 +10577,25 @@ end
 -- ============================================================
 --  MAIN
 -- ============================================================
+
+-- ── AIS: CEF-інвентар (packet 220) і GameText ────────────────
+function sampev.onReceivePacket(id, bs)
+    pcall(function()
+        if AIS and AIS.onReceivePacket then
+            AIS.onReceivePacket(id, bs)
+        end
+    end)
+end
+
+function sampev.onDisplayGameText(text, time, style)
+    pcall(function()
+        if AIS and AIS.onDisplayGameText then
+            AIS.onDisplayGameText(text, time, style)
+        end
+    end)
+end
+
+
 function main()
     -- 1. Š�Š½Š°Ń‡Š°Š»Š° Š³Ń€Ń�Š·ŠøŠ¼ ŠŗŠ¾Š½Ń„ŠøŠ³
     loadCfg()
@@ -10135,6 +10745,11 @@ function main()
     end
 
     registerMenuCommand(cfg.menuOpenCmd)
+
+    -- ── AIS (охоронці): команди /sppet /offpet /fasteat /ais... ──
+    pcall(function()
+        if AIS and AIS.init then AIS.init() end
+    end)
 
     -- ── команда чата для ручной оплаты налогов (по просьбе) ──
     pcall(sampRegisterChatCommand, "paytax", function() payTaxesThenHotel(false) end)
