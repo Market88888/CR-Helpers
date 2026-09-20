@@ -667,6 +667,10 @@ function pcs_ver.check(silent)
     S.checking = true
     S.checkingSince = os.clock()
     S.last_error = nil
+    -- запоминаем, каким запуском была ЭТА проверка (авто-раз-в-5-минут или
+    -- ручная кнопка) — используется в карточке "Обновления" ниже, чтобы
+    -- показывать разные стикеры/подписи для автопроверки и ручной проверки
+    S.lastWasSilent = silent and true or false
     if not silent then
         S.manualChecked = true
         pcs_ver.notify("\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe9\x2e\x2e\x2e", "{66CCFF}")
@@ -704,7 +708,16 @@ function pcs_ver.check(silent)
                     S.last_notify = os.time()
                 end
             elseif not silent then
-                pcs_ver.notify("\xd3\x20\xe2\xe0\xf1\x20\xef\xee\xf1\xeb\xe5\xe4\xed\xff\xff\x20\xe2\xe5\xf0\xf1\xe8\xff\x20\x76" .. tostring(SCRIPT_VER), "{00FF88}")
+                -- ФИКС/диагностика: раньше при "версия не найдена" не было
+                -- видно, ЧТО именно вернул GitHub — если человек забыл
+                -- поправить manifest.json (или залил не в ту ветку), кнопка
+                -- "Обновить" молча не появлялась и было непонятно, почему.
+                -- Теперь в этом же сообщении всегда виден номер версии,
+                -- который реально пришёл с GitHub, — сразу видно
+                -- расхождение (например SCRIPT_VER не совпадает с тем, что
+                -- скрипт увидел в manifest.json)
+                pcs_ver.notify("\xd3\x20\xe2\xe0\xf1\x20\xef\xee\xf1\xeb\xe5\xe4\xed\xff\xff\x20\xe2\xe5\xf0\xf1\xe8\xff\x20\x76" .. tostring(SCRIPT_VER)
+                    .. "\x20\x28\xed\xe0\x20\x47\x69\x74\x48\x75\x62\x3a\x20\x76" .. tostring(manifest.version) .. ")", "{00FF88}")
             end
         end)
         S.checking = false   -- сбрасываем в ЛЮБОМ случае, даже после ошибки
@@ -1388,6 +1401,16 @@ function AIS.AddVerifiSecurity(action)
     st.AddVerifi = false
 
     if not updated then
+        -- ФИКС: раньше при неудаче писали только "не удалось,
+        -- попробуйте позже" — без числа попыток/времени ожидания, поэтому
+        -- было непонятно, реально ли сервер не ответил ни разу за ~90 сек,
+        -- или инвентарь вообще не открывался (например, руки заняты,
+        -- диалог/меню перекрывает CEF, слишком большой пинг). Теперь видно
+        -- количество попыток и общее время ожидания — это можно
+        -- скопировать и прислать для дальнейшей диагностики
+        AIS.msg(u8"\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xee\xe1\xed\xee\xe2\xe8\xf2\xfc\x20\xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xfe\x20\xee\x20\xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8\x20\xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2\x20\xe7\xe0\x20" .. tostring(i or 40) ..
+            u8"\x20\xef\xee\xef\xfb\xf2\xee\xea\x20\x28\x7e" .. tostring(math.floor((i or 40) * 2.25)) ..
+            u8"\x20\xf1\xe5\xea\x29\x2e\x20\xd1\xe5\xf0\xe2\xe5\xf0\x20\xed\xe5\x20\xee\xf2\xe2\xe5\xf2\xe8\xeb\x20\xed\xe0\x20\x2f\x69\x6e\x76\x65\x6e\x74\x20\x97\x20\xef\xf0\xee\xe2\xe5\xf0\xfc\xf2\xe5\x2c\x20\xed\xe5\x20\xe7\xe0\xed\xff\xf2\xfb\x20\xeb\xe8\x20\xf0\xf3\xea\xe8\x2f\xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc\x2c\x20\xe8\x20\xef\xee\xef\xf0\xee\xe1\xf3\xe9\xf2\xe5\x20\xe5\xf9\xb8\x20\xf0\xe0\xe7\x2e", "{FF6666}")
         AIS.dbg("[AddVer] \xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xee\xe1\xed\xee\xe2\xe8\xf2\xfc \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xfe \xee \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2!")
         return false
     end
@@ -9330,10 +9353,16 @@ function drawAboutInner(h)
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(32)))
             imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xc0\xea\xf2\xf3\xe0\xeb\xfc\xed\xe0\xff\x20\xe2\xe5\xf0\xf1\xe8\xff\x3a")
             imgui.SameLine(0,8)
+            -- ── стикеры статуса: раньше "проверка/ошибка/актуально" рисовались
+            -- одним и тем же серым текстом без пометки авто/вручную — не
+            -- было видно, что вообще сейчас произошло. Теперь у каждого
+            -- состояния свой цвет + короткая иконка-тег, и отдельно видно,
+            -- была ли это автопроверка (раз в 5 минут) или ручная кнопка ──
+            local modeTag = (U and U.state.lastWasSilent) and u8"\x20\x28\xe0\xe2\xf2\xee\x29" or u8"\x20\x28\xe2\xf0\xf3\xf7\xed\xf3\xfe\x29"
             if not U then
                 imgui.TextColored(iv4(0.6,0.6,0.6,1.0), u8"\xed\xe5\xe8\xe7\xe2\xe5\xf1\xf2\xed\xee")
             elseif U.state.checking then
-                imgui.TextColored(iv4(0.6,0.6,0.6,1.0), u8"\xef\xf0\xee\xe2\xe5\xf0\xea\xe0\x2e\x2e\x2e")
+                imgui.TextColored(iv4(0.45,0.70,1.00,1.0), u8"\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0\x2e\x2e\x2e" .. modeTag)
             elseif U.state.ver_remote then
                 if U.state.available then
                     imgui.TextColored(thGold(), "v" .. U.state.ver_remote .. u8"\x20\x28\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x21\x29")
@@ -9341,7 +9370,7 @@ function drawAboutInner(h)
                     imgui.TextColored(iv4(0.40,1.00,0.50,1.0), "v" .. U.state.ver_remote .. u8"\x20\x28\xf3\x20\xe2\xe0\xf1\x20\xef\xee\xf1\xeb\xe5\xe4\xed\xff\xff\x29")
                 end
             elseif U and U.state.last_error then
-                imgui.TextColored(iv4(1.0,0.45,0.45,1.0), u8"\xee\xf8\xe8\xe1\xea\xe0\x20\xef\xf0\xee\xe2\xe5\xf0\xea\xe8")
+                imgui.TextColored(iv4(1.0,0.45,0.45,1.0), u8"\xee\xf8\xe8\xe1\xea\xe0\x20\xef\xf0\xee\xe2\xe5\xf0\xea\xe8\x3a\x20" .. tostring(U.state.last_error))
             else
                 imgui.TextColored(iv4(0.6,0.6,0.6,1.0), u8"\xed\xe5\xe8\xe7\xe2\xe5\xf1\xf2\xed\xee")
             end
