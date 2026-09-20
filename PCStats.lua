@@ -13,11 +13,11 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.5"
+local SCRIPT_VER = "1.8.0"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
-local PCS_UPDATE_AUTO_SECONDS = 900  -- автопроверка раз в 15 минут
+local PCS_UPDATE_AUTO_SECONDS = 300  -- автопроверка/напоминание об обновлении раз в 5 минут
 
 -- имя чат-команды, зарегистрированной сейчас (для перерегистрации при смене)
 local _registeredMenuCmd = nil
@@ -329,6 +329,9 @@ local ffi    = safeRequire("ffi")
 --    по всему файлу и отвергли бы скачанный файл, если бы он их содержал;
 --  * убран jsDelivr (кэширует @main до 12 часов → подсовывал старый файл);
 --  * зависший флаг checking/installing самовосстанавливается;
+--  * напоминания: если вышла новая версия, игрок получает сообщение в чат
+--    сразу после входа в игру и потом каждые 5 минут, пока не обновится
+--    (после обновления версия совпадает с manifest.json — и тишина);
 --  * после обновления в папке остаётся ОДИН файл скрипта: резервная копия
 --    PCStats.lua.bak больше не создаётся, а остатки прошлых обновлений
 --    (.bak/.old/.new) удаляются при запуске.
@@ -362,9 +365,11 @@ pcs_ver.cfg = {
     file        = "PCStats.lua",
     manifest    = "manifest.json",
     check_throttle  = 60,    -- сек между тихими проверками
-    auto_interval   = 900,   -- автопроверка раз в 15 мин
-    notify_interval = 3600,  -- тихое уведомление не чаще раза в час
+    auto_interval   = 300,   -- автопроверка раз в 5 мин (см. PCS_UPDATE_AUTO_SECONDS)
+    notify_interval = 0,     -- каждая автопроверка напоминает, пока не обновились
     autoCheck       = true,  -- совместимость со старым UI
+    channel_url     = "https://t.me/helper_stats",
+    channel_short   = "t.me/helper_stats",
 }
 
 pcs_ver.state = {
@@ -430,7 +435,9 @@ function pcs_ver.setProg(p, status)
     p = tonumber(p) or 0
     if p < 0 then p = 0 elseif p > 100 then p = 100 end
     pcs_ver.state.dlProg = p
-    pcs_ver.state.dlProgShow = p
+    -- dlProgShow плавно догоняет dlProg в UI (см. карточку "Обновления");
+    -- при сбросе в 0 полоса прячется сразу
+    if p == 0 then pcs_ver.state.dlProgShow = 0 end
     if status then pcs_ver.state.dlStatus = status end
 end
 
@@ -676,6 +683,8 @@ function pcs_ver.check(silent)
                 if needNotify then
                     local msg = "\xc4\xee\xf1\xf2\xf3\xef\xed\xee\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20\x76" .. tostring(manifest.version)
                     if manifest.required then msg = msg .. "\x20\x28\xee\xe1\xff\xe7\xe0\xf2\xe5\xeb\xfc\xed\xee\xe5\x29" end
+                    msg = msg .. "\x21\x20\xd3\xf1\xf2\xe0\xed\xee\xe2\xe8\xf2\xfc\x3a\x20\x2f\x70\x63\x73\x75\x70\x64\x61\x74\x65\x20\x69\x6e\x73\x74\x61\x6c\x6c\x20\x7c\x20\xca\xe0\xed\xe0\xeb\x3a\x20"
+                        .. tostring(pcs_ver.cfg.channel_short)
                     pcs_ver.notify(msg, "{FFD700}")
                     S.last_notify = os.time()
                 end
@@ -940,6 +949,66 @@ function pcs_ver.install()
     end)
 end
 
+-- ── красивая полоса прогресса (сегментированная, с бегущим бликом) ──
+-- dl — draw list ImGui, x/y/w/h — прямоугольник в экранных координатах,
+-- frac — 0..1, now — os.clock() для анимации. Рисует только примитивами,
+-- своего состояния не имеет.
+function pcs_ver.drawBar(dl, x, y, w, h, frac, now)
+    local V2, V4, U32 = imgui.ImVec2, imgui.ImVec4, imgui.ColorConvertFloat4ToU32
+    local function col(r, g, b, a) return U32(V4(r, g, b, a or 1.0)) end
+    frac = math.max(0, math.min(1, tonumber(frac) or 0))
+    now = tonumber(now) or 0
+    local done = frac >= 0.995
+
+    -- контейнер (тёмная "дорожка" с тонкой рамкой)
+    local outer = h * 0.38
+    dl:AddRectFilled(V2(x, y), V2(x + w, y + h), col(0.05, 0.06, 0.09, 1.0), outer)
+    dl:AddRect(V2(x, y), V2(x + w, y + h), col(1, 1, 1, 0.10), outer, 0, 1.0)
+
+    local pad = math.max(2, h * 0.20)
+    local ix, iy = x + pad, y + pad
+    local iw, ih = w - pad * 2, h - pad * 2
+    local n = math.max(12, math.min(48, math.floor(iw / math.max(6, ih * 0.85))))
+    local gap = math.max(1.5, ih * 0.20)
+    local sw = (iw - gap * (n - 1)) / n
+    local rnd = math.min(3, sw * 0.35)
+
+    -- бегущий блик: движется слева направо, за краем полосы делает паузу
+    local pos = ((now * 0.9) % 1.7) * (n + 4) - 4
+    local pulse = 0.5 + 0.5 * math.sin(now * 4)
+
+    for i = 0, n - 1 do
+        local sx = ix + i * (sw + gap)
+        local f = math.max(0, math.min(1, frac * n - i))
+        -- пустая ячейка
+        dl:AddRectFilled(V2(sx, iy), V2(sx + sw, iy + ih), col(0.13, 0.15, 0.21, 1.0), rnd)
+        if f > 0 then
+            local t = (n > 1) and (i / (n - 1)) or 0
+            -- градиент: синий -> зелёный по длине полосы
+            local r = 0.16 + (0.24 - 0.16) * t
+            local g = 0.55 + (0.92 - 0.55) * t
+            local b = 0.98 + (0.58 - 0.98) * t
+            if done then
+                -- на 100% вся полоса мягко пульсирует золотом
+                local m = 0.55 + 0.25 * pulse
+                r = r + (1.00 - r) * m
+                g = g + (0.80 - g) * m
+                b = b + (0.25 - b) * m
+            else
+                local d = i - pos
+                if d >= 0 and d < 4 then
+                    local boost = 0.35 * (1 - d / 4)
+                    r, g, b = math.min(1, r + boost), math.min(1, g + boost), math.min(1, b + boost)
+                end
+            end
+            local fx = sx + sw * f
+            dl:AddRectFilled(V2(sx, iy), V2(fx, iy + ih), col(r, g, b, 1.0), rnd)
+            -- глянец на верхней половине ячейки
+            dl:AddRectFilled(V2(sx, iy), V2(fx, iy + ih * 0.45), col(1, 1, 1, 0.20), rnd)
+        end
+    end
+end
+
 -- Совместимость с UI / командами чата
 PCS_UPDATE = {
     cfg   = pcs_ver.cfg,
@@ -949,6 +1018,7 @@ PCS_UPDATE = {
     cleanupHttpTmp = pcs_ver.cleanup,
     cleanup = pcs_ver.cleanup,
     notify = pcs_ver.notify,
+    drawBar = pcs_ver.drawBar,
 }
 
 function pcsCheckForUpdate(silent) pcs_ver.check(silent) end
@@ -7688,9 +7758,14 @@ function drawAboutInner(h)
         -- и перезаписывает им сам скрипт (PCS_UPDATE.install(), см.
         -- секцию "САМООБНОВЛЕНИЕ" в самом начале файла) ──
         secTitle(u8"\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff")
-        aboutCard("##updcard", 130, function(aw, ch)
+        do
+        local U0 = PCS_UPDATE
+        local showProg0 = U0 and (U0.state.installing or (tonumber(U0.state.dlProg) or 0) > 0)
+        aboutCard("##updcard", showProg0 and 202 or 132, function(aw, ch)
             imgui.SetWindowFontScale(aboutBaseScale)
             local U = PCS_UPDATE
+            local chUrl   = (U and U.cfg and U.cfg.channel_url)   or "https://t.me/helper_stats"
+            local chShort = (U and U.cfg and U.cfg.channel_short) or "t.me/helper_stats"
 
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(12)))
             imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xd2\xe5\xea\xf3\xf9\xe0\xff\x20\xe2\xe5\xf0\xf1\xe8\xff\x3a")
@@ -7708,7 +7783,7 @@ function drawAboutInner(h)
                 if U.state.available then
                     imgui.TextColored(thGold(), "v" .. U.state.ver_remote .. u8"\x20\x28\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x21\x29")
                 else
-                    imgui.TextColored(iv4(0.40,1.00,0.50,1.0), "v" .. U.state.ver_remote .. u8" \x28\xf3\x20\xe2\xe0\xf1\x20\xef\xee\xf1\xeb\xe5\xe4\xed\xff\xff\x29")
+                    imgui.TextColored(iv4(0.40,1.00,0.50,1.0), "v" .. U.state.ver_remote .. u8"\x20\x28\xf3\x20\xe2\xe0\xf1\x20\xef\xee\xf1\xeb\xe5\xe4\xed\xff\xff\x29")
                 end
             elseif U and U.state.last_error then
                 imgui.TextColored(iv4(1.0,0.45,0.45,1.0), u8"\xee\xf8\xe8\xe1\xea\xe0\x20\xef\xf0\xee\xe2\xe5\xf0\xea\xe8")
@@ -7716,16 +7791,17 @@ function drawAboutInner(h)
                 imgui.TextColored(iv4(0.6,0.6,0.6,1.0), u8"\xed\xe5\xe8\xe7\xe2\xe5\xf1\xf2\xed\xee")
             end
 
-            local btnW, btnH = SFtext(150), SFtext(24)
+            -- ── кнопки: Проверить / Обновить до vX / Канал ──
+            local btnH = SFtext(24)
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(58)))
             imgui.PushStyleColor(imgui.Col.Button,        iv4(0.18, 0.42, 0.72, 1.0))
             imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.25, 0.55, 0.90, 1.0))
             imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.12, 0.32, 0.58, 1.0))
             do local _pbu = prettyBtnPush(6.0)
             local checkLabel = (U and U.state.checking)
-                and (u8"\xcf\xf0\xee\xe2\xe5\xf0\xe8\xf2\xfc...##updcheck")
-                or  (u8"\xcf\xf0\xee\xe2\xe5\xf0\xe8\xf2\xfc##updcheck")
-            if imgui.Button(checkLabel, imgui.ImVec2(btnW, btnH)) then
+                and (u8"\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0\x2e\x2e\x2e\x23\x23\x75\x70\x64\x63\x68\x65\x63\x6b")
+                or  (u8"\xcf\xf0\xee\xe2\xe5\xf0\xe8\xf2\xfc\x23\x23\x75\x70\x64\x63\x68\x65\x63\x6b")
+            if imgui.Button(checkLabel, imgui.ImVec2(SFtext(130), btnH)) then
                 if U and not U.state.checking and not U.state.installing then
                     U.check(false)
                 end
@@ -7741,46 +7817,94 @@ function drawAboutInner(h)
                 do local _pbi = prettyBtnPush(6.0)
                 local instLabel = U.state.installing
                     and (u8"\xd3\xf1\xf2\xe0\xed\xe0\xe2\xeb\xe8\xe2\xe0\xfe\x2e\x2e\x2e" .. "##updinstall")
-                    or  (u8"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc\x20\xe4\xee\x20v" .. (U.state.ver_remote or "?") .. "##updinstall")
-                if imgui.Button(instLabel, imgui.ImVec2(btnW, btnH)) then
+                    or  (u8"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc\x20\xe4\xee\x20\x76" .. (U.state.ver_remote or "?") .. "##updinstall")
+                if imgui.Button(instLabel, imgui.ImVec2(SFtext(160), btnH)) then
                     if not U.state.installing then U.install() end
                 end
                 prettyBtnPop(_pbi) end
                 imgui.PopStyleColor(3)
             end
 
-            
-            -- прогресс скачивания 0..100% (плавная яркая полоска)
-            if U and (U.state.installing or (U.state.dlProg and U.state.dlProg > 0)) then
+            imgui.SameLine(0, SFtext(10))
+            imgui.PushStyleColor(imgui.Col.Button,        iv4(0.09,0.42,0.68,1.0))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.13,0.58,0.90,1.0))
+            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.18,0.72,1.00,1.0))
+            do local _pbch = prettyBtnPush(6.0)
+            if imgui.Button(u8"\xca\xe0\xed\xe0\xeb\x23\x23\x75\x70\x64\x63\x68\x61\x6e\x6e\x65\x6c", imgui.ImVec2(SFtext(96), btnH)) then
+                -- ссылку открываем без консоли (WinAPI), запасной вариант —
+                -- os.execute('start ...'); ссылка ещё и копируется в буфер
+                local opened = winOpenUrl(chUrl)
+                if not opened then
+                    pcall(function()
+                        opened = os.execute('start "" "' .. chUrl .. '"') ~= nil
+                    end)
+                end
+                pcall(function()
+                    if imgui.SetClipboardText then imgui.SetClipboardText(chUrl) end
+                end)
+                if opened then
+                    pcall(sampAddChatMessage, "{00FF88}[PC Stats] " .. "\xee\xf2\xea\xf0\xfb\xe2\xe0\xfe\x20\xea\xe0\xed\xe0\xeb\x3a\x20" .. chShort, -1)
+                else
+                    pcall(sampAddChatMessage, "{00CCFF}[PC Stats] " .. "\xea\xe0\xed\xe0\xeb\x3a\x20" .. chShort .. "\x20\x28\xf1\xea\xee\xef\xe8\xf0\xee\xe2\xe0\xed\xee\x29", -1)
+                end
+            end
+            prettyBtnPop(_pbch) end
+            imgui.PopStyleColor(3)
+
+            -- ── строка про канал (при обновлении — заметная, золотая) ──
+            imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(92)))
+            imgui.PushTextWrapPos(aw - SFtext(16))
+            if U and U.state.available then
+                imgui.TextColored(thGold(), u8"\xc4\xee\xf1\xf2\xf3\xef\xed\xee\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x21\x20\xcf\xee\xe4\xf0\xee\xe1\xed\xee\xf1\xf2\xe8\x20\xe8\x20\xed\xee\xe2\xee\xf1\xf2\xe8\x20\x2d\x20\xe2\x20\xea\xe0\xed\xe0\xeb\xe5\x3a\x20" .. chShort)
+            else
+                imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xcd\xee\xe2\xee\xf1\xf2\xe8\x20\xe8\x20\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff\x20\xf1\xea\xf0\xe8\xef\xf2\xe0\x3a\x20")
+                imgui.SameLine(0, 4)
+                imgui.TextColored(thAccBright(), chShort)
+            end
+            imgui.PopTextWrapPos()
+
+            -- ── красивый прогресс скачивания: заголовок, крупный процент,
+            -- сегментированная полоса с бегущим бликом и строка статуса ──
+            if U and (U.state.installing or (tonumber(U.state.dlProg) or 0) > 0) then
                 local target = tonumber(U.state.dlProg) or 0
                 if target < 0 then target = 0 end
                 if target > 100 then target = 100 end
-                U.state.dlProgShow = tonumber(U.state.dlProgShow) or 0
-                if U.state.dlProgShow < target then
-                    U.state.dlProgShow = U.state.dlProgShow + math.max(0.6, (target - U.state.dlProgShow) * 0.18)
-                    if U.state.dlProgShow > target then U.state.dlProgShow = target end
+                local shown = tonumber(U.state.dlProgShow) or 0
+                if shown < target then
+                    shown = math.min(target, shown + math.max(0.35, (target - shown) * 0.12))
                 else
-                    U.state.dlProgShow = target
+                    shown = target
                 end
-                local p = U.state.dlProgShow
-                local frac = p / 100
-                -- зелёный → золотой к 100%
-                local r = 0.12 + 0.55 * frac
-                local g = 0.70 + 0.20 * (1 - math.abs(frac - 0.5) * 2)
-                local b = 0.25 + 0.05 * frac
-                imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(86)))
-                imgui.PushStyleColor(imgui.Col.PlotHistogram, iv4(r, g, b, 1.0))
-                imgui.PushStyleColor(imgui.Col.FrameBg, iv4(0.10, 0.12, 0.16, 1.0))
-                imgui.PushStyleColor(imgui.Col.FrameBgHovered, iv4(0.10, 0.12, 0.16, 1.0))
-                -- PushStyleVar removed
-                imgui.ProgressBar(frac, imgui.ImVec2(aw - SFtext(32), SFtext(26)),
-                    string.format("%d%%", math.floor(p + 0.5)))
-                -- PopStyleVar removed
-                imgui.PopStyleColor(3)
+                U.state.dlProgShow = shown
+
+                local x0 = SFtext(16)
+                imgui.SetCursorPos(imgui.ImVec2(x0, SFtext(124)))
+                imgui.TextColored(iv4(1,1,1,1), u8"\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5\x20\xe4\xee\x20\x76" .. tostring(U.state.ver_remote or "?"))
+
+                local pctStr = string.format("%d%%", math.floor(shown + 0.5))
+                imgui.SetWindowFontScale(aboutBaseScale * 1.3)
+                local pw = imgui.CalcTextSize(pctStr).x
+                imgui.SetCursorPos(imgui.ImVec2(aw - SFtext(16) - pw, SFtext(120)))
+                imgui.TextColored(shown >= 99.5 and thGold() or thAccBright(), pctStr)
+                imgui.SetWindowFontScale(aboutBaseScale)
+
+                imgui.SetCursorPos(imgui.ImVec2(x0, SFtext(150)))
+                local cpos = imgui.GetCursorScreenPos()
+                local barW, barH = aw - SFtext(32), SFtext(18)
+                imgui.Dummy(imgui.ImVec2(barW, barH))
+                if U.drawBar then
+                    U.drawBar(imgui.GetWindowDrawList(), cpos.x, cpos.y, barW, barH, shown / 100, os.clock())
+                end
+
+                imgui.SetCursorPos(imgui.ImVec2(x0, SFtext(176)))
+                local spin = ({ "|", "/", "-", "\\" })[math.floor(os.clock() * 8) % 4 + 1]
+                imgui.TextColored(iv4(0.55,0.62,0.80,1.0),
+                    (shown >= 99.5 and "" or (spin .. " ")) .. tostring(U.state.dlStatus or ""))
             end
 
-imgui.SetWindowFontScale(aboutBaseScale)
+            imgui.SetWindowFontScale(aboutBaseScale)
         end)
+        end
 
 
         -- Карточка описания скрипта
@@ -9960,9 +10084,22 @@ function main()
     -- автопроверка: раз в 15 мин, уведомление не чаще раза в час (см. pcs_ver.check)
     if (cfg.autoCheckUpdates ~= false) and (not PCS_UPDATE.cfg or PCS_UPDATE.cfg.autoCheck ~= false) then
         lua_thread.create(function()
-            wait(5000)
+            -- ждём, пока игрок реально зайдёт на сервер (чат SA-MP готов) —
+            -- иначе первое сообщение об обновлении потерялось бы при загрузке
+            -- игры; если за 3 минуты спавна нет, всё равно продолжаем
+            for _i = 1, 180 do
+                local okS, spawned = pcall(function()
+                    return sampIsLocalPlayerSpawned and sampIsLocalPlayerSpawned()
+                end)
+                if okS and spawned then break end
+                wait(1000)
+            end
+            wait(3000)
+            -- первая проверка при входе; дальше — каждые 5 минут. Пока
+            -- версия старая, КАЖДАЯ проверка повторяет сообщение в чате;
+            -- после обновления версия совпадает с manifest.json — тишина
             pcall(pcsCheckForUpdate, true)
-            local sec = tonumber(PCS_UPDATE_AUTO_SECONDS) or 900
+            local sec = tonumber(PCS_UPDATE_AUTO_SECONDS) or 300
             if sec < 300 then sec = 300 end
             if sec > 3600 then sec = 3600 end
             while true do
