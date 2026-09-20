@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.8"
+local SCRIPT_VER = "1.8.7"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -1542,6 +1542,30 @@ function AIS.CheckAllPet()
     local st = AIS.st
     if st.scanBusy then AIS.msg("\xd1\xea\xe0\xed\xe8\xf0\xee\xe2\xe0\xed\xe8\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 \xf3\xe6\xe5 \xe8\xe4\xb8\xf2, \xef\xee\xe4\xee\xe6\xe4\xe8\xf2\xe5...") return end
     if not sampIsLocalPlayerSpawned() then AIS.msg("\xd1\xed\xe0\xf7\xe0\xeb\xe0 \xe7\xe0\xe9\xe4\xe8\xf2\xe5 \xed\xe0 \xf1\xe5\xf0\xe2\xe5\xf0.") return end
+    -- ФИКС (по просьбе, "обновить список только открывает инвентарь и
+    -- дальше ничего не делает"): причина — залипшие с прошлого раза
+    -- флаги st.checkinv/st.checksecurityinv. Если предыдущий вызов
+    -- (спавн/снятие/кормление охранника, либо сам этот же скан) не
+    -- завершился штатно, эти флаги могли остаться true. Тогда цикл ниже
+    -- видел "st.checkinv уже true" и решал, что /invent отправлять не
+    -- надо — инвентарь визуально открывался (обработчиком пакета 220 у
+    -- сервера), а сам скрипт заново его не запрашивал и ответа не ждал.
+    -- Поэтому здесь состояние ВСЕГДА принудительно сбрасывается перед
+    -- стартом нового скана, а не только читается.
+    st.checkinv         = false
+    st.checksecurityinv = false
+    if not AIS.on() then
+        -- AIS.s ещё не загружен (AIS.init() почему-то не успел
+        -- выполниться) — без этого обработчик входящих пакетов 220
+        -- тут же выходит (см. AIS.onReceivePacket -> AIS.on()), и любой
+        -- ответ сервера молча игнорируется, отчего и кажется, что
+        -- "инвентарь открылся и дальше ничего не происходит"
+        AIS.load()
+        if not AIS.on() then
+            AIS.msg("{ff6666}\xcd\xe5 \xe3\xee\xf2\xee\xe2\xee: \xec\xee\xe4\xf3\xeb\xfc \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 \xed\xe5 \xe8\xed\xe8\xf6\xe8\xe0\xeb\xe8\xe7\xe8\xf0\xee\xe2\xe0\xed. \xcf\xee\xef\xf0\xee\xe1\xf3\xe9\xf2\xe5 \xf1\xed\xee\xe2\xe0.")
+            return
+        end
+    end
 
     st.scanBusy = true
     st.checkAllPet = true
@@ -1570,6 +1594,14 @@ function AIS.CheckAllPet()
     st.scanBusy = false
     if not got and st.checkAllPet then
         st.checkAllPet = false
+        -- ФИКС: раньше при таймауте открытый на клиенте инвентарь мог
+        -- остаться висеть на экране (сервер уже прислал "инвентарь
+        -- открыт", но не прислал данные по охранникам) — теперь на любом
+        -- таймауте гарантированно закрываем окно и сбрасываем флаги,
+        -- чтобы следующая попытка стартовала с чистого состояния, а не
+        -- снова считала инвентарь "уже открытым"
+        pcall(AIS.sendCEF, "inventoryClose")
+        st.checkinv = false
         AIS.msg("{ff6666}\xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xef\xee\xeb\xf3\xf7\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2{ffffff}: \xf1\xe5\xf0\xe2\xe5\xf0 \xed\xe5 \xef\xf0\xe8\xf1\xeb\xe0\xeb \xe4\xe0\xed\xed\xfb\xe5. "
             .. "\xc7\xe0\xea\xf0\xee\xe9\xf2\xe5 \xee\xf2\xea\xf0\xfb\xf2\xfb\xe5 \xee\xea\xed\xe0 \xe8 \xe4\xe8\xe0\xeb\xee\xe3\xe8 \xe8 \xed\xe0\xe6\xec\xe8\xf2\xe5 \xab\xce\xe1\xed\xee\xe2\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea\xbb \xe5\xf9\xb8 \xf0\xe0\xe7.")
     end
@@ -2860,8 +2892,19 @@ local cfg = {
     taxAutoIntervalHours  = 1,     -- через сколько часов повторять автооплату
     taxLastPayTime        = 0,     -- os.time() последней успешной оплаты (своей)
     taxLastPayAmount      = 0.0,   -- сумма последней оплаты (если удалось распознать из чата)
+    -- ФИКС (по просьбе): вкладка "Налоги" не показывала, сколько денег в
+    -- сумме ушло на оплату налогов — только последнюю оплату и итог за
+    -- выбранный день в логе. taxTotalPaid — накопительный счётчик за всё
+    -- время (переживает перезапуск скрипта), растёт в onTaxPaymentSuccess
+    -- на каждую реальную (не "нет налогов") успешную оплату.
+    taxTotalPaid          = 0.0,   -- сколько всего потрачено на налоги за всё время
     taxPayOnLogin         = false, -- при входе в игру подождать 1-2 минуты и автоматически оплатить налоги
     autoCheckUpdates      = true,  -- автопроверка обновлений с GitHub
+    -- ФИКС/добавлено (по просьбе): если true — сообщения о проверке
+    -- версии / доступной новой версии / завершении обновления НЕ
+    -- пишутся в обычный чат SA-MP, а показываются только всплывающим
+    -- уведомлением (тостом) поверх игры
+    updateToastOnly        = false,
 }
 
 -- kastomnye cveta konkretnyh tekstovyh elementov (klikom po tekstu/cifram),
@@ -3044,8 +3087,10 @@ local function applyCfgData(m)
     cfg.taxAutoIntervalHours  = clampNum(m.taxAutoIntervalHours, 1, 120, 1)
     cfg.taxLastPayTime        = clampNum(m.taxLastPayTime, 0, 99999999999, 0)
     cfg.taxLastPayAmount      = clampNum(m.taxLastPayAmount, 0, 1e15, 0.0)
+    cfg.taxTotalPaid          = clampNum(m.taxTotalPaid, 0, 1e18, 0.0)
     cfg.taxPayOnLogin         = toBool(m.taxPayOnLogin, false)
     cfg.autoCheckUpdates      = toBool(m.autoCheckUpdates, true)
+    cfg.updateToastOnly       = toBool(m.updateToastOnly, false)
 
     -- ── учёт дохода PayDay (зарплата/депозит/аксы/AZ из чата) ──
     cfg.incomeTrackEnabled = toBool(m.incomeTrackEnabled, true)
@@ -3150,8 +3195,10 @@ local function saveCfg()
             taxAutoIntervalHours  = tostring(cfg.taxAutoIntervalHours),
             taxLastPayTime        = tostring(cfg.taxLastPayTime),
             taxLastPayAmount      = tostring(cfg.taxLastPayAmount),
+            taxTotalPaid          = tostring(cfg.taxTotalPaid),
             taxPayOnLogin         = tostring(cfg.taxPayOnLogin),
             autoCheckUpdates      = tostring(cfg.autoCheckUpdates ~= false),
+            updateToastOnly       = tostring(cfg.updateToastOnly == true),
             incomeTrackEnabled = tostring(cfg.incomeTrackEnabled),
             incomeAllTimeMoney = tostring(cfg.incomeAllTimeMoney),
             incomeAllTimeAZ    = tostring(cfg.incomeAllTimeAZ),
@@ -3884,6 +3931,46 @@ do
     end
 
     PCS_Notify = PcsNotifyManager
+end
+
+-- ============================================================
+--  ФИКС/ДОБАВЛЕНО (по просьбе): сообщения о проверке версии, о
+--  доступной новой версии и об окончании установки обновления
+--  (pcs_ver.notify — вызывается из pcs_ver.check()/pcs_ver.install()
+--  в самом начале файла) теперь получают стикер и всплывающее
+--  уведомление точно так же, как и любое другое сообщение скрипта.
+-- ------------------------------------------------------------
+-- Раньше pcs_ver.notify() нарочно вызывал "сырую" PCS_ORIG_CHAT в обход
+-- общей обёртки sampAddChatMessage (см. эту обёртку в начале файла) —
+-- именно та обёртка добавляет стикер (PCS_addChatEmoji) и дублирует
+-- сообщение всплывающим тостом (pcs_notify). В обход обёртки — ни
+-- стикера, ни тоста, отсюда и жалоба "не появляются всплывающие
+-- уведомления" именно для сообщений об обновлении.
+-- Переопределяем pcs_ver.notify здесь (а не в месте первого объявления),
+-- потому что здесь уже видны cfg, pcs_notify, u8 и stripUtf8Symbols —
+-- при первом объявлении (в самом начале файла) cfg как раз ещё не
+-- существует.
+-- Плюс добавлен флаг cfg.updateToastOnly (тумблер в разделе
+-- "Уведомления" → drawNotificationsSection): если включён, сообщения об
+-- обновлении вообще не пишутся в обычный чат SA-MP — только всплывающим
+-- уведомлением поверх игры (тосты не перехватывают мышь/клавиатуру и не
+-- открывают никакого модального окна — см. pcs_toast_flags выше).
+function pcs_ver.notify(text, color)
+    local plain = tostring(text or "")
+    if cfg.updateToastOnly == true then
+        pcall(function()
+            local ntype = (color == "{FF6666}" and "error")
+                or (color == "{FFD700}" and "warning")
+                or (color == "{00FF88}" and "success")
+                or "info"
+            pcs_notify(u8(stripUtf8Symbols(plain)), ntype)
+        end)
+        return
+    end
+    local msg = (color or "{66CCFF}") .. "[PC Stats] " .. plain
+    -- вызываем ИМЕННО текущий глобальный sampAddChatMessage (обёрнутую
+    -- версию) — намеренно не PCS_ORIG_CHAT, чтобы сработали и стикер, и тост
+    pcall(sampAddChatMessage, msg, -1)
 end
 
 -- ============================================================
@@ -5859,7 +5946,13 @@ local function onTaxPaymentSuccess(isAuto, amount)
     if _taxFinalizeDone then return end
     _taxFinalizeDone = true
     cfg.taxLastPayTime   = os.time()
-    if amount and amount > 0 then cfg.taxLastPayAmount = amount end
+    if amount and amount > 0 then
+        cfg.taxLastPayAmount = amount
+        -- ФИКС (по просьбе): копим общую сумму, потраченную на налоги за
+        -- всё время — раньше нигде не считалось, вкладка "Налоги" не
+        -- могла показать, сколько денег в итоге ушло на оплату
+        cfg.taxTotalPaid = (tonumber(cfg.taxTotalPaid) or 0) + amount
+    end
     saveCfg()
     -- ── по просьбе: красивее оформленное сообщение об оплате в чат — рамка
     -- из символов + сумма отдельной строкой золотым цветом + способ оплаты ──
@@ -8581,6 +8674,18 @@ function drawNotificationsSection()
         imgui.SameLine(0, S(8))
         imgui.TextColored(iv4(1,1,1,1), u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5\x20\xe7\xe0\x20\x35\x20\xec\xe8\xed\xf3\xf2\x20\xe4\xee\x20PayDay")
     end
+    imgui.Spacing()
+    do
+        -- ФИКС/ДОБАВЛЕНО (по просьбе): флаг "не показывать сообщения об
+        -- обновлении скрипта в обычном чате — только всплывающим
+        -- уведомлением поверх игры" (см. pcs_ver.notify выше по файлу)
+        local isOn = cfg.updateToastOnly == true
+        if drawToggleSwitch("##updateToastOnlyToggle", isOn) then
+            cfg.updateToastOnly = not isOn; saveCfg()
+        end
+        imgui.SameLine(0, S(8))
+        imgui.TextColored(iv4(1,1,1,1), u8"\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff\x20\xf1\xea\xf0\xe8\xef\xf2\xe0\x20\x97\x20\xf2\xee\xeb\xfc\xea\xee\x20\xe2\xf1\xef\xeb\xfb\xe2\xe0\xfe\xf9\xe8\xec\x20\xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xe5\xec\x20\x28\xe1\xe5\xe7\x20\xf7\xe0\xf2\xe0\x29")
+    end
 
     -- ФИКС (по просьбе): тумблер "Обновление курса валют" убран совсем.
     -- ФИКС (по просьбе): тумблер "Автообновлять курс по таймеру" и слайдер
@@ -9388,7 +9493,14 @@ secTitle(u8"\xca\xee\xec\xe0\xed\xe4\xfb")
         -- панель настроек) и переоформлено в общем стиле вкладки "О
         -- скрипте" (карточка вместо голых полей) ──
         secTitle(u8"\xd3\xef\xf0\xe0\xe2\xeb\xe5\xed\xe8\xe5\x20\xec\xe5\xed\xfe")
-        aboutCard("##menucmdcard", 108, function(aw, ch)
+        -- ФИКС (по просьбе): блок "Горячая клавиша" убран из вкладки
+        -- "О скрипте" целиком (кнопки "Назначить"/"Сброс" и строка
+        -- "Текущая: ...") — осталась только команда открытия меню.
+        -- Сама функциональность горячей клавиши (cfg.menuHotkeyVK,
+        -- St.awaitingHotkeyBind, обработка в onKeyDown) не тронута —
+        -- если клавиша уже была назначена раньше, она продолжит
+        -- работать, просто без UI для неё в этой карточке.
+        aboutCard("##menucmdcard", 64, function(aw, ch)
             imgui.SetWindowFontScale(aboutBaseScale)
             local applyW = SFtext(96)
             imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(12)))
@@ -9422,47 +9534,6 @@ secTitle(u8"\xca\xee\xec\xe0\xed\xe4\xfb")
             end
             prettyBtnPop(_pbmc) end
             imgui.PopStyleColor(3)
-
-            imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(58)))
-            imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xc3\xee\xf0\xff\xf7\xe0\xff\x20\xea\xeb\xe0\xe2\xe8\xf8\xe0:")
-
-            imgui.SetCursorPos(imgui.ImVec2(SFtext(16), SFtext(76)))
-            local hkBtnW = SFtext(120)
-            imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.30,g*0.30,b*0.30,1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.48,g*0.48,b*0.48,1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r*0.65,g*0.65,b*0.65,1.0))
-            do local _pbhk = prettyBtnPush(6.0)
-            local hkLabel = St.awaitingHotkeyBind
-                and u8"\xcd\xe0\xe6\xec\xe8\xf2\xe5\x20\xea\xeb\xe0\xe2\xe8\xf8\xf3\x2e\x2e\x2e##hkAssign"
-                or  u8"\xcd\xe0\xe7\xed\xe0\xf7\xe8\xf2\xfc##hkAssign"
-            if imgui.Button(hkLabel, imgui.ImVec2(hkBtnW, SFtext(22))) then
-                St.awaitingHotkeyBind = true
-            end
-            prettyBtnPop(_pbhk) end
-            imgui.PopStyleColor(3)
-
-            if cfg.menuHotkeyVK and cfg.menuHotkeyVK > 0 then
-                imgui.SameLine(0, SFtext(8))
-                imgui.PushStyleColor(imgui.Col.Button,        iv4(0.35,0.14,0.14,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.55,0.20,0.20,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.70,0.26,0.26,1.0))
-                do local _pbhkr = prettyBtnPush(6.0)
-                if imgui.Button(u8"\xd1\xe1\xf0\xee\xf1##hkReset", imgui.ImVec2(SFtext(70), SFtext(22))) then
-                    cfg.menuHotkeyVK = 0
-                    St.awaitingHotkeyBind = false
-                    saveCfg()
-                    pcall(sampAddChatMessage, "{00FF88}[PC Stats] \xc3\xee\xf0\xff\xf7\xe0\xff\x20\xea\xeb\xe0\xe2\xe8\xf8\xe0\x20\xf1\xe1\xf0\xee\xf8\xe5\xed\xe0", -1)
-                end
-                prettyBtnPop(_pbhkr) end
-                imgui.PopStyleColor(3)
-            end
-
-            imgui.SameLine(0, SFtext(10))
-            if St.awaitingHotkeyBind then
-                imgui.TextColored(thGold(), u8"\xcd\xe0\xe6\xec\xe8\xf2\xe5\x20\xeb\xfe\xe1\xf3\xfe\x20\xea\xeb\xe0\xe2\xe8\xf8\xf3\x2e\x2e\x2e\x20\x28Esc\x20\xe4\xeb\xff\x20\xee\xf2\xec\xe5\xed\xfb\x29")
-            else
-                imgui.TextColored(iv4(0.50,0.54,0.62,1.0), u8"\xd2\xe5\xea\xf3\xf9\xe0\xff\x3a\x20" .. vkName(cfg.menuHotkeyVK))
-            end
             imgui.SetWindowFontScale(aboutBaseScale)
         end)
 
@@ -9861,7 +9932,12 @@ function drawTaxesInner(h)
         local p_sp  = imgui.GetCursorScreenPos()
         local aw_sp = imgui.GetContentRegionAvail().x
         local hasAmt = cfg.taxLastPayAmount and cfg.taxLastPayAmount > 0
-        local cardH_sp = hasAmt and S(64) or S(44)
+        -- ФИКС (по просьбе): вкладка "Налоги" не показывала, сколько денег
+        -- всего ушло на оплату налогов — добавлена строка "Всего
+        -- потрачено" на основе накопительного cfg.taxTotalPaid (см.
+        -- onTaxPaymentSuccess, где он и растёт)
+        local hasTotal = cfg.taxTotalPaid and cfg.taxTotalPaid > 0
+        local cardH_sp = (hasAmt and S(64) or S(44)) + (hasTotal and S(20) or 0)
         dl_sp:AddRectFilled(p_sp, imgui.ImVec2(p_sp.x+aw_sp, p_sp.y+cardH_sp),
             imgui.ColorConvertFloat4ToU32(iv4(r*0.08,g*0.08,b*0.08,0.85)), 10)
         dl_sp:AddRect(p_sp, imgui.ImVec2(p_sp.x+aw_sp, p_sp.y+cardH_sp),
@@ -9873,6 +9949,13 @@ function drawTaxesInner(h)
         if hasAmt then
             imgui.SetCursorScreenPos(imgui.ImVec2(p_sp.x + S(12), p_sp.y + S(46)))
             imgui.TextColored(thGold(), fmtMoney(string.format("%.0f", cfg.taxLastPayAmount)))
+        end
+        if hasTotal then
+            local totalY = hasAmt and S(66) or S(46)
+            imgui.SetCursorScreenPos(imgui.ImVec2(p_sp.x + S(12), p_sp.y + totalY))
+            imgui.TextColored(iv4(0.55,0.62,0.80,1.0), u8"\xc2\xf1\xe5\xe3\xee\x20\xef\xee\xf2\xf0\xe0\xf7\xe5\xed\xee\x20\xed\xe0\x20\xed\xe0\xeb\xee\xe3\xe8\x3a" .. "  ")
+            imgui.SameLine(0, 0)
+            imgui.TextColored(thGold(), fmtMoney(string.format("%.0f", cfg.taxTotalPaid)))
         end
         imgui.SetCursorScreenPos(imgui.ImVec2(p_sp.x, p_sp.y + cardH_sp + S(8)))
     end
@@ -11090,6 +11173,7 @@ local _okSC, _errSC = pcall(function()
                         cfg.notifyWelcomeEnabled = true
                         cfg.notifyPaydayReminderEnabled = true
                         cfg.notifyCryptoUpdateEnabled = true
+                        cfg.updateToastOnly = false
                         cfg.toastPosH = "right"; cfg.toastPosV = "bottom"
                         cfg.toastWidth = 320; cfg.toastCornerRadius = 8
                         cfg.toastDuration = 6.0; cfg.toastAnimSpeed = 10.0
