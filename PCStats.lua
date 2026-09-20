@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.3"
+local SCRIPT_VER = "1.8.6"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -1130,15 +1130,19 @@ AIS.st = {
     eatpet1 = false, eatpet2 = false,
     checkinv = false,
     checksecurityinv = false,
+    checkAllPet = false,
     AddVerifi = false,
     SpawnProcessing = false,
     freezeUntil = 0,
     lastInvJson = "",
-    pets = {},          -- id -> { name, hungry, ... }
-    food = {},          -- { {slot=, amount=, type=}, ... }
+    pets = {},
+    securityList = {},
+    food = {},
     enabled = true,
     autoSpawn = false,
     autoEat = false,
+    reducedCooldown = false,
+    sotg = false, -- spawn of two guards
     reducedAudio = false,
 }
 
@@ -1332,53 +1336,46 @@ end
 -- ── дії з охоронцями ────────────────────────────────────────
 function AIS.SpawnPet(n)
     n = tonumber(n) or 1
+    if n ~= 1 and n ~= 2 then return end
     if AIS.st.SpawnProcessing then return end
     AIS.st.SpawnProcessing = true
-    if n == 1 then AIS.st.sppet1 = true else AIS.st.sppet2 = true end
+    AIS.st.sppet1 = (n == 1)
+    AIS.st.sppet2 = (n == 2)
     lua_thread.create(function()
         local ok, err = pcall(function()
+            -- як у AIS 2.0.6: відкрити інвентар пакет+команда, чекати CEF
             AIS.emul_num({ 220, 0, 27, 64 })
-            wait(400)
-            AIS.sendCEF("requestShowingInventory|28")
-            wait(600)
-            local petId = AIS.petIdByIndex(n) or AIS.firstPetId()
-            if not petId then
-                -- ще раз попросити інвентар і почекати пакет
-                AIS.st.checkinv = true
-                wait(800)
-                petId = AIS.petIdByIndex(n) or AIS.firstPetId()
+            for i = 1, 40 do
+                wait(50)
+                if AIS.st.checkinv then break end
+                wait(750)
+                pcall(sampSendChat, "/invent")
+                wait(50)
+                if AIS.st.checkinv then break end
             end
-            if petId then
-                AIS.sendCEF(string.format('clickOnMenu|{"id": %d}', petId))
-                wait(400)
-            end
-            AIS.sendCEF("inventoryClose")
         end)
-        if n == 1 then AIS.st.sppet1 = false else AIS.st.sppet2 = false end
         AIS.st.SpawnProcessing = false
-        if not ok then
-            print("[AIS] SpawnPet error: " .. tostring(err))
-        end
+        if not ok then print("[AIS] SpawnPet: " .. tostring(err)) end
     end)
 end
 
 function AIS.OffPet(n)
     n = tonumber(n) or 1
-    if n == 1 then AIS.st.offpet1 = true else AIS.st.offpet2 = true end
+    if n ~= 1 and n ~= 2 then return end
+    AIS.st.offpet1 = (n == 1)
+    AIS.st.offpet2 = (n == 2)
     lua_thread.create(function()
         pcall(function()
             AIS.emul_num({ 220, 0, 27, 64 })
-            wait(400)
-            AIS.sendCEF("requestShowingInventory|28")
-            wait(600)
-            local petId = AIS.petIdByIndex(n) or AIS.firstPetId()
-            if petId then
-                AIS.sendCEF(string.format('clickOnMenu|{"id": %d}', petId))
-                wait(400)
+            for i = 1, 40 do
+                wait(50)
+                if AIS.st.checkinv then break end
+                wait(750)
+                pcall(sampSendChat, "/invent")
+                wait(50)
+                if AIS.st.checkinv then break end
             end
-            AIS.sendCEF("inventoryClose")
         end)
-        if n == 1 then AIS.st.offpet1 = false else AIS.st.offpet2 = false end
     end)
 end
 
@@ -1440,16 +1437,16 @@ function AIS.AutoEatpet()
 end
 
 function AIS.CheckAllPet()
+    AIS.st.checkAllPet = true
     AIS.st.checksecurityinv = true
     lua_thread.create(function()
         pcall(function()
-            AIS.sendCEF("requestShowingInventory|28")
+            AIS.emul_num({ 220, 0, 27, 64 })
+            pcall(sampSendChat, "/invent")
             wait(800)
-            AIS.sendCEF("inventoryClose")
-            local n = 0
-            for _ in pairs(AIS.st.pets) do n = n + 1 end
+            local n = #(AIS.st.securityList or {})
             pcall(sampAddChatMessage,
-                string.format("{66CCFF}[AIS] pets=%d food=%d", n, #AIS.st.food), -1)
+                string.format("{66CCFF}[AIS] securities=%d food=%d", n, #(AIS.st.food or {})), -1)
         end)
         AIS.st.checksecurityinv = false
     end)
@@ -1598,20 +1595,86 @@ end
 function AIS.onReceivePacket(id, bs)
     if id ~= 220 then return end
     if not AIS.st.enabled then return end
-    local ok, opcode = pcall(raknetBitStreamReadInt8, bs)
-    if not ok or opcode ~= 17 then return end
-    local ok2, raw = pcall(function()
-        -- після opcode: часто length + string; різні клієнти — різний layout.
-        -- Читаємо залишок як рядок евристично.
-        local len = raknetBitStreamReadInt16(bs)
-        if type(len) == "number" and len > 0 and len < 500000 then
-            return raknetBitStreamReadString(bs, len)
+    local raw = nil
+    pcall(function()
+        -- layout як у AIS 2.0.6: skip 8 bit, opcode 17, skip 32, len, encoded, string
+        if raknetBitStreamIgnoreBits then
+            raknetBitStreamIgnoreBits(bs, 8)
+            local op = raknetBitStreamReadInt8(bs)
+            if op ~= 17 then return end
+            raknetBitStreamIgnoreBits(bs, 32)
+            local length = raknetBitStreamReadInt16(bs)
+            local encoded = raknetBitStreamReadInt8(bs)
+            if encoded ~= 0 and raknetBitStreamDecodeString then
+                raw = raknetBitStreamDecodeString(bs, length + encoded)
+            else
+                raw = raknetBitStreamReadString(bs, length)
+            end
+        else
+            local op = raknetBitStreamReadInt8(bs)
+            if op ~= 17 then return end
+            local length = raknetBitStreamReadInt16(bs)
+            if length and length > 0 and length < 500000 then
+                raw = raknetBitStreamReadString(bs, length)
+            end
         end
-        return nil
     end)
-    if ok2 and type(raw) == "string" and #raw > 20 then
-        AIS.st.checkinv = false
-        pcall(AIS.parseInventoryJson, raw)
+    if type(raw) ~= "string" or #raw < 10 then return end
+    AIS.st.checkinv = true
+    pcall(AIS.parseInventoryJson, raw)
+
+    -- список охранників з "securities":[ ... ]
+    if AIS.st.checkAllPet or (raw:find('"securities"', 1, true)) then
+        local arr = raw:match('"securities"%s*:%s*%[(.-)%]')
+        if arr then
+            AIS.st.securityList = {}
+            for obj in arr:gmatch("%b{}") do
+                local name = obj:match('"name"%s*:%s*"([^"]*)"')
+                local pid = tonumber(obj:match('"id"%s*:%s*(%d+)'))
+                local slot = tonumber(obj:match('"slot"%s*:%s*(%d+)'))
+                local spawned = tonumber(obj:match('"spawned"%s*:%s*(%d+)')) or 0
+                if name and pid then
+                    AIS.st.securityList[#AIS.st.securityList + 1] = {
+                        name = name, id = pid, slot = slot, spawned = spawned
+                    }
+                    AIS.st.pets[pid] = { id = pid, name = name, slot = slot, spawned = spawned }
+                end
+            end
+            AIS.st.checkAllPet = false
+            pcall(AIS.jsonSave)
+        end
+    end
+
+    -- клік по меню при призові/знятті (як у AIS після requestShowingInventory|28)
+    if AIS.st.sppet1 or AIS.st.sppet2 or AIS.st.offpet1 or AIS.st.offpet2 or AIS.st.eatpet1 or AIS.st.eatpet2 then
+        lua_thread.create(function()
+            wait(450)
+            pcall(function()
+                AIS.sendCEF("requestShowingInventory|28")
+                wait(250)
+                local n = (AIS.st.sppet1 or AIS.st.offpet1 or AIS.st.eatpet1) and 1 or 2
+                local petId = nil
+                if AIS.cfg and AIS.cfg["spPet" .. n] then
+                    petId = tonumber(AIS.cfg["spPet" .. n].id)
+                end
+                petId = petId or AIS.petIdByIndex(n) or AIS.firstPetId()
+                if AIS.st.eatpet1 or AIS.st.eatpet2 then
+                    local food = AIS.pickFood()
+                    if food and petId then
+                        AIS.sendCEF(string.format(
+                            'useItemOnSecurity|{"from":{"amount":1,"slot":%d,"type":1},"id":%d}',
+                            food.slot, petId))
+                    end
+                    AIS.st.eatpet1, AIS.st.eatpet2 = false, false
+                elseif petId then
+                    AIS.sendCEF(string.format('clickOnMenu|{"id": %d}', petId))
+                end
+                wait(200)
+                AIS.sendCEF("inventoryClose")
+                AIS.st.sppet1, AIS.st.sppet2 = false, false
+                AIS.st.offpet1, AIS.st.offpet2 = false, false
+            end)
+        end)
     end
 end
 
@@ -2019,13 +2082,6 @@ local ICON_POWER = "\239\128\145" -- fa-power-off       -- "Выключить"
 local ICON_TRASH = "\239\135\184" -- fa-trash           -- "Удалить"
 local ICON_UNDO  = "\239\131\162" -- fa-arrow-rotate-left -- "Сброс данных"
 local ICON_SYNC  = "\239\128\161" -- fa-arrows-rotate   -- "Перезагрузить"
-local ICON_TAX     = ICON_SACK -- вкладка Налоги (пока = sack)
-local ICON_TG_FB   = "â"
-local ICON_DC_FB   = "ð®"
-local ICON_TG      = ICON_TG_FB
-local ICON_DISCORD = ICON_DC_FB
-local ICON_CALENDAR = "ð"
-local ICON_CARD    = "ð³"
 
 -- простой чистый Lua base64-декодер (без внешних зависимостей —
 -- на скрипт с mimgui нельзя рассчитывать, что будет доступна bit32/bit)
@@ -4220,7 +4276,7 @@ local SECTION_DEFS = {
         { tab=2, label = ICON_FIST.." "..u8"\xc1\xee\xe9" },
         { tab=3, label = ICON_SACK.." "..u8"\xd4\xe8\xed\xe0\xed\xf1\xfb" },
       } },
-    { label = ICON_TAX.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8",             icon=ICON_TAX, name=u8"\xcd\xe0\xeb\xee\xe3\xe8",             r=1.0,g=0.65,b=0.15,
+    { label = ICON_SACK.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8",             icon=ICON_SACK, name=u8"\xcd\xe0\xeb\xee\xe3\xe8",             r=1.0,g=0.65,b=0.15,
       tabs = {
         { tab=6, label = u8"\xcd\xe0\xeb\xee\xe3\xe8" },
       } },
@@ -6777,9 +6833,178 @@ end
 
 -- ФИКС (п.7): тот же паттерн — drawTotalInner под pcall, EndChild/
 -- PopStyleColor гарантированы
+
+-- ============================================================
+--  UI: панель "Охранник" (стиль PC Stats, логіка AIS 2.0.6)
+--  Відкривається з вкладки Финансы кнопкою "Охранник"
+-- ============================================================
+local function drawAisPanel(h)
+    if not AIS then
+        imgui.TextColored(thDim(), "AIS module missing")
+        return
+    end
+    AIS.st = AIS.st or {}
+    AIS.cfg = AIS.cfg or {}
+
+    local r, g, b = getAcc()
+
+    -- назад до фінансів
+    imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.25, g*0.25, b*0.25, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.40, g*0.40, b*0.40, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r*0.55, g*0.55, b*0.55, 1.0))
+    do local _pb = prettyBtnPush(8.0)
+    if imgui.Button(u8"\x3c\x20\xcd\xe0\xe7\xe0\xe4 \xea \xf4\xe8\xed\xe0\xed\xf1\xe0\xec##aisBack", imgui.ImVec2(S(200), S(28))) then
+        St.aisView = false
+    end
+    prettyBtnPop(_pb) end
+    imgui.PopStyleColor(3)
+
+    imgui.Spacing()
+    secTitle(u8"\xce\xf5\xf0\xe0\xed\xed\xe8\xea")
+
+    -- тумблери
+    do
+        local aw = imgui.GetContentRegionAvail().x
+        local function rowToggle(label, key, tip)
+            imgui.TextColored(iv4(0.85, 0.87, 0.92, 1), label)
+            imgui.SameLine(aw - S(40))
+            local on = AIS.st[key] and true or false
+            if drawToggleSwitch("##ais_" .. key, on) then
+                AIS.st[key] = not on
+                if key == "autoSpawn" then AIS.st.autoSpawn = AIS.st[key] end
+                if key == "autoEat" then AIS.st.autoEat = AIS.st[key] end
+                if key == "sotg" then AIS.st.sotg = AIS.st[key] end
+                if key == "reducedCooldown" then AIS.st.reducedCooldown = AIS.st[key] end
+                if key == "enabled" then AIS.st.enabled = AIS.st[key] end
+                pcall(function() if AIS.jsonSave then AIS.jsonSave() end end)
+            end
+            if tip and imgui.IsItemHovered and imgui.IsItemHovered() then
+                imgui.SetTooltip(tip)
+            end
+            imgui.Spacing()
+        end
+        rowToggle(u8"\xcc\xee\xe4\xf3\xeb\xfc \xe2\xea\xeb\xfe\xf7\xb8\xed", "enabled")
+        rowToggle(u8"\xc0\xe2\xf2\xee\xef\xf0\xe8\xe7\xfb\xe2", "autoSpawn")
+        rowToggle(u8"\xc4\xe2\xe0 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe0", "sotg")
+        rowToggle(u8"\xc0\xe2\xf2\xee\xea\xee\xf0\xec", "autoEat")
+        rowToggle(u8"\xd3\xec\xe5\xed\xfc\xf8\xe5\xed\xed\xee\xe5 \xca\xc4 (3 \xf1\xe5\xea)", "reducedCooldown")
+    end
+
+    imgui.Spacing()
+    secTitle(u8"\xc4\xe5\xe9\xf1\xf2\xe2\xe8\xff")
+
+    local btnH = S(32)
+    local gap = S(8)
+    local aw = imgui.GetContentRegionAvail().x
+    local bw = (aw - gap) * 0.5
+
+    local function actBtn(label, col, fn)
+        imgui.PushStyleColor(imgui.Col.Button,        iv4(col[1]*0.55, col[2]*0.55, col[3]*0.55, 1))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(col[1]*0.75, col[2]*0.75, col[3]*0.75, 1))
+        imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(col[1], col[2], col[3], 1))
+        do local _p = prettyBtnPush(8.0)
+        if imgui.Button(label, imgui.ImVec2(bw, btnH)) then
+            pcall(fn)
+        end
+        prettyBtnPop(_p) end
+        imgui.PopStyleColor(3)
+    end
+
+    actBtn(u8"\xcf\xf0\xe8\xe7\xe2\xe0\xf2\xfc 1##aisSp1", {0.25, 0.75, 0.40}, function() AIS.SpawnPet(1) end)
+    imgui.SameLine(0, gap)
+    actBtn(u8"\xcf\xf0\xe8\xe7\xe2\xe0\xf2\xfc 2##aisSp2", {0.25, 0.65, 0.85}, function()
+        if AIS.st.sotg then AIS.SpawnPet(2) else
+            pcall(sampAddChatMessage, "{FFAA00}[AIS] enable SOTG (two guards)", -1)
+        end
+    end)
+
+    actBtn(u8"\xd3\xe1\xf0\xe0\xf2\xfc 1##aisOff1", {0.85, 0.35, 0.30}, function() AIS.OffPet(1) end)
+    imgui.SameLine(0, gap)
+    actBtn(u8"\xd3\xe1\xf0\xe0\xf2\xfc 2##aisOff2", {0.85, 0.45, 0.25}, function() AIS.OffPet(2) end)
+
+    actBtn(u8"\xcf\xee\xea\xee\xf0\xec\xe8\xf2\xfc 1##aisEat1", {0.90, 0.70, 0.20}, function() AIS.EatPet(1) end)
+    imgui.SameLine(0, gap)
+    actBtn(u8"\xcf\xee\xea\xee\xf0\xec\xe8\xf2\xfc 2##aisEat2", {0.90, 0.60, 0.15}, function() AIS.EatPet(2) end)
+
+    imgui.Spacing()
+    imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.30, g*0.30, b*0.30, 1))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.48, g*0.48, b*0.48, 1))
+    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r*0.62, g*0.62, b*0.62, 1))
+    do local _p = prettyBtnPush(8.0)
+    if imgui.Button(u8"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2##aisRefresh", imgui.ImVec2(-1, btnH)) then
+        AIS.CheckAllPet()
+    end
+    prettyBtnPop(_p) end
+    imgui.PopStyleColor(3)
+
+    imgui.Spacing()
+    secTitle(u8"\xd1\xef\xe8\xf1\xee\xea")
+
+    local list = AIS.st.securityList or {}
+    if #list == 0 then
+        imgui.TextColored(thDim(), u8"\xd1\xef\xe8\xf1\xee\xea \xef\xf3\xf1\xf2 \x97 \xed\xe0\xe6\xec\xe8\xf2\xe5 \"\xce\xe1\xed\xee\xe2\xe8\xf2\xfc\"")
+        imgui.TextColored(thDim(), u8"\xea\xee\xec\xe0\xed\xe4\xfb: /sppet /offpet /fasteat /ais")
+    else
+        for i, pet in ipairs(list) do
+            local spawned = tonumber(pet.spawned) == 1
+            if spawned then
+                imgui.TextColored(iv4(0.35, 1.0, 0.45, 1), u8"[ON]")
+            else
+                imgui.TextColored(iv4(1.0, 0.40, 0.40, 1), u8"[OFF]")
+            end
+            imgui.SameLine(0, 8)
+            imgui.TextColored(iv4(0.95, 0.95, 0.98, 1),
+                string.format("%s  ID:%s  slot:%s", tostring(pet.name or "?"), tostring(pet.id or "?"), tostring(pet.slot or "?")))
+            imgui.SameLine(aw - S(200))
+            if imgui.SmallButton(u8"\xee\xf1\xed##m" .. tostring(pet.id)) then
+                AIS.cfg.spPet1 = { name = pet.name, id = pet.id, slot = pet.slot, spawned = pet.spawned }
+                pcall(AIS.jsonSave)
+                pcall(sampAddChatMessage, "{00FF88}[AIS] main=" .. tostring(pet.name), -1)
+            end
+            imgui.SameLine()
+            if imgui.SmallButton(u8"2##s" .. tostring(pet.id)) then
+                AIS.cfg.spPet2 = { name = pet.name, id = pet.id, slot = pet.slot, spawned = pet.spawned }
+                pcall(AIS.jsonSave)
+                pcall(sampAddChatMessage, "{00FF88}[AIS] second=" .. tostring(pet.name), -1)
+            end
+        end
+    end
+
+    -- вибрані
+    imgui.Spacing()
+    local p1 = AIS.cfg and AIS.cfg.spPet1
+    local p2 = AIS.cfg and AIS.cfg.spPet2
+    imgui.TextColored(iv4(1.0, 0.85, 0.30, 1), u8"\xce\xf1\xed\xee\xe2\xed\xee\xe9: " .. (p1 and tostring(p1.name) or "-"))
+    if AIS.st.sotg then
+        imgui.TextColored(iv4(0.45, 0.80, 1.0, 1), u8"\xc2\xf2\xee\xf0\xee\xe9: " .. (p2 and tostring(p2.name) or "-"))
+    end
+end
+
+
 function drawTotalInner(s, h)
     if St._resetCharScroll then imgui.SetScrollY(0) end
         local r,g,b = getAcc()
+
+        -- ── панель охранника (з кнопки на Финансах) ──
+        if St.aisView then
+            drawAisPanel(h)
+            return
+        end
+
+        -- кнопка переходу до охранника
+        do
+            imgui.PushStyleColor(imgui.Col.Button,        iv4(0.55, 0.40, 0.12, 1.0))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.75, 0.55, 0.18, 1.0))
+            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.90, 0.68, 0.22, 1.0))
+            do local _pb = prettyBtnPush(9.0)
+            local lbl = u8"  Îõðàííèê  ##aisOpenFin"
+            if imgui.Button(lbl, imgui.ImVec2(imgui.GetContentRegionAvail().x, S(34))) then
+                St.aisView = true
+            end
+            prettyBtnPop(_pb) end
+            imgui.PopStyleColor(3)
+            imgui.Spacing()
+        end
 
         -- ── кнопка управления вкладкой "Всего": подписана текстом, читаемый
         -- шрифт, толщина рамки 4px ──────────────────────────────────────
@@ -9982,6 +10207,7 @@ local _okSC, _errSC = pcall(function()
         local bottomBarH = (St.activeTab == 5) and (46 + S(50)) or 46
         local contentH = imgui.GetContentRegionAvail().y - bottomBarH - 20
 
+        if St.activeTab ~= 3 then St.aisView = false end
         if St.activeTab == 4 then
             drawSettings(contentH, sw, sh)
         elseif St.activeTab == 5 then
@@ -9990,6 +10216,9 @@ local _okSC, _errSC = pcall(function()
             drawTaxes(contentH)
         elseif St.activeTab == 3 and St.statsData then
             drawTotal(St.statsData, contentH)
+        elseif St.activeTab == 3 and St.aisView then
+            -- фінанси без statsData, але панель охранника доступна
+            drawTotal({ }, contentH)
         elseif not St.statsData then
             imgui.Spacing()
             if St.waitingStats then
