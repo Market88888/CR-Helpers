@@ -1539,10 +1539,40 @@ function AIS.AutoEatpet()
 end
 
 function AIS.CheckAllPet()
-    AIS.st.checkAllPet = true
+    local st = AIS.st
+    if st.scanBusy then AIS.msg("\xd1\xea\xe0\xed\xe8\xf0\xee\xe2\xe0\xed\xe8\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 \xf3\xe6\xe5 \xe8\xe4\xb8\xf2, \xef\xee\xe4\xee\xe6\xe4\xe8\xf2\xe5...") return end
+    if not sampIsLocalPlayerSpawned() then AIS.msg("\xd1\xed\xe0\xf7\xe0\xeb\xe0 \xe7\xe0\xe9\xe4\xe8\xf2\xe5 \xed\xe0 \xf1\xe5\xf0\xe2\xe5\xf0.") return end
+
+    st.scanBusy = true
+    st.checkAllPet = true
+    AIS.msg("\xce\xf2\xea\xf0\xfb\xe2\xe0\xfe \xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc \xe8 \xe8\xf9\xf3 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2...")
+
     AIS.emul_num({ 220, 0, 27, 64 })
-    sampSendChat("/invent")
-    wait(500)
+
+    -- как в SpawnPet/OffPet: /invent может не сработать с первого раза
+    -- (антифлуд, открытое окно и т.п.), поэтому повторяем, пока не придёт
+    -- ответ сервера (флаг checkAllPet сбрасывает обработчик пакета)
+    local got = false
+    for i = 1, 14 do
+        if not st.checkAllPet then got = true break end
+        if not sampIsLocalPlayerSpawned() then break end
+        if not st.checkinv then
+            sampSendChat("/invent")
+            AIS.dbg("[Scan] \xcf\xee\xef\xfb\xf2\xea\xe0 \xee\xf2\xea\xf0\xfb\xf2\xfc \xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc [ " .. i .. " ]")
+        end
+        for _ = 1, 40 do
+            wait(50)
+            if not st.checkAllPet then got = true break end
+        end
+        if got then break end
+    end
+
+    st.scanBusy = false
+    if not got and st.checkAllPet then
+        st.checkAllPet = false
+        AIS.msg("{ff6666}\xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xef\xee\xeb\xf3\xf7\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2{ffffff}: \xf1\xe5\xf0\xe2\xe5\xf0 \xed\xe5 \xef\xf0\xe8\xf1\xeb\xe0\xeb \xe4\xe0\xed\xed\xfb\xe5. "
+            .. "\xc7\xe0\xea\xf0\xee\xe9\xf2\xe5 \xee\xf2\xea\xf0\xfb\xf2\xfb\xe5 \xee\xea\xed\xe0 \xe8 \xe4\xe8\xe0\xeb\xee\xe3\xe8 \xe8 \xed\xe0\xe6\xec\xe8\xf2\xe5 \xab\xce\xe1\xed\xee\xe2\xe8\xf2\xfc \xf1\xef\xe8\xf1\xee\xea\xbb \xe5\xf9\xb8 \xf0\xe0\xe7.")
+    end
 end
 
 -- ── автопризыв (ждёт остановки персонажа, проверяет, спавнит) ──
@@ -1587,10 +1617,32 @@ function AIS.AutoSpawnPet()
     if not ok then print("[AIS] AutoSpawnPet error: " .. tostring(err)) end
 end
 
--- ── разбор списка охранников из пакета инвентаря ──
+-- \\uXXXX из JSON -> байты CP1251 (имена охранников иногда приходят экранированными)
+function AIS.unescape(name)
+    if not name or not name:find("\\u", 1, true) then return name end
+    return (name:gsub("\\u(%x%x%x%x)", function(h)
+        local cp = tonumber(h, 16)
+        if cp < 128 then return string.char(cp) end
+        if cp == 0x401 then return "\168" end
+        if cp == 0x451 then return "\184" end
+        if cp >= 0x410 and cp <= 0x44F then return string.char(0xC0 + cp - 0x410) end
+        return "?"
+    end))
+end
+
+-- достаёт массив "securities":[...] с учётом вложенных [] внутри объектов
+function AIS.securitiesArray(str)
+    local pos = str:find('"securities"%s*:%s*%[')
+    if not pos then return nil end
+    local arr = str:match('"securities"%s*:%s*(%b[])')
+    if arr then return arr:sub(2, -2) end
+    return str:match('"securities"%s*:%s*%[(.-)%]')
+end
+
 -- fullReset=true — список пересобирается с нуля (кнопка "Обновить список")
+-- возвращает: nil — массив не найден, иначе true/false (были ли изменения)
 function AIS.parseSecurities(str, fullReset)
-    local arr = str:match('"securities"%s*:%s*%[(.-)%]')
+    local arr = AIS.securitiesArray(str)
     if not arr then return nil end
 
     local s = AIS.s
@@ -1608,14 +1660,19 @@ function AIS.parseSecurities(str, fullReset)
     end
 
     local changed = false
+    local found = 0
     for obj in arr:gmatch("%b{}") do
         local name    = obj:match('"name"%s*:%s*"([^"]*)"')
-        local id      = tonumber(obj:match('"id"%s*:%s*(%d+)'))
-        local slot    = tonumber(obj:match('"slot"%s*:%s*(%d+)'))
-        local spawned = tonumber(obj:match('"spawned"%s*:%s*(%d+)'))
+        local id      = tonumber(obj:match('"id"%s*:%s*"?(%d+)'))
+        local slot    = tonumber(obj:match('"slot"%s*:%s*"?(%d+)'))
+        local spRaw   = obj:match('"spawned"%s*:%s*"?(%w+)')
+        local spawned = tonumber(spRaw)
+        if spawned == nil and spRaw ~= nil then spawned = (spRaw == "true") and 1 or 0 end
 
         if name and id and slot then
+            name = AIS.unescape(name)
             spawned = spawned or 0
+            found = found + 1
             local sec = byId[id]
             if not sec then
                 sec = { name = name, id = id, slot = slot, spawned = spawned }
@@ -1634,6 +1691,11 @@ function AIS.parseSecurities(str, fullReset)
                 AIS.dbg(string.format("\xce\xf5\xf0\xe0\xed\xed\xe8\xea: %s | ID: %d | Slot: %d | Spawned: %d", name, id, slot, spawned))
             end
         end
+    end
+
+    if found == 0 then
+        -- массив есть, но объекты не разобрались — покажем сырой фрагмент в консоли
+        print("[AIS] securities: \xed\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xf0\xe0\xe7\xee\xe1\xf0\xe0\xf2\xfc \xee\xe1\xfa\xe5\xea\xf2\xfb, \xf4\xf0\xe0\xe3\xec\xe5\xed\xf2: " .. tostring(arr):sub(1, 400))
     end
     return changed
 end
@@ -1706,7 +1768,16 @@ AIS.ACTIONS = {
 function AIS.onReceivePacket(id, bs)
     if id ~= 220 then return end
     if not AIS.on() then return end
+    -- в MoonLoader указатель чтения указывает на начало пакета (вместе с id),
+    -- но другой обработчик (в т.ч. чужой скрипт) мог уже сдвинуть его —
+    -- возвращаем в начало, а после разбора снова, чтобы не мешать остальным
+    pcall(raknetBitStreamResetReadPointer, bs)
+    local ok, err = pcall(AIS._onPacket, id, bs)
+    pcall(raknetBitStreamResetReadPointer, bs)
+    if not ok then print("[AIS] packet error: " .. tostring(err)) end
+end
 
+function AIS._onPacket(id, bs)
     local st, s = AIS.st, AIS.s
 
     raknetBitStreamIgnoreBits(bs, 8)
@@ -2071,31 +2142,48 @@ end
 --     (правильно: local unpack = table.unpack or unpack);
 --   - _pcsStripColorTags раньше резал только "{RRGGBB}", теперь ещё и
 --     "{RRGGBBAA}".
--- ── СМАЙЛЫ В ЧАТЕ ARIZONA ──────────────────────────────────
+-- ── СТИКЕРЫ В СООБЩЕНИЯХ ЧАТА ─────────────────────────────
 -- Родной чат SA-MP не рисует UTF-8 эмодзи (они вырезаются ниже), но клиент
--- Arizona умеет заменять коды вида ":name:" на картинки-смайлы. Здесь
--- лежит таблица кодов (ПОДТВЕРЖДЕНЫ: :man: — им пользуется сам AIS, :buy:
--- приходит в сообщениях сервера). Свои коды из игрового списка смайлов
--- можно добавлять сюда же и использовать через PCS_EMOJI.имя ──
-PCS_EMOJI = { man = ":man:", money = ":buy:" }
--- сообщениям про налоги/PayDay (не ошибкам и не с уже стоящим смайлом)
--- добавляет смайл денег сразу после тега вида "[PC Stats]"
+-- Arizona заменяет коды вида ":name:" на картинки-стикеры. Каждому
+-- сообщению скрипта ставится стикер В НАЧАЛО строки (так же, как делает
+-- Auto-Interaction Securities). Подтверждённые коды: :man: (ставит сам AIS)
+-- и :buy: (приходит в сообщениях сервера). Сообщения про деньги, налоги,
+-- курсы и PayDay получают :buy:, остальные — :man:.
+-- Свои коды из игрового списка добавляйте в PCS_EMOJI и назначайте
+-- видам сообщений в PCS_EMOJI_KIND (money / ok / info / warn / err).
+-- Выключается в Настройки → Цвета → "Стикеры в сообщениях чата".
+PCS_EMOJI      = { man = ":man:", money = ":buy:" }
+PCS_EMOJI_KIND = { money = "money", ok = "man", info = "man", warn = "man", err = "man" }
+
 function PCS_addChatEmoji(text)
-    if type(text) ~= "string" then return text end
-    local hex, rest = text:match("^{(%x%x%x%x%x%x)}(.*)$")
-    if not hex then return text end
-    local H = hex:upper()
-    if H == "FF6666" or H == "FF4444" or H == "FFAA00" then return text end
-    if rest:find(":%a+:") then return text end
-    local close = rest:find("]", 1, true)
-    if not close or close > 30 then return text end
-    local words = { "\xed\xe0\xeb\xee\xe3", "\xcd\xe0\xeb\xee\xe3", "PayDay", "Payday", "PAYDAY", "payday" }
+    if type(text) ~= "string" or text == "" then return text end
+    if type(PCS_stickersEnabled) == "function" and not PCS_stickersEnabled() then return text end
+    if text:find("^:[%w_]+:") then return text end -- стикер уже стоит
+
+    -- строки-разделители и пустые сообщения без стикера
+    local plain = text:gsub("{%x%x%x%x%x%x%x%x}", ""):gsub("{%x%x%x%x%x%x}", "")
+    plain = plain:gsub("[\226][\148\149][\128-\191]", ""):gsub("[%s%-=_]+", "")
+    if plain == "" then return text end
+
+    local hex = text:match("^{(%x%x%x%x%x%x)}")
+    local H = hex and hex:upper() or ""
+    local kind = "info"
+    if H == "FF6666" or H == "FF4444" then kind = "err"
+    elseif H == "FFAA00" or H == "FFD700" then kind = "warn"
+    elseif H == "00FF88" then kind = "ok" end
+
+    local words = { "\xed\xe0\xeb\xee\xe3", "\xcd\xe0\xeb\xee\xe3", "PayDay", "Payday", "PAYDAY", "payday",
+        "\xea\xf3\xf0\xf1", "\xca\xf3\xf0\xf1", "\xe2\xe0\xeb\xfe\xf2", "\xc2\xe0\xeb\xfe\xf2",
+        "\xe4\xee\xf5\xee\xe4", "\xc4\xee\xf5\xee\xe4", "\xc2\xd1\xc5\xc3\xce", "\xe2\xe8\xf0\xf2", "\xc2\xe8\xf0\xf2",
+        "AZ", "BTC", "VC$", "ASC" }
     for _, w in ipairs(words) do
-        if rest:find(w, 1, true) then
-            return "{" .. hex .. "}" .. rest:sub(1, close) .. " " .. PCS_EMOJI.money .. rest:sub(close + 1)
-        end
+        if text:find(w, 1, true) then kind = "money" break end
     end
-    return text
+
+    local key = PCS_EMOJI_KIND[kind] or "man"
+    local tag = PCS_EMOJI[key] or PCS_EMOJI.man
+    if not tag or tag == "" then return text end
+    return tag .. " " .. text
 end
 
 if type(sampAddChatMessage) == "function" then
@@ -2132,16 +2220,18 @@ if type(sampAddChatMessage) == "function" then
         local rawText = text
         if type(text) == "string" then
             text = stripUtf8Symbols(text)
-            if type(PCS_addChatEmoji) == "function" then
-                local okE, withE = pcall(PCS_addChatEmoji, text)
-                if okE and withE then text = withE end
-            end
             -- applyCustomChatColor определяется ниже по файлу (после того,
             -- как загружен cfg) — на момент реального вызова (отправка
             -- сообщения в чат) она уже точно объявлена как глобальная
             if type(applyCustomChatColor) == "function" then
                 local okC, colored = pcall(applyCustomChatColor, text)
                 if okC and colored then text = colored end
+            end
+            -- стикер ставится ПОСЛЕДНИМ (в самое начало строки), уже после
+            -- подмены цвета тега — иначе applyCustomChatColor не найдёт "{RRGGBB}"
+            if type(PCS_addChatEmoji) == "function" then
+                local okE, withE = pcall(PCS_addChatEmoji, text)
+                if okE and withE then text = withE end
             end
         end
         local ret = { pcall(_origAddChatMessage, text, color) }
@@ -2153,6 +2243,7 @@ if type(sampAddChatMessage) == "function" then
             for _, tag in pairs(PCS_EMOJI or {}) do
                 clean = clean:gsub((tag:gsub("%p", "%%%0")) .. " ?", "")
             end
+            clean = clean:gsub("^%s+", "")
             if type(clean) == "string" and clean:match("%S") and not _pcsIsDecorativeOnly(clean) then
                 -- ФИКС "в тосте вопросики вместо текста": rawText — это сырые
                 -- CP1251-байты (как их ожидает сам sampAddChatMessage), а
@@ -2313,145 +2404,174 @@ end
 -- base64 в бинарные байты и один раз сохраняем как .ttf-файл рядом
 -- с настройками (moonloader/config/PCStats/) — при следующих запусках
 -- скрипт видит, что файл уже есть, и просто переиспользует его ──
-local ICON_FONT_FILE = CFG_DIR .. "/pcstats-icons-v2.ttf" -- v2: расширенный набор глифов (иконки FA6 solid+brands)
+local ICON_FONT_FILE = CFG_DIR .. "/pcstats-icons-v3.ttf" -- v3: + иконки валют и замка (FA6 solid+brands); имя файла меняется при каждом расширении набора глифов
 local ICON_FONT_B64 = table.concat({
-    "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",
+    "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",
-    "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",
-    "CQIyM0tcwBERHh4iIh4eERERER4eIiIeHhERMAIyM0sNCAkJCA1LMzICAAEAAAAgAcABYAAeAAABFhUxMRQHATEGIyInJzEmNTQ3",
-    "NjMyFxcxNzE2MzIXAbcJCf8ACg0NCoAJCQoNDQpp6QoNDQoBVwoNDQr/AAkJgAoNDQoJCWrqCQkAAAEAIAAgAWABYAAxAAABNjUx",
-    "MTQnJiMiBwcxJzEmIyIHBhUUFxcxBzEGFRQXFjMyNzcxFzEWMzI3NjU0JycxNwFXCQkKDQ0KaWkKDQ0KCQlqagkJCg0NCmlpCg0N",
-    "CgkJamoBKQoNDQoJCWpqCQkKDQ0KaWkKDQ0KCQlqagkJCg0NCmlpAAIAEP/QAfABwAAVAEwAAAE0JzExJiMiBwYVFTEUFxYzMjc2",
-    "NTUHNjcxMTYnJicmBwYHBhUWFxYXFhc2NzY3Njc0JyYnJgcGBwYXFhcWFxYVBgcGByYnJic0NzY3ASAJCQ4OCQkJCQ4OCQmQCgEB",
-    "CAkNDQopFxcBICA2NkNDNjYgIAEXGCgKDQ0JCAEBCh4REQIyMUtLMjECEREdAaAOCQkJCQ7gDgkJCQkO4FkJDQ0KCwEBCCIvMDhD",
-    "NjYgIAEBICA2NkM4MC8iCAEBCgsNDQkYIyMpSzEyAgIyMUspIyMYAAACAAz/wAH0AcAAYABtAAABFgcHMRYVFAcXMRYHBgcHMQYH",
-    "BicnMQYHBzEGBwYjIicmJycxJicHMQYnJicnMSYnJjc3MSY1NDcnMSY3Njc3MTY3NhcXMTY3NzE2NzYzMhcWFxcxFhc3MTYXFhcX",
-    "MRYXBzY3NicmJwYHBhcWFwHwBAosAgIsCgQHCQUKDAoOOBQYDAQPFBYWFQ4EDBgUOA4KDQkFCQcECiwCAiwKBAcJBQkNCg44FBgM",
-    "BA8UFhYVDgQMGBQ4DgoNCgQJB/AtGBYWGC0tGBYWGC0BGQ4KKAwNDQwoCg4SEQgQDwsEEhAJOg4DBAQDDjoJEBIECw8QCBERDwon",
-    "DQ0NDCgKDhIRCBAPCwQSEAo5DgMEBAMOOQoQEgQLDxAIERKpAScoKCcBAScoKCcBAAIAAP/AAgABwAAaAC4AAAEWFzExFhcWFRQH",
-    "BgcGByYnJicmNTQ3Njc2NwcVNRUUFxcxFjc2JycxNTEmJwYHAQBGOjokIiIkOjpGRjo6JCIiJDo6RhgLYBMOCxJVAhYWAgHAASEi",
-    "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",
-    "AgIBpQASACUAUABjAHYAABMWBzExBgcGJyYnJjc2NzYXFhcHFgcxMQYHBicmJyY3Njc2FxYXBzY3MTE2NzExNhc2FxYXFhcWFRUx",
-    "FAcGIyInJzEmBwcxBiMiJyY1NTE0NyUmJzExJjc2NzYXFhcWBwYHBicnJicxMSY3Njc2FxYXFgcGBwYn4woJChgZGBgMCgkKGBkY",
-    "GAx/DgIDExMWFg8OAwITExYWDx8bJCMiIRYWISIjJBsFDg0UERFYFxdYEREUDQ4FAWETAwIODxYWExMCAw4PFhYTcBgKCQsLGBgZ",
-    "GAoJCgwYGBkBYyEbHAkHEBEhIRscCQcRECFqGRgXDAoKCRkZGBcMCgoJGcpGJyYPEAEBEA8mJ0YPEAEUDQ4EFgYGFgQODRQBEA92",
-    "DBcYGRkJCgoMFxgZGQkKCl0JHBshIRARBwkcGyEhERAHAAACAAD/wAHAAcAAIQAyAAATBzcHIzEiBwYVFBcWMyExMjc2NTQnJiMj",
-    "MScxJicjMQYHBSkCEzEWFxYzMzEyNzY3E4cHBwdgDgkJCQkOAYAOCQkJCQ5gBwkUeBQJARn+gAGA/oAVAg0OE/YTDg0CFQGuDg4O",
-    "CQkODgkJCQkODgkJDhEBARFu/q0TDQ0NDRMBUwADAAD/wAKAAcAAGgAxAFMAABM0NzExNjc2MzIXFhcWFRQHBgcGIyInJicmNQM2",
-    "NzExNjczMRYXFhcUBwYjITEiJyY1JTUVNSMxJic2NzMxNTE2NxYXFTEzMRYXBgcjMRUxBgcmJ2ARER4eIiIeHhEREREeHiIiHh4R",
-    "EWACMjNLXEszMgIJCA3+fA0ICQH4QBYCAhZAAhYWAkAWAgIWQAIWFgIBQCMdHRIRERIdHSMjHR0SERESHR0j/p5LMzICAjIzSw0I",
-    "CQkIDapAQEACFhYCQBYCAhZAAhYWAkAWAgIWAAMAAP/AAcABwQAmAF4AZwAAASYHMTEGBzExBgcVMRYXFhczMRUxFBcWMzI3NjU1",
-    "MTUxNTE0JyYjBSYnIgcHMQYVFhcWFxUxFBcWMzI3NjU1MTY3Njc0JycxJiMGBxUxBgcmJycxJicGBwcxBgcmJzUXOQQ1MRUBoAoe",
-    "HxscAgESEhsgCQkODgkJCQkO/qABDQ4EHgIBFhciCQkODgkJIhcWAQIeBA4NAQEJCAIMAg4OAgwCCAkBMAHAAQ8OJidHcBsSEgGA",
-    "DgkJCQkOgHDQDgkJEA0DDYgJCiMYGQTgDgkJCQkO4AQZGCMKCYgNAw2GCQEBCIgOAQEOiAgBAQmGmAEBAAIAEP/ZAfABpwAuAF4A",
-    "ABMGBwYHBicmJyY3Njc2NzYXFhc3MTYXFhcVMQYHIzEwMTAxIzEmJyY3NzEmIyIHBzY3MzkCMzEWFxYHBzEWMzI3Njc2NzYXFhcW",
-    "BwYHBgcGJyYnBzEGJyYnNTkCNY8aDAULDA0MBgUEECUsOTg5OSwqDA4OAQIWCHgQBgYLKTFAPzF/AhYIeBAGBgspMUA/MRoMBQsM",
-    "DQwGBgUQJSw5ODk5LCoMDg4BATEbIQwGBQQFCwwNLiUsDw4ODiwqCwYGEIAWAgEODgwpLi+pFgIBDg4MKS4vGyEMBgUEBQsMDS4l",
-    "LA8ODg4sKgsGBhB4CAAAAgAP/70B8QHAAB4ALgAAATIXFzEWFxYVFgcGBwYHBicmJyYnJjc0NzY3NzE2MxUZAjY3Njc2NScxMDEw",
-    "MQEABwa9EQoLARISLy5WGhpWLi8SEgELChG9BgdEJyYQD7ABwANQBw8PFDNFRUFCKwwMK0JBRUUzFA8PB1ADQ/6GAXr+hiM2Njk6",
-    "LkoAAwAA/8ACQgHAAF8AlAChAAABFTUVFhcWBwYnJiMiBwYVIhUUMTAxMDEUFxYXMzEwMTAxFhcWFwYHBgcVMQYHJic1MSYnIiMm",
-    "IyYjJjc2FxYzFhcWFzI3NjU2NTExNicmJycxJicmJzY3Njc1MTY3FhcBFgcxMQYHBzEGKwIiJyY1NTE0NzYzMzE3MTY7AjIXFhUU",
-    "BwYrAgYHFhczMTcxNhcWFwUwOQIwMSMxMDEwMwE4CggVBAcWEQ0MCAMBAwkTARITGAMCGQoLAhYWAg4KAQEBAQICFAUJFQICAgIT",
-    "DwwHAwEBBQgTAhITFwMDGQkLAhYWAgEACgIDDX8kLaCgDgkJCQkOJS0jLU5QDgkJCQkOQBAPAQEPeXcOEBAK/ooBAQGoCwsLAQMH",
-    "FhUEBQUCAQIBAQIEBgQLDSAiDwYCCxYCAhYLBAQBAQkWFAUBAQEHAQQCAQEDAQQFBQEECgwgIw0FAwsWAgIW/sgOEBAKXhoJCQ5A",
-    "DgkJJBwJCQ4OCQkBDw8BWAoCAw0wAAQAAP/AAoABwAAaADEASwBcAAATNDcxMTY3NjMyFxYXFhUUBwYHBiMiJyYnJjUDNjcxMTY3",
-    "MzEWFxYXFAcGIyExIicmNQUjMyM2NTUxNCcmJzAzMjMzMRYXFhcUBwYjAyYnNjc0JzY3FhcWFwYHBgdgEREeHiIiHh4RERERHh4i",
-    "Ih4eERFgAjIzS1xLMzICCQgN/nwNCAkCYYmJiQgTEiEBAwM+RC4tAgkJDbEwHx4BEhwmMB8gAQEgHzABQCMdHRIRERIdHSMjHR0S",
-    "ERESHR0j/p5LMzICAjIzSw0ICQkIDR4OEgguJyccAi0uRA0JCQEAASApNikhFQEBIB8wMB8gAQAAAwAA/74BQgHGAAwAVgBtAAAT",
-    "Njc2FxYXBgcGJyYnBwYjMTEiFQcxBgcHMQYHBicmJyY3NzE2NzcxNjMyFxYXFzEXMRYXFgcGBwYnJzEmJycxBzEXMRYXFzEWBwYH",
-    "BicmJycxJzEmNzcHNwc3FhcXMQcxBgcHMQYjIicmNTQ3N6ABFxgYFwEBFxgYFwEhAQEBCBoJAwQMCw0NBgUEAhMzCB8jIhsbDg8V",
-    "DAQEBQcMDAwbEAcJFDIIAxcDBwYNDgsKBBZHFggQORkZGQMEKA4EBz0KDQ0KCQk8AZAbDwwMDxsbDwwMDxuXAQEDDBoIDQUGBAQM",
-    "Cw0INRgDDhITHyUKBwwMDAwEBAUOCBAXQTYJDFwNCwsEAwcGDVhOGiFAxz4+PgQELSQJBz4JCQoNDQo7AAUAAP/AAYABwAAdACQA",
-    "MQA+AKsAABMGBzExBgcRMRYXFhchMTY3NjcRMSMxIicmNTUxIzMVNRUzMScHNjczMRYXBgcjMSYnFTY3MzEWFwYHIzEmJxcWFxUx",
-    "FhcWBwYnJiMiBwYVBhcWFzExMDEwMTAxMDEwMRYXFhcGBwYHFTEGByYnNTEmJzAxMDEwMSYnJjc2FxYXMDEwMTAxMDEwMTAxMDEy",
-    "FRYXMjc2NTQnJicnMTAxMDEmJyYnNjc2NzUxNjdAGxISAQESEhsBABsSEgGADgkJoMCAgMABD0APAQEPQA8BAQ9ADwEBD0APAYAP",
-    "AQ0LDgMFDhEPDgoIAQgLExISFQIBFgwNAQ8PAREOAwMOBAYOBAMBExAPCQgIChMBEhEUAwIWCw0BDwHAARISG/6AGxISAQESEhsB",
-    "IAkJDoCAgICAUA8BAQ8PAQEPQA8BAQ8PAQEPSAEPEQIDBQ8OAwUGBAgFBQYFBQoLGx0NBwIRDwEBDxIDBgEBBg4NAwEBAQcBBQUJ",
-    "BwUGBQEECQsbHQsHAhEPAQADAAD/wAIAAcAAPgBYAHIAAAEGBzExBgcVMQYHJic1MTY3Njc2NxYXFhcWFxUxBgcGByMxBgcjMSYn",
-    "Jic2NzY3MzEWFzMxMjc2NTUxJicmJwczIzMyFxYVFTEUBwYjIzEmJyYnNTE2NzY3MxYXMTEWFxUxBgcGByMxIicmNTUxNDc2MzMB",
-    "AFg7OwICFhYCASIiOjlISDk6IiIBARkZJW4OHCAUDg0BAQ0OFCAcDm4RCwwCOztYcBAQEA4JCQkJDhAbEhIBARISG+AbEhIBARIS",
-    "GxAOCQkJCQ4QAZACOztYKBYCAhYoSDk6IiIBASIiOjlIkCUZGQEXAQENDhQUDg0BARcMCxGQWDs7AqAJCQ5wDgkJARISGzAbEhIB",
-    "ARISGzAbEhIBCQkOcA4JCQABAAAAIAJAAWAARgAAExYXMTEWMzMxMjc2NzY3NjMWFxYXBgcGFRQXFhcGBwYHIicmJyYnJiMjMSIH",
-    "BgcGBwYjJicmJzY3NjU0JyYnNjc2NzIXFheaBQoKDcANCgoFChMUGSIXFgECKAYGKAIBFhciGRQTCgUKCg3ADQoKBQoTFBkiFxYB",
-    "AigGBigCARYXIhkUEwoBLwwKCQkKDBYNDgEWFyIwFgQGBgQWMCIXFgEODRYMCgkJCgwWDQ4BFhciMBYEBgYEFjAiFxYBDg0WAAP/",
-    "/v/AAkABwAAeAFMAXAAAATcHNzY3MhcXMTMxMhcXMTMxFhcVMQYHBgcjIwcxJxcVNRUUBwYjIzEiJyY1NTEGIyInFTEUBwYjIzEi",
-    "JyY1NTEmJycxJjc2NzYXFhcXMRYXMzMXNyYnBgcWFzY3ATYXFxcEEwwHETQUDhI4FgIBFhciICUFcGoJCQ4gDgkJJCwsJAkJDiAO",
-    "CQktDgQDBwYNDgsKBAQHGB6wcDABDw8BAQ8PAQEhi4uLEwEKFg4SAhYYIhcWAR9AYeDg4A4JCQkJDnMTE3MOCQkJCQ7mEjEPDQsL",
-    "BAMHBg0QFwFAsA8BAQ8PAQEPAAEAAP/AAf4BwABDAAA3FAcHMQYjBicmIwYHBgcWFxYXFhcWFxYXNjc2NzQnJjc0NzcxNjMzMTI3",
-    "Njc2JyY1Njc2NzIXFjc2JyYnJicGBwYHFaAJGwoNDg0GCBkREQEBEREZCwEBEREZGRERAQIDAQkbCg1ZCQoJAgMEDQEgHzAMCwkH",
-    "BwEMLzBCSzEyArcNChsJAQMCARERGRkREQEBCxkREQEBEREZBwcODQ0KGwkBAggICBgdMB8gAQICBQUJPygpAQIyMUtZAAAFACD/",
-    "wAGgAcAAEAAgADYATACQAAATMhcxMRYVFTEjMTUxNDc2Mwc0NzExNjMyFxYVFTEjMTUzNDcxMTYzMhcWFRUxFAcGIyInJjU1FzQ3",
-    "MTE2MzIXFhUVMRQHBiMiJyY1NQc1FTUWMzI3FhcWMzI3FTEUBwYHFTEUBwYjIzEiJyY1NTEmJycxJic1MTY3NjczMTIXFhUUBwYj",
-    "IzEGBxYXMzE2NzY3wA4JCUAJCQ6ACQkODgkJQMAJCQ4OCQkJCQ4OCQlgCQkODgkJCQkODgkJYA4SFBAGERAVEg4RER4JCQ6gDgkJ",
-    "GhULJQEBEhIbWBELDAwLETgPAQEPOB8UFAEBwAkJDnBwDgkJQA4JCQkJDlBQDgkJCQkOYA4JCQkJDmBADgkJCQkOQA4JCQkJDkBY",
-    "AQEBCQsTDAwJCSghIRZgDgkJCQkOTgwVCyY1GxsSEgEMCxERCwwBDw8BARQUHwAAAwAA/8ACAAHAABAAPACQAAABIzMjJzEmNzY3",
-    "MzEWFxYPAjMjMxYXMDEWFxYXFhcGBwYHITEmJyYnNjc2NzY3MDEwMTAxMDEwMTY3NjcXJicGBxUxBgcGBxYXFhcXMRYXFgcUBwYj",
-    "JicmJyYHBhcWFzAxMDEwMTAxFhcVMRYXNjc1MTY3NjcmJyYnMDEwOQImJyY3Jjc2MzIXFjc2JyYnNQFAgICALwUEBArECgQEBS+A",
-    "gICABgceKikgIAIBGxsp/sApGxsBAiAgKSoeAgMEBFQCEhICDAoYAgMWEhECEwkHAQYIDRATBAQSBwQRAwMMEAISEgIMCxcCAxYS",
-    "ExMKBgEBBwkNDhESBgMRCgsBYEcJCAcBAQcICUcgBAQSIiM3OFIpGxsBARsbKVI4NyMiEgECAgNYEgICEg4CBwwfHgsKBAEFBQUE",
-    "BwMFAQgBAQQQEggBAQUDDxICAhIOAgcNIB4MCgUFBQUCBQQFBQMREgcCAg4ABQAA/8ABgAHAAAYADQAUABsANQAANzcHNycxERcz",
-    "IzMnMQc3FycXETEHNyMzIxcxNyU2NzExNjchMRYXFhcRMQYHBgchMSYnJicRQFpaWlons7OzWlmAWVlZWTOzs7NZWv7mAQ0OFAEg",
-    "FA4NAQENDhT+4BQODQE6hoaGhv70OoaGwIaGhgEMhsCGhhAUDg0BAQ0OFP5gFA4NAQENDhQBoAAAAgAA/8gB8AG4ABwAWwAAEwYH",
-    "MTEGBzExBgcWFxYXFhc2NzY3NjcmJyYnJicXBgcxMQYHMTEGBwYnIicmJyYnJicmNzY3Njc2NzY3Njc2JyYHBgcGJyInJicmIyY1",
-    "Njc2NzY3NjMyFxYXFBX4RTg4ISEBASEhODhFRTg4ISEBASEhODhFcwIFBQYGBAYLEA8EBBEMDA8PAwIKAwMBChATFAIBAgMCBGUP",
-    "DAcLCwkDAxUBEW0kMhITBQUFAwEBuAEhITg4RUU4OCEhAQEhITg4RUU4OCEhAakUIiEiIhcaAQwDAwsJCAkLBwgIAwMCCA8TEgUB",
-    "AwIBAUUKAQMCBAEFCgcHLw8VBgcDAwQFBQAAAwAU/+ACcwGgAEgAWwBuAAABJjEmJyIHBgcmByYnJiMGBzAHBgcGFxYVFhcyNzY3",
-    "MDU0IyYnJjU0MzY3NjMWMzI3MhUWFzAVFAcGByIHFDMWFxQzNjc0NTYnASYnMTEmNTQ3NjcWFxYVFAcGBzMmJzExJic2NzY3FhcW",
-    "FwYHBgcCDQE6PgEBCAdDQwcIAQE+OgE4FBMIAUNQAQERDQEYFgEBBQQBAUlLTEgBBQUBFhcBAQENEQJPRBBm/tEWDw8PDxYXDw8P",
-    "DxfEFg8PAQEODxcXDw4BAQ8OFwF6ARoLAQ8QCwsQDwELGgFVVFNSAQExGQEXGgEBCQ0BAQEEAwEhIQEDBAEBAQ0JAQEaFwEZMQEB",
-    "vZH+9AERERkZERABAREQGRkREQEBEREZGREQAQEREBkZEREBAAAAAAAGAAA=",
+    "AAGAAAACAAAAAkAAFAHAAAABwAAAAYAAIAIAABACAAAMAgAAAAIAABABwAAAAgAAAAIAAAACAAAAAgAAAAHAAAACAP/7AcAAAAIA",
+    "//kBwAAAAgAAEAHAABsCgAAAAkAAAAFAAAACAP/+AcAAAAKAAAABwAAAAgAAEAIA//sCQAAAAgAADwJAAAACgAAAAgAAAAJAAAAB",
+    "QAAAAYAAAAIAAAACQAAAAkD//gIAAAABwAAgAgAAAAGAAAAB8AAAAgAACAKAABQAAAABAAMAAQAAAAwABAGAAAAAXABAAAUAHPAC",
+    "8AXwB/AN8BHwE/AX8CHwI/BE8FjwWvBg8HHwc/Cu8Mfw4vDn8O3xIPFT8bDx+PI08sby5/Lx83nzkvOl88Hz7fTA9QD1HvU69VT1",
+    "cfWQ9df20/bX9t74Hf//AADwAvAF8AfwDPAR8BPwF/Ah8CPwRPBX8FrwYPBx8HPwrvDH8OLw5/Dt8SDxU/Gw8fjyNPLG8ufy8fN5",
+    "85LzpfPB8+30wPUA9R71OvVU9XH1kPXX9tP21/be+B3//w//D/0P/A/4D/UP9A/xD+gP5w/HD7UPtA+vD58Png9kD0wPMg8uDykO",
+    "9w7FDmkOIg3nDWgNNQ0sDLYMngx5DF4MMwthCyILBQrqCtEKtQqXClEJVglTCU0IDwABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABRAKQA",
+    "3wElAVIBlAIFAp8C5QOFA9METgSlBO4FVQWNBdgGqgdMB6cICAg1CJYI3glZCgMKSwq7CzwLuwwMDF4Mow1oDeoOwg9ID+AQqxFB",
+    "EagSIxKIEzgT8hRDFMoVjBYnAAUAAP/AAYABwAAGAA0AFAAbADUAADc3BzcnMREXMyMzJzEHNxcnFxExBzcjMyMXMTclNjcxMTY3",
+    "ITEWFxYXETEGBwYHITEmJyYnEUBaWlpaJ7Ozs1pZgFlZWVkzs7OzWVr+5gENDhQBIBQODQEBDQ4U/uAUDg0BOoaGhob+9DqGhsCG",
+    "hoYBDIbAhoYQFA4NAQENDhT+YBQODQEBDQ4UAaAAAAIAAP/AAgABwAAcADcAACUGBxcxFhUUBwYjIicnMQYHJicmJzY3NjcWFxYX",
+    "BzI3MTE2NzY1NCcmJyYjIgcGBwYVFBcWFxYzAaABJ38JCQoNDQp+NUZYOzsCAjs7WFg7OwLQJyEhFBMTFCEhJychIRQTExQhISfw",
+    "RjV+Cg0NCgkJfycBAjs7WFg7OwICOztYkBMTIiImJiIiExMTEyIiJiYiIhMTAAABABT/uwIsAcAAJwAAASYnBgcHMQcxBgcGFxcx",
+    "BzEGFxY3NzEXMRY3NicnMTcxNicmJycxJwE9CRQTCkCQEwYGDmgZAg8QEoCBERAQAxhoDQUHE5BAAa4RAQERhBYDEhMOZ5ITDAsJ",
+    "REQJCwwTkmcOExIDFoQAAgAA/8ABwAHAABoAMAAANzI3MTE2NzY1NCcmJyYjIgcGBwYVFBcWFxYzBwYHMTEGBxQXFjMhMTI3NjUm",
+    "JyYnI+AjHR0SERESHR0jIx0dEhEREh0dIy5LMzICCQgNAYQNCAkCMjNLXMARER4eIiIeHhEREREeHiIiHh4RETACMjNLDQgJCQgN",
+    "SzMyAgABAAAAIAHAAWAAHgAAARYVMTEUBwExBiMiJycxJjU0NzYzMhcXMTcxNjMyFwG3CQn/AAoNDQqACQkKDQ0KaekKDQ0KAVcK",
+    "DQ0K/wAJCYAKDQ0KCQlq6gkJAAABACAAIAFgAWAAMQAAATY1MTE0JyYjIgcHMScxJiMiBwYVFBcXMQcxBhUUFxYzMjc3MRcxFjMy",
+    "NzY1NCcnMTcBVwkJCg0NCmlpCg0NCgkJamoJCQoNDQppaQoNDQoJCWpqASkKDQ0KCQlqagkJCg0NCmlpCg0NCgkJamoJCQoNDQpp",
+    "aQACABD/0AHwAcAAFQBMAAABNCcxMSYjIgcGFRUxFBcWMzI3NjU1BzY3MTE2JyYnJgcGBwYVFhcWFxYXNjc2NzY3NCcmJyYHBgcG",
+    "FxYXFhcWFQYHBgcmJyYnNDc2NwEgCQkODgkJCQkODgkJkAoBAQgJDQ0KKRcXASAgNjZDQzY2ICABFxgoCg0NCQgBAQoeERECMjFL",
+    "SzIxAhERHQGgDgkJCQkO4A4JCQkJDuBZCQ0NCgsBAQgiLzA4QzY2ICABASAgNjZDODAvIggBAQoLDQ0JGCMjKUsxMgICMjFLKSMj",
+    "GAAAAgAM/8AB9AHAAGAAbQAAARYHBzEWFRQHFzEWBwYHBzEGBwYnJzEGBwcxBgcGIyInJicnMSYnBzEGJyYnJzEmJyY3NzEmNTQ3",
+    "JzEmNzY3NzE2NzYXFzE2NzcxNjc2MzIXFhcXMRYXNzE2FxYXFzEWFwc2NzYnJicGBwYXFhcB8AQKLAICLAoEBwkFCgwKDjgUGAwE",
+    "DxQWFhUOBAwYFDgOCg0JBQkHBAosAgIsCgQHCQUJDQoOOBQYDAQPFBYWFQ4EDBgUOA4KDQoECQfwLRgWFhgtLRgWFhgtARkOCigM",
+    "DQ0MKAoOEhEIEA8LBBIQCToOAwQEAw46CRASBAsPEAgREQ8KJw0NDQwoCg4SEQgQDwsEEhAKOQ4DBAQDDjkKEBIECw8QCBESqQEn",
+    "KCgnAQEnKCgnAQACAAD/wAIAAcAAGgAuAAABFhcxMRYXFhUUBwYHBgcmJyYnJjU0NzY3NjcHFTUVFBcXMRY3NicnMTUxJicGBwEA",
+    "Rjo6JCIiJDo6RkY6OiQiIiQ6OkYYC2ATDgsSVQIWFgIBwAEhIjw9Q0M9PCIhAQEhIjw9Q0M9PCIhAXiIiIgNB0ALEhMOOXsWAgIW",
+    "AAIAEP/ZAfABpwA8AH8AADc2NzYzMhcXMSMxIgcGFRQXFjMzMTAxMDkCMjc2NTUxNCcmIyIHBhUVMScxJicmBwYHBgcGFxYXFjc2",
+    "NwcGBwYHFAcUFRUxFBcWMzI3NjU1MRcxMDEWFxY3Njc2NzYnJicmBwYHBgcGIyInMTEnMTMxMjc2NTQnJiMjMSIjBiNpDBoxQEAx",
+    "ESIOCQkJCQ5wDgkJCQkODgkJEiw5OTk5LCUQBAUGDA0MCwVCCAYGAgEJCQ4OCQkSLDk5OTksJRAEBQYMDQwLBQwaMUBAMREiDgkJ",
+    "CQkOcAICAwL1IhovLxEJCQ4OCQkJCQ5wDgkJCQkOIxEsDw4ODywlLg0MCwUEBQYMVgMGBggBAgMCcA4JCQkJDiMRLA8ODg8sJS4N",
+    "DAsFBAUGDCEbLy8RCQkODgkJAQAAAgAA/8ABwAHAAA8ANgAAExU1FTMxNTEmJyYnBgcGBwc1FTU2NzY3FhcWFxUxMzEWFxYXFTEG",
+    "BwYHITEmJyYnNTE2NzY3M5CgARYXIiIXFgFAAigpPT0pKAIQGxISAQESEhv+wBsSEgEBEhIbEAEwMDAwMCIXFgEBFhciMDAwMD0p",
+    "KAICKCk9MAESEhvAGxISAQESEhvAGxISAQAAAwAA/8AB+wG7ABEAIwBdAAABJiMxMSIHBzEXMTcxNjU0JycFBgcHMQYXFjc3MTY3",
+    "NzEnMQcnBgcxMQYHETEWFxYXITE2NzY3NTE0JyYjIgcGFRUxFAcGIyExIicmNRExNDc2MzMxMjc2NTQnJiMjAdgSFhYSHmIeERES",
+    "/tQJBB4ECgsOWQwJqGKoTCkbGwEBGxspAQApGxsBCQkODgkJCQkO/wAOCQkJCQ5gDgkJCQkOYAGqEREeYh4SFhYSEtwJDVgOCwoE",
+    "HgQJqGKosgEbGyn/ACkbGwEBGxspYA4JCQkJDmAOCQkJCQ4BAA4JCQkJDg4JCQAAAgAA/8ACAAHAABoAOwAABTY3MTE2NzY1NCcm",
+    "JyYnBgcGBwYVFBcWFxYXAzYXFzE3MTYXFgcHMRcxFgcGJycxBzEGJyY3NzEnMSY3AQBGOjokIiIkOjpGRjo6JCIiJDo6RlERES8v",
+    "EREODi8vDg4RES8vEREODi8vDg5AASEiPD1DQz08IiEBASEiPD1DQz08IiEBAVEODi8vDg4RES8vEREODi8vDg4RES8vEREAAgAA",
+    "/8ACAAHAABoALgAABTY3MTE2NzY1NCcmJyYnBgcGBwYVFBcWFxYXEwc3BwYnJzEmNzYXFzE3MTYXFgcBAEY6OiQiIiQ6OkZGOjok",
+    "IiIkOjpGcYCAgBERQA4OEREvbxERDg5AASEiPD1DQz08IiEBASEiPD1DQz08IiEBAS+AgIAODkAREQ4OL28ODhERAAADAAD/wAIA",
+    "AcAAGgA4AEsAAAU2NzExNjc2NTQnJicmJwYHBgcGFRQXFhcWFyczIzM1MSMxJic2NzMxFhcVMTMxFhcGByMxJic2NzcyFzExFhUU",
+    "BwYjIicmNTQ3NjMBAEY6OiQiIiQ6OkZGOjokIiIkOjpGKBgYGBgWAgIWMBYCCBYCAhZQFgICFigOCQkJCQ4OCQkJCQ5AASEiPD1D",
+    "Qz08IiEBASEiPD1DQz08IiEBsEACFhYCAhZYAhYWAgIWFgLQCQkODgkJCQkODgkJAAEAAAAAAcABgAApAAA3BhUxMRQXFzEWMzI3",
+    "NjU0JycxITEyNzY1NCcmIyExNzE2NTQnJiMiBwcJCQmgCg0NCgkJagEzDgkJCQkO/s1qCQkKDQ0KoNcKDQ0KoAkJCg0NCmkJCQ4O",
+    "CQlpCg0NCgkJoAAD//v/4AIFAaAAEgAfADIAAAEWFxMxFgcGByExJicmNxMxNjcVBgcVMRYXNjc1MSYnFzQnMTEmIyIHBhUUFxYz",
+    "Mjc2NQEAFwzYCgoMF/5QFwwKCtkMFhYCAhYWAgIWIAkJDg4JCQkJDg4JCQGgARP+kBQUEwEBExQUAXATAYACFnAWAgIWcBYC4A4J",
+    "CQkJDg4JCQkJDgAIAAD/wAHAAcAALgA/AFEAYwBzAIUAlQCnAAATMhcxMRYVFTEzMTUxNDc2MzIXFhUVMTMxFhcWFxUxITE1MTY3",
+    "NjczMTUxNDc2MwcpAhExBgcGByExJicmJxEXFTUVFhczMTY3NTEmJyMxBgczFTUVFhczMTY3NTEmJyMxBgc3BgcVMRYXMzE2NzUx",
+    "JicjBRU1FRYXMzE2NzUxJicjMQYHNwYHFTEWFzMxNjc1MSYnIxcVNRUWFzMxNjc1MSYnIzEGB4AOCQmACQkODgkJMBQODQH+QAEN",
+    "DhQwCQkOgAHA/kABwAENDhT+oBQODQFAAQ8gDwEBDyAPAYABDyAPAQEPIA8BkA8BAQ8gDwEBDyD+8AEPIA8BAQ8gDwGQDwEBDyAP",
+    "AQEPIHABDyAPAQEPIA8BAcAJCQ4gIA4JCQkJDiABDQ4UMDAUDg0BIA4JCcD+8BQODQEBDQ4UARBQICAgDwEBDyAPAQEPICAgDwEB",
+    "DyAPAQEPEAEPIA8BAQ8gDwGQICAgDwEBDyAPAQEPEAEPIA8BAQ8gDwEQICAgDwEBDyAPAQEPAAAG//n/8AIAAacAFAApAEAAVwBu",
+    "AHsAABMWBwcxBiMiJycxJjc2FxcxNzE2FxUWBwcxBiMiJycxJjc2FxcxNzE2Fzc0NzExNjMzMTIXFhUUBwYjIzEiJyY1FTQ3MTE2",
+    "MzMxMhcWFRQHBiMjMSInJjUHNDcxMTYzITEyFxYVFAcGIyExIicmNScWFxYHBgcmJyY3NjeYDw1IBwoLBygODhERFjcQEg8NSAcK",
+    "CwcoDg4RERY3EBJICQkO4A4JCQkJDuAOCQkJCQ7gDgkJCQkO4A4JCUAJCQ4BIA4JCQkJDv7gDgkJcBsPDAwPGxsPDAwPGwGaEBJQ",
+    "CAcoEREODhY9Dw2gEBJQCAcoEREODhY9Dw1mDgkJCQkODgkJCQkOoA4JCQkJDg4JCQkJDqAOCQkJCQ4OCQkJCQ4wARcYGBcBARcY",
+    "GBcBAAADAAD/4AHAAaAAGwA1AEIAABMGBzExBgcRMRYXFhchMTY3Njc1MTQnJzEmIyMVNDcxMTYzMzEyFxYVFTEUBwYjIzEiJyY1",
+    "NRcWFxYHBgcmJyY3NjdAGxISAQESEhsBQBsSEgETTRMa8wkJDsAOCQkJCQ7ADgkJoCQTEhITJCQTEhITJAGgARISG/7AGxISAQES",
+    "EhvzGhNNE2AOCQkJCQ5ADgkJCQkOQKABHyAgHwEBHyAgHwEAAAEAEP/ZAecBpwBGAAATMyMzMhcWFRQHBiMjMSInJjU1MTQ3NjMy",
+    "FxYVFTE3MTY3NhcWFxYXFgcGBwYHBicmJyY1NDc2MzIXFjMyNzY1NCcmIyIHB34yMjIOCQkJCQ6ADgkJCQkODgkJEiw5OTk5LCwP",
+    "Dg4PLCw5OTk5LAoKCQ0NCjFAQDEvLzFAQDERASAJCQ4OCQkJCQ6ADgkJCQkOMxEsDw4ODywsOTk5OSwsDw4ODywJDQ0KCQkvLzFA",
+    "QDEvLxEAAQAb/7kBpQHHABsAAAE2JyYHBTEGFxYXMzEHMQYXFjclMTYnJicjMTcBXQkTFRP/ABAHCRVwTQkTFRMBABAHCBZvTAGT",
+    "FxAND+APFBQBsxcQDQ/gDxQUAbMAAgAA/+ACgAGgACUAQQAAFyYnMTEmJzY3Njc0NTY3NjcWFxYXNjMWFxYXFAcWFxYXBgcGByE3",
+    "FycXFjc3MTYnJgcHMTUxJicGBxUxJzEmBwYXkD0pKAIBGhorAi0tRC0kJBYXHikbGwEGLB0cAQEkJTb+kE9QUFAREVAODhERJwIW",
+    "FgInEREODiACKCk9MCQkEAQERC0tAgEVFiQQARsbKRIRCSMiLzYlJAGnUFBQDg5QEREODieGFgICFoYnDg4REQACAAD/4AJAAaAA",
+    "HQAzAAATJjUxMTQ3NjMyFxcxFhUUBwcxBiMiJyY1NDc3MScTKQIyFxYVFAcGIyExIicmNTQ3NjMJCQkKDQ0KwAkJwAoNDQoJCaqq",
+    "9wEg/uABIA4JCQkJDv7gDgkJCQkOAWkKDQ0KCQnACg0NCsAJCQoNDQqpqf63CQkODgkJCQkODgkJAAABAAD/4AFAAaAAZwAANxQV",
+    "MTEwMRUxFBUjMSIHBhUUFxYzMzEWFxYXMzEyNzY1NCcmIyMxJicmJzMxMjc2NTQnJiMjMTQ1NTE0NTMxMjc2NTQnJiMjMTY3Njcz",
+    "MTI3NjU0JyYjIzEGBwYHIzEiBwYVFBcWMzMwEA4JCQkJDhwYNjZIGA4JCQkJDhgsIyMUfg4JCQkJDpCQDgkJCQkOfhQjIywYDgkJ",
+    "CQkOGEg2NhgcDgkJCQkOENAEBBAEBAkJDg4JCUAnKAEJCQ4OCQkBFRYkCQkODgkJBAQQBAQJCQ4OCQkkFhUBCQkODgkJASgnQAkJ",
+    "Dg4JCQAF//7/4AICAaUAEgAlAFAAYwB2AAATFgcxMQYHBicmJyY3Njc2FxYXBxYHMTEGBwYnJicmNzY3NhcWFwc2NzExNjcxMTYX",
+    "NhcWFxYXFhUVMRQHBiMiJycxJgcHMQYjIicmNTUxNDclJicxMSY3Njc2FxYXFgcGBwYnJyYnMTEmNzY3NhcWFxYHBgcGJ+MKCQoY",
+    "GRgYDAoJChgZGBgMfw4CAxMTFhYPDgMCExMWFg8fGyQjIiEWFiEiIyQbBQ4NFBERWBcXWBERFA0OBQFhEwMCDg8WFhMTAgMODxYW",
+    "E3AYCgkLCxgYGRgKCQoMGBgZAWMhGxwJBxARISEbHAkHERAhahkYFwwKCgkZGRgXDAoKCRnKRicmDxABARAPJidGDxABFA0OBBYG",
+    "BhYEDg0UARAPdgwXGBkZCQoKDBcYGRkJCgpdCRwbISEQEQcJHBshIREQBwAAAgAA/8ABwAHAACEAMgAAEwc3ByMxIgcGFRQXFjMh",
+    "MTI3NjU0JyYjIzEnMSYnIzEGBwUpAhMxFhcWMzMxMjc2NxOHBwcHYA4JCQkJDgGADgkJCQkOYAcJFHgUCQEZ/oABgP6AFQINDhP2",
+    "Ew4NAhUBrg4ODgkJDg4JCQkJDg4JCQ4RAQERbv6tEw0NDQ0TAVMAAwAA/8ACgAHAABoAMQBTAAATNDcxMTY3NjMyFxYXFhUUBwYH",
+    "BiMiJyYnJjUDNjcxMTY3MzEWFxYXFAcGIyExIicmNSU1FTUjMSYnNjczMTUxNjcWFxUxMzEWFwYHIzEVMQYHJidgEREeHiIiHh4R",
+    "ERERHh4iIh4eERFgAjIzS1xLMzICCQgN/nwNCAkB+EAWAgIWQAIWFgJAFgICFkACFhYCAUAjHR0SERESHR0jIx0dEhEREh0dI/6e",
+    "SzMyAgIyM0sNCAkJCA2qQEBAAhYWAkAWAgIWQAIWFgJAFgICFgADAAD/wAHAAcEAJgBeAGcAAAEmBzExBgcxMQYHFTEWFxYXMzEV",
+    "MRQXFjMyNzY1NTE1MTUxNCcmIwUmJyIHBzEGFRYXFhcVMRQXFjMyNzY1NTE2NzY3NCcnMSYjBgcVMQYHJicnMSYnBgcHMQYHJic1",
+    "FzkENTEVAaAKHh8bHAIBEhIbIAkJDg4JCQkJDv6gAQ0OBB4CARYXIgkJDg4JCSIXFgECHgQODQEBCQgCDAIODgIMAggJATABwAEP",
+    "DiYnR3AbEhIBgA4JCQkJDoBw0A4JCRANAw2ICQojGBkE4A4JCQkJDuAEGRgjCgmIDQMNhgkBAQiIDgEBDogIAQEJhpgBAQACABD/",
+    "2QHwAacALgBeAAATBgcGBwYnJicmNzY3Njc2FxYXNzE2FxYXFTEGByMxMDEwMSMxJicmNzcxJiMiBwc2NzM5AjMxFhcWBwcxFjMy",
+    "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",
+    "FhcxMRYXIzE1NwYHMTEGBzUxMwUVNRUjMTY3NjcnMyMzFTEmJyYnARpBQkFBPDw8OxIPDwEBGkFBQkE8PDw7Ew4PAQEgIhcWAQEW",
+    "FyIiFxYBARYXIuAbEhIBQEABEhIbQAGAQAESEhtAQEBAGxISAQFP/ssBNf7LHgwWCAgSEQkIDwQKCRMBNR4MFggIEhEICQ8ECQoT",
+    "7wEbGykpGxsBARsbKSkbGwEBEhIbQNAbEhIBQKBAQEAbEhIB0EABEhIbAAMAAP++AUIBxgAMAFYAbQAAEzY3NhcWFwYHBicmJwcG",
+    "IzExIhUHMQYHBzEGBwYnJicmNzcxNjc3MTYzMhcWFxcxFzEWFxYHBgcGJycxJicnMQcxFzEWFxcxFgcGBwYnJicnMScxJjc3BzcH",
+    "NxYXFzEHMQYHBzEGIyInJjU0NzegARcYGBcBARcYGBcBIQEBAQgaCQMEDAsNDQYFBAITMwgfIyIbGw4PFQwEBAUHDAwMGxAHCRQy",
+    "CAMXAwcGDQ4LCgQWRxYIEDkZGRkDBCgOBAc9Cg0NCgkJPAGQGw8MDA8bGw8MDA8blwEBAwwaCA0FBgQEDAsNCDUYAw4SEx8lCgcM",
+    "DAwMBAQFDggQF0E2CQxcDQsLBAMHBg1YThohQMc+Pj4EBC0kCQc+CQkKDQ0KOwAFAAD/wAGAAcAAHQAkADEAPgCrAAATBgcxMQYH",
+    "ETEWFxYXITE2NzY3ETEjMSInJjU1MSMzFTUVMzEnBzY3MzEWFwYHIzEmJxU2NzMxFhcGByMxJicXFhcVMRYXFgcGJyYjIgcGFQYX",
+    "FhcxMTAxMDEwMTAxMDEWFxYXBgcGBxUxBgcmJzUxJicwMTAxMDEmJyY3NhcWFzAxMDEwMTAxMDEwMTAxMhUWFzI3NjU0JyYnJzEw",
+    "MTAxJicmJzY3Njc1MTY3QBsSEgEBEhIbAQAbEhIBgA4JCaDAgIDAAQ9ADwEBD0APAQEPQA8BAQ9ADwGADwENCw4DBQ4RDw4KCAEI",
+    "CxMSEhUCARYMDQEPDwERDgMDDgQGDgQDARMQDwkICAoTARIRFAMCFgsNAQ8BwAESEhv+gBsSEgEBEhIbASAJCQ6AgICAgFAPAQEP",
+    "DwEBD0APAQEPDwEBD0gBDxECAwUPDgMFBgQIBQUGBQUKCxsdDQcCEQ8BAQ8SAwYBAQYODQMBAQEHAQUFCQcFBgUBBAkLGx0LBwIR",
+    "DwEAAwAA/8ACAAHAAD4AWAByAAABBgcxMQYHFTEGByYnNTE2NzY3NjcWFxYXFhcVMQYHBgcjMQYHIzEmJyYnNjc2NzMxFhczMTI3",
+    "NjU1MSYnJicHMyMzMhcWFRUxFAcGIyMxJicmJzUxNjc2NzMWFzExFhcVMQYHBgcjMSInJjU1MTQ3NjMzAQBYOzsCAhYWAgEiIjo5",
+    "SEg5OiIiAQEZGSVuDhwgFA4NAQENDhQgHA5uEQsMAjs7WHAQEBAOCQkJCQ4QGxISAQESEhvgGxISAQESEhsQDgkJCQkOEAGQAjs7",
+    "WCgWAgIWKEg5OiIiAQEiIjo5SJAlGRkBFwEBDQ4UFA4NAQEXDAsRkFg7OwKgCQkOcA4JCQESEhswGxISAQESEhswGxISAQkJDnAO",
+    "CQkAAQAAACACQAFgAEYAABMWFzExFjMzMTI3Njc2NzYzFhcWFwYHBhUUFxYXBgcGByInJicmJyYjIzEiBwYHBgcGIyYnJic2NzY1",
+    "NCcmJzY3NjcyFxYXmgUKCg3ADQoKBQoTFBkiFxYBAigGBigCARYXIhkUEwoFCgoNwA0KCgUKExQZIhcWAQIoBgYoAgEWFyIZFBMK",
+    "AS8MCgkJCgwWDQ4BFhciMBYEBgYEFjAiFxYBDg0WDAoJCQoMFg0OARYXIjAWBAYGBBYwIhcWAQ4NFgAD//7/wAJAAcAAHgBTAFwA",
+    "AAE3Bzc2NzIXFzEzMTIXFzEzMRYXFTEGBwYHIyMHMScXFTUVFAcGIyMxIicmNTUxBiMiJxUxFAcGIyMxIicmNTUxJicnMSY3Njc2",
+    "FxYXFzEWFzMzFzcmJwYHFhc2NwE2FxcXBBMMBxE0FA4SOBYCARYXIiAlBXBqCQkOIA4JCSQsLCQJCQ4gDgkJLQ4EAwcGDQ4LCgQE",
+    "BxgesHAwAQ8PAQEPDwEBIYuLixMBChYOEgIWGCIXFgEfQGHg4OAOCQkJCQ5zExNzDgkJCQkO5hIxDw0LCwQDBwYNEBcBQLAPAQEP",
+    "DwEBDwABAAD/wAH+AcAAQwAANxQHBzEGIwYnJiMGBwYHFhcWFxYXFhcWFzY3Njc0JyY3NDc3MTYzMzEyNzY3NicmNTY3NjcyFxY3",
+    "NicmJyYnBgcGBxWgCRsKDQ4NBggZEREBARERGQsBARERGRkREQECAwEJGwoNWQkKCQIDBA0BIB8wDAsJBwcBDC8wQksxMgK3DQob",
+    "CQEDAgERERkZEREBAQsZEREBARERGQcHDg0NChsJAQIICAgYHTAfIAECAgUFCT8oKQECMjFLWQAABQAg/8ABoAHAABAAIAA2AEwA",
+    "kAAAEzIXMTEWFRUxIzE1MTQ3NjMHNDcxMTYzMhcWFRUxIzE1MzQ3MTE2MzIXFhUVMRQHBiMiJyY1NRc0NzExNjMyFxYVFTEUBwYj",
+    "IicmNTUHNRU1FjMyNxYXFjMyNxUxFAcGBxUxFAcGIyMxIicmNTUxJicnMSYnNTE2NzY3MzEyFxYVFAcGIyMxBgcWFzMxNjc2N8AO",
+    "CQlACQkOgAkJDg4JCUDACQkODgkJCQkODgkJYAkJDg4JCQkJDg4JCWAOEhQQBhEQFRIOEREeCQkOoA4JCRoVCyUBARISG1gRCwwM",
+    "CxE4DwEBDzgfFBQBAcAJCQ5wcA4JCUAOCQkJCQ5QUA4JCQkJDmAOCQkJCQ5gQA4JCQkJDkAOCQkJCQ5AWAEBAQkLEwwMCQkoISEW",
+    "YA4JCQkJDk4MFQsmNRsbEhIBDAsREQsMAQ8PAQEUFB8AAAMAAP/AAgABwAAQADwAkAAAASMzIycxJjc2NzMxFhcWDwIzIzMWFzAx",
+    "FhcWFxYXBgcGByExJicmJzY3Njc2NzAxMDEwMTAxMDE2NzY3FyYnBgcVMQYHBgcWFxYXFzEWFxYHFAcGIyYnJicmBwYXFhcwMTAx",
+    "MDEwMRYXFTEWFzY3NTE2NzY3JicmJzAxMDkCJicmNyY3NjMyFxY3NicmJzUBQICAgC8FBAQKxAoEBAUvgICAgAYHHiopICACARsb",
+    "Kf7AKRsbAQIgICkqHgIDBARUAhISAgwKGAIDFhIRAhMJBwEGCA0QEwQEEgcEEQMDDBACEhICDAsXAgMWEhMTCgYBAQcJDQ4REgYD",
+    "EQoLAWBHCQgHAQEHCAlHIAQEEiIjNzhSKRsbAQEbGylSODcjIhIBAgIDWBICAhIOAgcMHx4LCgQBBQUFBAcDBQEIAQEEEBIIAQEF",
+    "Aw8SAgISDgIHDSAeDAoFBQUFAgUEBQUDERIHAgIOAAUAAP/AAYABwAAGAA0AFAAbADUAADc3BzcnMREXMyMzJzEHNxcnFxExBzcj",
+    "MyMXMTclNjcxMTY3ITEWFxYXETEGBwYHITEmJyYnEUBaWlpaJ7Ozs1pZgFlZWVkzs7OzWVr+5gENDhQBIBQODQEBDQ4U/uAUDg0B",
+    "OoaGhob+9DqGhsCGhoYBDIbAhoYQFA4NAQENDhT+YBQODQEBDQ4UAaAAAAIAAP/IAfABuAAcAFsAABMGBzExBgcxMQYHFhcWFxYX",
+    "Njc2NzY3JicmJyYnFwYHMTEGBzExBgcGJyInJicmJyYnJjc2NzY3Njc2NzY3NicmBwYHBiciJyYnJiMmNTY3Njc2NzYzMhcWFxQV",
+    "+EU4OCEhAQEhITg4RUU4OCEhAQEhITg4RXMCBQUGBgQGCxAPBAQRDAwPDwMCCgMDAQoQExQCAQIDAgRlDwwHCwsJAwMVARFtJDIS",
+    "EwUFBQMBAbgBISE4OEVFODghIQEBISE4OEVFODghIQGpFCIhIiIXGgEMAwMLCQgJCwcICAMDAggPExIFAQMCAQFFCgEDAgQBBQoH",
+    "By8PFQYHAwMEBQUAAAQACP/IAfgBuAAcAG8AggCVAAAlBgcxMQYHMTEGByYnJicmJzY3Njc2NxYXFhcWFyc2JzExJic3MScxBzEm",
+    "JzcxJzEHMSYnMTEnMQcxMhcWMxYHBzEWMzAjIicHMQYnIicmJwcxFzEWFxYXBzEXMTcxFhcHMRcxNzEWNzY3NicmJzY3BwYnMTEm",
+    "JzExJiM3MRYzFhcWBzcGJzExJicxMSYnNzEWMxYXFgcB+AEhITg4RUU4OCEhAQEhITg4RUU4OCEhAY4DDxAaCxsLCwsLGwsJCSUH",
+    "AQkIAQ8CDQECAQEBEgELAQkJAQ0jBgYEAwsbDAoLCxsMIxkYDAgHCBIcBj4IGhoSAwMPAwQUFxcECQcWFg8DAg4CAxETEwPARTg4",
+    "ISEBASEhODhFRTg4ISEBASEhODhFIxkPDgktBisDAiwHLQICCR0CAgYKMwEBSAcBAgIBHwkCAQEBLQcsAgMtBi0IBwceGRAQCQUj",
+    "VxYCAgYBPAEECgsXWBQBAQUBATYBAwkJFQADABT/4AJzAaAASABbAG4AAAEmMSYnIgcGByYHJicmIwYHMAcGBwYXFhUWFzI3Njcw",
+    "NTQjJicmNTQzNjc2MxYzMjcyFRYXMBUUBwYHIgcUMxYXFDM2NzQ1NicBJicxMSY1NDc2NxYXFhUUBwYHMyYnMTEmJzY3NjcWFxYX",
+    "BgcGBwINATo+AQEIB0NDBwgBAT46ATgUEwgBQ1ABARENARgWAQEFBAEBSUtMSAEFBQEWFwEBAQ0RAk9EEGb+0RYPDw8PFhcPDw8P",
+    "F8QWDw8BAQ4PFxcPDgEBDw4XAXoBGgsBDxALCxAPAQsaAVVUU1IBATEZARcaAQEJDQEBAQQDASEhAQMEAQEBDQkBARoXARkxAQG9",
+    "kf70ARERGRkREAEBERAZGRERAQERERkZERABAREQGRkREQEAAAAAAAAABgAA",
 })
 
 -- UTF-8 байты нужных иконок (кодовые точки Private Use Area
@@ -2516,6 +2636,22 @@ PCS_IC = {
     undo = "\239\131\162", -- fa-arrow-rotate-left
     sack = "\239\160\157", -- fa-sack-dollar
     fist = "\239\155\158", -- fa-hand-fist
+    coins = "\239\148\158", -- fa-coins
+    bitcoin = "\239\141\185", -- fa-bitcoin
+    euro = "\239\133\147", -- fa-euro-sign
+    money = "\239\148\186", -- fa-money-bill-wave
+    gem = "\239\142\165", -- fa-gem
+    lock = "\239\128\163", -- fa-lock
+    unlock = "\239\143\129", -- fa-lock-open
+    edit = "\239\129\132", -- fa-pen-to-square
+}
+-- ── валюты: иконка (ключ PCS_IC), цвет иконки, ключ курса в cfg и буфер ввода ──
+PCS_CUR = {
+    { id = "az",  name = "AZ-Coins", key = "rateAZ",  buf = "rateAZBuf",  ic = "coins",   col = { 0.98, 0.80, 0.25 } },
+    { id = "btc", name = "BTC",      key = "rateBTC", buf = "rateBTCBuf", ic = "bitcoin", col = { 0.97, 0.58, 0.10 } },
+    { id = "eur", name = nil,        key = "rateEUR", buf = "rateEURBuf", ic = "euro",    col = { 0.35, 0.62, 0.95 } },
+    { id = "vc",  name = "VC$",      key = "rateVC",  buf = "rateVCBuf",  ic = "money",   col = { 0.30, 0.85, 0.50 } },
+    { id = "asc", name = "ASC",      key = "rateASC", buf = "rateASCBuf", ic = "gem",     col = { 0.70, 0.55, 0.95 } },
 }
 
 -- простой чистый Lua base64-декодер (без внешних зависимостей —
@@ -2697,6 +2833,7 @@ local cfg = {
     hideNativeStats = true,
     -- vkladka "Finansy": dvuhkolonochnyy rezhim (nalichnye/bank/depozit/scheta slева, valyuty справа)
     financeTwoCol = true,
+    chatStickers = true, -- стикеры (:man:/:buy:) в начале сообщений скрипта в чате
     -- serializovannye kastomnye cveta otdelnyh tekstov/cifr (id=r,g,b;id=r,g,b;...)
     customColorsStr = "",
     -- vkladka "Finansy": kakie kategorii uchityvat v obschem itoge "Vsego virtov"
@@ -2868,6 +3005,7 @@ local function applyCfgData(m)
     -- тумблер убран из интерфейса — родное окно /stats теперь скрывается всегда
     cfg.hideNativeStats = true
     cfg.financeTwoCol   = toBool(m.financeTwoCol, true)
+    cfg.chatStickers    = toBool(m.chatStickers, true)
     -- ── тумблеры категорий "Всего вирты": по умолчанию ВСЕ включены ──
     cfg.incCash = toBool(m.incCash, true)
     cfg.incBank = toBool(m.incBank, true)
@@ -2993,6 +3131,7 @@ local function saveCfg()
             vcAutoDetectServer = tostring(cfg.vcAutoDetectServer),
             hideNativeStats = tostring(cfg.hideNativeStats),
             financeTwoCol   = tostring(cfg.financeTwoCol),
+            chatStickers    = tostring(cfg.chatStickers),
             incCash = tostring(cfg.incCash), incBank = tostring(cfg.incBank),
             incDep  = tostring(cfg.incDep),  incAcc  = tostring(cfg.incAcc),
             incAZ   = tostring(cfg.incAZ),   incBTC  = tostring(cfg.incBTC),
@@ -3068,6 +3207,8 @@ end
 -- (FF4444/FF6666/FFAA00) сознательно НЕ трогаем, чтобы ошибка всегда
 -- оставалась заметной, даже если выбран, например, зелёный или синий ──
 local _CHAT_COLOR_PROTECTED_HEX = { ["FF4444"]=true, ["FF6666"]=true, ["FFAA00"]=true }
+function PCS_stickersEnabled() return cfg.chatStickers ~= false end
+
 function applyCustomChatColor(text)
     if type(text) ~= "string" then return text end
     if not cfg.chatR or cfg.chatR < 0 then return text end
@@ -4498,7 +4639,7 @@ local function applyGlobalNumColor(col)
     return col
 end
 
-local function dataRow(label, value, valColor)
+local function dataRow(label, value, valColor, icon, iconCol)
     if not hasVal(value) then return end
     local r,g,b = getAcc()
     local rr,rg,rb = getRowBgColor()
@@ -4543,10 +4684,16 @@ local function dataRow(label, value, valColor)
     autoValCol = getElemColor(valId, autoValCol)
     imgui.SetCursorPosY(imgui.GetCursorPosY()+S(6))
     imgui.SetCursorPosX(imgui.GetCursorPosX()+S(10))
+    local iconW = 0
+    if icon then
+        imgui.TextColored(iconCol and iv4(iconCol[1], iconCol[2], iconCol[3], 1.0) or labelCol, icon)
+        iconW = imgui.CalcTextSize(icon).x + S(6)
+        imgui.SameLine(0, S(6))
+    end
     imgui.TextColored(labelCol, label)
     recolorOnClick(lblId)
     local valStr  = u8(tostring(vOrDash(value) or '-'))
-    local labelW  = imgui.CalcTextSize(label).x
+    local labelW  = imgui.CalcTextSize(label).x + iconW
     local valW    = imgui.CalcTextSize(valStr).x
     -- avtoumenshenie shrifta znacheniya, esli ono ne pomeshchaetsya v stroku
     -- (posle ispravleniya toNum summy mogut byt ochen bolshimi -- millirdy/trilliony)
@@ -4739,7 +4886,7 @@ local SECTION_DEFS = {
       } },
     { label = ICON_TAX.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8",             icon=ICON_TAX, name=u8"\xcd\xe0\xeb\xee\xe3\xe8",             r=1.0,g=0.65,b=0.15,
       tabs = {
-        { tab=6, label = u8"\xcd\xe0\xeb\xee\xe3\xe8" },
+        { tab=6, label = ICON_TAX.." "..u8"\xcd\xe0\xeb\xee\xe3\xe8" },
       } },
     { label = ICON_GEAR.." "..u8"\xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8", icon=ICON_GEAR, name=u8"\xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8", r=0.75,g=0.75,b=0.80,
       -- по просьбе "Уведомления" больше не отдельная под-вкладка —
@@ -6689,17 +6836,6 @@ function drawFinanceSettingsPanelContent(r, g, b)
     -- parsePhoneRatesText), показываются всегда, без отдельной кнопки-
     -- переключателя ──
     do
-        local pr1,pg1,pb1 = getAcc()
-        imgui.PushStyleColor(imgui.Col.Button,        iv4(pr1*0.20,pg1*0.20,pb1*0.20,1.0))
-        imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(pr1*0.34,pg1*0.34,pb1*0.34,1.0))
-        imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(pr1*0.48,pg1*0.48,pb1*0.48,1.0))
-        do local _pbm = prettyBtnPush(9.0)
-        if imgui.Button(u8"\x20\x20\xc2\xe2\xe5\xf1\xf2\xe8\x20\xea\xf3\xf0\xf1\x20\xe2\xf0\xf3\xf7\xed\xf3\xfe\x20\x20##openManualRates", imgui.ImVec2(imgui.GetContentRegionAvail().x, S(32))) then
-            imgui.OpenPopup("##manualRatesPopup")
-        end
-        prettyBtnPop(_pbm) end
-        imgui.PopStyleColor(3)
-
         if St._cefLastResult ~= "" or St._phoneBuy or St._phoneSell then
             imgui.Spacing()
             if St._cefLastResult ~= "" then
@@ -6720,48 +6856,8 @@ function drawFinanceSettingsPanelContent(r, g, b)
             end
         end
 
-        pcall(imgui.SetNextWindowSize, imgui.ImVec2(S(280), 0), imgui.Cond and imgui.Cond.Appearing or 0)
-        local _mps1 = pushModernPopupStyle()
-        -- ФИКС: BeginPopup/EndPopup теперь под pcall (тот же класс защиты,
-        -- что и у остальных попапов) — раньше здесь не было вообще никакой
-        -- защиты, и любая ошибка внутри (например, в rateInputRow) ломала
-        -- стек imgui так же, как раньше это делала оплата налогов.
-        local began1 = false
-        local ok1, err1 = pcall(function()
-        if imgui.BeginPopup("##manualRatesPopup") then
-            began1 = true
-            imgui.TextColored(thDim(), u8"\xca\xf3\xf0\xf1\x20\xe2\xe0\xeb\xfe\xf2\x20\xe2\xf0\xf3\xf7\xed\xf3\xfe\x3a")
-            imgui.Spacing()
-            imgui.Separator()
-            imgui.Spacing()
-            imgui.PushItemWidth(S(220))
-            rateInputRow("az",  "AZ-Coins", St.rateAZBuf,  "rateAZ")
-            rateInputRow("btc", "BTC",      St.rateBTCBuf, "rateBTC")
-            rateInputRow("eur", CUR_AARP_SHORT, St.rateEURBuf, "rateEUR")
-            rateInputRow("vc",  "VC$",       St.rateVCBuf,  "rateVC")
-            rateInputRow("asc", u8"\xca\xf3\xf0\xf1 ASC", St.rateASCBuf, "rateASC")
-            imgui.PopItemWidth()
-            imgui.Spacing()
-            do
-                local pr2,pg2,pb2 = getAcc()
-                imgui.PushStyleColor(imgui.Col.Button,        iv4(pr2*0.22,pg2*0.22,pb2*0.22,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(pr2*0.40,pg2*0.40,pb2*0.40,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(pr2*0.58,pg2*0.58,pb2*0.58,1.0))
-                do local _pbd = prettyBtnPush(8.0)
-                if imgui.Button(u8"\xc3\xee\xf2\xee\xe2\xee##closeManualRates", imgui.ImVec2(imgui.GetContentRegionAvail().x, S(30))) then
-                    imgui.CloseCurrentPopup()
-                end
-                prettyBtnPop(_pbd) end
-                imgui.PopStyleColor(3)
-            end
-        end
-        end) -- конец pcall
-        if began1 then pcall(imgui.EndPopup) end
-        popModernPopupStyle(_mps1)
-        if not ok1 then
-            pcall(sampAddChatMessage, "{FF6666}[PC Stats] " ..
-                "\xee\xf8\xe8\xe1\xea\xe0\x20\xef\xee\xef\xe0\xef\xe0\x20\xea\xf3\xf0\xf1\xee\xe2: " .. tostring(err1), -1)
-        end
+        imgui.Spacing()
+        imgui.TextColored(thDim(), "  " .. u8"\xca\xf3\xf0\xf1 \xe2\xf0\xf3\xf7\xed\xf3\xfe \x97 \xed\xe0 \xe2\xea\xeb\xe0\xe4\xea\xe5 \xab\xd4\xe8\xed\xe0\xed\xf1\xfb\xbb, \xe1\xeb\xee\xea \xab\xca\xf3\xf0\xf1\xfb \xe2\xe0\xeb\xfe\xf2\xbb")
     end
     imgui.Dummy(imgui.ImVec2(0, S(4)))
 
@@ -7310,6 +7406,73 @@ end
 
 -- ФИКС (п.7): тот же паттерн — drawTotalInner под pcall, EndChild/
 -- PopStyleColor гарантированы
+-- ============================================================
+--  КУРСЫ ВАЛЮТ на вкладке "Финансы" (перенесено из панели "Настройки"):
+--  значения показаны текстом с иконками валют и защищены от случайных
+--  правок; поля ввода появляются только после нажатия "Изменить курс
+--  вручную", а кнопка "Готово" снова закрепляет курсы.
+-- ============================================================
+function PCS_drawRatesCard()
+    local r, g, b = getAcc()
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local unlocked = St._ratesUnlocked == true
+
+    secTitle(PCS_IC.coins .. "  " .. u8"\xca\xf3\xf0\xf1\xfb \xe2\xe0\xeb\xfe\xf2")
+
+    local lbl, col
+    if unlocked then
+        lbl = PCS_IC.lock .. "  " .. u8"\xc3\xee\xf2\xee\xe2\xee \x97 \xe7\xe0\xea\xf0\xe5\xef\xe8\xf2\xfc \xea\xf3\xf0\xf1\xfb"
+        col = { 0.30, 0.90, 0.50 }
+    else
+        lbl = PCS_IC.edit .. "  " .. u8"\xc8\xe7\xec\xe5\xed\xe8\xf2\xfc \xea\xf3\xf0\xf1 \xe2\xf0\xf3\xf7\xed\xf3\xfe"
+        col = { r, g, b }
+    end
+    if PCS_gdButton(lbl .. "##ratesLockBtn", imgui.GetContentRegionAvail().x, S(32), col, 9.0) then
+        St._ratesUnlocked = not unlocked
+        unlocked = St._ratesUnlocked
+        if not unlocked then
+            for id in pairs(_rateActive) do _rateActive[id] = false end
+            saveCfg()
+        end
+    end
+    imgui.Dummy(V2(0, S(4)))
+
+    if not unlocked then
+        local dl = imgui.GetWindowDrawList()
+        local rr, rg, rb = getRowBgColor()
+        for i, c in ipairs(PCS_CUR) do
+            local p  = imgui.GetCursorScreenPos()
+            local aw = imgui.GetContentRegionAvail().x
+            local h  = S(36)
+            local shade = (i % 2 == 0) and 0.13 or 0.07
+            local minV  = (i % 2 == 0) and 0.10 or 0.05
+            dl:AddRectFilled(p, V2(p.x + aw, p.y + h),
+                U32(iv4(math.max(rr*shade, minV), math.max(rg*shade, minV), math.max(rb*shade, minV), 0.98)), 5)
+            dl:AddRect(p, V2(p.x + aw, p.y + h), U32(iv4(r*0.45, g*0.45, b*0.45, 0.40)), 5, 0, 0.7)
+            dl:AddRectFilled(V2(p.x, p.y + 3), V2(p.x + 2, p.y + h - 3),
+                U32(iv4(c.col[1], c.col[2], c.col[3], 0.95)), 1)
+            imgui.SetCursorScreenPos(V2(p.x + S(10), p.y + S(8)))
+            imgui.TextColored(iv4(c.col[1], c.col[2], c.col[3], 1.0), PCS_IC[c.ic])
+            imgui.SameLine(0, S(8))
+            imgui.TextColored(iv4(0.95, 0.95, 0.98, 1.0), c.name or CUR_AARP_SHORT)
+            local val = fmtMoney(string.format("%.0f", cfg[c.key] or 0))
+            local vw = imgui.CalcTextSize(val).x
+            imgui.SetCursorScreenPos(V2(p.x + aw - vw - S(12), p.y + S(8)))
+            imgui.TextColored(thGold(), val)
+            imgui.SetCursorScreenPos(V2(p.x, p.y + h + S(2)))
+            imgui.Dummy(V2(aw, S(2)))
+        end
+        imgui.TextColored(thDim(), "  " .. PCS_IC.lock .. "  " .. u8"\xea\xf3\xf0\xf1\xfb \xe7\xe0\xf9\xe8\xf9\xe5\xed\xfb \xee\xf2 \xf1\xeb\xf3\xf7\xe0\xe9\xed\xfb\xf5 \xe8\xe7\xec\xe5\xed\xe5\xed\xe8\xe9")
+    else
+        imgui.PushItemWidth(-1)
+        for _, c in ipairs(PCS_CUR) do
+            rateInputRow(c.id, PCS_IC[c.ic] .. "  " .. (c.name or CUR_AARP_SHORT), St[c.buf], c.key)
+        end
+        imgui.PopItemWidth()
+    end
+    imgui.Dummy(V2(0, S(6)))
+end
+
 function drawTotalInner(s, h)
     if St._resetCharScroll then imgui.SetScrollY(0) end
         local r,g,b = getAcc()
@@ -7474,19 +7637,19 @@ function drawTotalInner(s, h)
             _rowIndex = 0
             secTitle(u8"\xc2\xe0\xeb\xfe\xf2\xfb")
             if az > 0 then
-                dataRow("AZ-Coins", fmtAmt(az).." AZ  -  "..fmtMoney(string.format("%.0f", azSA)), thGold())
+                dataRow("AZ-Coins", fmtAmt(az).." AZ  -  "..fmtMoney(string.format("%.0f", azSA)), thGold(), PCS_IC.coins, PCS_CUR[1].col)
             end
             if btc > 0 then
-                dataRow("BTC", fmtAmt(btc).." BTC  -  "..fmtMoney(string.format("%.0f", btcSA)), thGold())
+                dataRow("BTC", fmtAmt(btc).." BTC  -  "..fmtMoney(string.format("%.0f", btcSA)), thGold(), PCS_IC.bitcoin, PCS_CUR[2].col)
             end
             if eur > 0 then
-                dataRow(CUR_AARP_SHORT, fmtAmt(eur).." AARRP  -  "..fmtMoney(string.format("%.0f", eurSA)), thGold())
+                dataRow(CUR_AARP_SHORT, fmtAmt(eur).." AARRP  -  "..fmtMoney(string.format("%.0f", eurSA)), thGold(), PCS_IC.euro, PCS_CUR[3].col)
             end
             if vc > 0 then
-                dataRow("VC$", fmtAmt(vc).." VC$  -  "..fmtMoney(string.format("%.0f", vcSA)), thGold())
+                dataRow("VC$", fmtAmt(vc).." VC$  -  "..fmtMoney(string.format("%.0f", vcSA)), thGold(), PCS_IC.money, PCS_CUR[4].col)
             end
             if asc > 0 then
-                dataRow("ASC", fmtAmt(asc).." ASC  -  "..fmtMoney(string.format("%.0f", ascSA)), thGold())
+                dataRow("ASC", fmtAmt(asc).." ASC  -  "..fmtMoney(string.format("%.0f", ascSA)), thGold(), PCS_IC.gem, PCS_CUR[5].col)
             end
             if az<=0 and btc<=0 and eur<=0 and vc<=0 and asc<=0 then
                 imgui.Spacing()
@@ -7510,19 +7673,19 @@ function drawTotalInner(s, h)
         _rowIndex = 0
         secTitle(u8"\xc2\xe0\xeb\xfe\xf2\xfb")
         if az > 0 then
-            dataRow("AZ-Coins", fmtAmt(az).." AZ  -  "..fmtMoney(string.format("%.0f", azSA)), thGold())
+            dataRow("AZ-Coins", fmtAmt(az).." AZ  -  "..fmtMoney(string.format("%.0f", azSA)), thGold(), PCS_IC.coins, PCS_CUR[1].col)
         end
         if btc > 0 then
-            dataRow("BTC", fmtAmt(btc).." BTC  -  "..fmtMoney(string.format("%.0f", btcSA)), thGold())
+            dataRow("BTC", fmtAmt(btc).." BTC  -  "..fmtMoney(string.format("%.0f", btcSA)), thGold(), PCS_IC.bitcoin, PCS_CUR[2].col)
         end
         if eur > 0 then
-            dataRow(CUR_AARP_SHORT, fmtAmt(eur).." AARRP  -  "..fmtMoney(string.format("%.0f", eurSA)), thGold())
+            dataRow(CUR_AARP_SHORT, fmtAmt(eur).." AARRP  -  "..fmtMoney(string.format("%.0f", eurSA)), thGold(), PCS_IC.euro, PCS_CUR[3].col)
         end
         if vc > 0 then
-            dataRow("VC$", fmtAmt(vc).." VC$  -  "..fmtMoney(string.format("%.0f", vcSA)), thGold())
+            dataRow("VC$", fmtAmt(vc).." VC$  -  "..fmtMoney(string.format("%.0f", vcSA)), thGold(), PCS_IC.money, PCS_CUR[4].col)
         end
         if asc > 0 then
-            dataRow("ASC", fmtAmt(asc).." ASC  -  "..fmtMoney(string.format("%.0f", ascSA)), thGold())
+            dataRow("ASC", fmtAmt(asc).." ASC  -  "..fmtMoney(string.format("%.0f", ascSA)), thGold(), PCS_IC.gem, PCS_CUR[5].col)
         end
         if az<=0 and btc<=0 and eur<=0 and vc<=0 and asc<=0 then
             imgui.Spacing()
@@ -7533,6 +7696,10 @@ function drawTotalInner(s, h)
 
         -- ── "Доход по PayDay": зарплата/депозит/аксы/AZ, распознанные из
         -- чата (см. PD.drawIncomeSection выше) ──
+        -- ── курсы валют (перенесено из "Настроек"): значения защищены от
+        -- случайных правок, ввод открывается кнопкой "Изменить курс вручную" ──
+        PCS_GUARD.call(PCS_drawRatesCard)
+
         PD.drawIncomeSection()
 
     -- ── нижний отступ, чтобы последний блок не прилипал к краю окна ──
@@ -8248,6 +8415,13 @@ function drawSettingsInner(h, sw, sh)
     mmtColorRow(u8"\xc6\xe2\xe5\xf2 \xf4\xee\xed\xe0", "winBgR", "winBgG", "winBgB", 0.0, 0.0, 0.0, "bg")
     mmtColorRow(u8"\xc0\xea\xf6\xe5\xed\xf2", "outlineR", "outlineG", "outlineB", ar, ag, ab, "acc")
     mmtColorRow(u8"\xcf\xf0\xe5\xf4\xe8\xea\xf1 \xf1\xea\xf0\xe8\xef\xf2\xe0 \xe2 \xf7\xe0\xf2\xe5", "chatR", "chatG", "chatB", 0.0, 1.0, 0.53, "chat")
+    imgui.Spacing()
+    if drawToggleSwitch("##chatStickersSw", cfg.chatStickers ~= false) then
+        cfg.chatStickers = not (cfg.chatStickers ~= false)
+        saveCfg()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xd1\xf2\xe8\xea\xe5\xf0\xfb \xe2 \xf1\xee\xee\xe1\xf9\xe5\xed\xe8\xff\xf5 \xf7\xe0\xf2\xe0")
 
     imgui.Spacing()
     imgui.TextColored(thDim(), u8"\xd1\xec\xfb\xf1\xeb\xee\xe2\xfb\xe5 \xf6\xe2\xe5\xf2\xe0:")
@@ -9693,7 +9867,7 @@ function drawTaxesInner(h)
         dl_sp:AddRect(p_sp, imgui.ImVec2(p_sp.x+aw_sp, p_sp.y+cardH_sp),
             imgui.ColorConvertFloat4ToU32(iv4(r,g,b,0.55)), 10, 0, 1.3)
         imgui.SetCursorScreenPos(imgui.ImVec2(p_sp.x + S(12), p_sp.y + S(9)))
-        imgui.TextColored(thAcc(), u8"\xd1\xe2\xee\xff\x20\xee\xef\xeb\xe0\xf2\xe0")
+        imgui.TextColored(thAcc(), PCS_IC.taxes .. "  " .. u8"\xd1\xe2\xee\xff\x20\xee\xef\xeb\xe0\xf2\xe0")
         imgui.SetCursorScreenPos(imgui.ImVec2(p_sp.x + S(12), p_sp.y + S(28)))
         imgui.TextColored(iv4(1,1,1,1), fmtTaxTime(cfg.taxLastPayTime)..fmtTaxAgo(cfg.taxLastPayTime))
         if hasAmt then
@@ -9736,7 +9910,7 @@ function drawTaxesInner(h)
     imgui.PushStyleColor(imgui.Col.Button,        iv4(r*0.55,g*0.55,b*0.55,1.0))
     imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r*0.78,g*0.78,b*0.78,1.0))
     imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r,g,b,1.0))
-    if imgui.Button(PCS_IC.handdollar .. u8"  \xce\xef\xeb\xe0\xf2\xe8\xf2\xfc\x20\xed\xe0\xeb\xee\xe3\xe8\x20\xf1\xe5\xe9\xf7\xe0\xf1  ", imgui.ImVec2(-1, S(38))) then
+    if imgui.Button(PCS_IC.taxes .. u8"  \xce\xef\xeb\xe0\xf2\xe8\xf2\xfc\x20\xed\xe0\xeb\xee\xe3\xe8\x20\xf1\xe5\xe9\xf7\xe0\xf1  ", imgui.ImVec2(-1, S(38))) then
         payTaxesThenHotel(false)
     end
     if imgui.IsItemHovered and imgui.IsItemHovered() then
@@ -10251,8 +10425,6 @@ function PCS_drawGuardInner(h)
     PCS_gdToggle("##gdDebug", ic.terminal .. "  " .. u8"DEBUG-\xf1\xee\xee\xe1\xf9\xe5\xed\xe8\xff \xe2 \xea\xee\xed\xf1\xee\xeb\xfc", s.debug_msg,
         nil, function(v) s.debug_msg = v end)
 
-    imgui.TextColored(thDim(), "  " .. u8"\xca\xee\xec\xe0\xed\xe4\xfb: /ais, /sppet 1|2, /offpet 1|2, /fasteat 1|2")
-    imgui.TextColored(thDim(), "  " .. u8"\xce\xf2\xe4\xe5\xeb\xfc\xed\xfb\xe9 \xf1\xea\xf0\xe8\xef\xf2 Auto-Interaction Securities \xeb\xf3\xf7\xf8\xe5 \xe2\xfb\xe3\xf0\xf3\xe7\xe8\xf2\xfc.")
     imgui.Dummy(V2(0, S(30)))
 end
 
