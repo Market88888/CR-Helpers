@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.2"
+local SCRIPT_VER = "1.8.0"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -1044,6 +1044,67 @@ PCS_UPDATE = {
 function pcsCheckForUpdate(silent) pcs_ver.check(silent) end
 function pcsInstallUpdate() pcs_ver.install() end
 
+PCS_MENU_BUTTON = { hover = 0 }
+function PCS_MENU_BUTTON.draw()
+    if not imgui or not cfg then return end
+    if cfg.menuButtonEnabled == false then return end
+    if St and St.winOpen then return end
+    local ok, err = pcall(function()
+        local io = imgui.GetIO()
+        local sw, sh = io.DisplaySize.x, io.DisplaySize.y
+        local size = tonumber(cfg.menuButtonSize) or 32
+        local pad = 12
+        local pos = tostring(cfg.menuButtonPos or "top_right")
+        local x, y = pad, pad
+        if pos == "top_right" then x = sw - size - pad; y = pad
+        elseif pos == "bottom_left" then x = pad; y = sh - size - pad
+        elseif pos == "bottom_right" then x = sw - size - pad; y = sh - size - pad
+        end
+        imgui.SetNextWindowPos(imgui.ImVec2(x, y), imgui.Cond.Always)
+        imgui.SetNextWindowSize(imgui.ImVec2(size + 4, size + 4), imgui.Cond.Always)
+        local flags = 0
+        local W = imgui.WindowFlags
+        if W then
+            for _, name in ipairs({"NoTitleBar","NoResize","NoMove","NoScrollbar","NoSavedSettings","NoBackground","NoCollapse"}) do
+                if W[name] then flags = flags + W[name] end
+            end
+        end
+        if imgui.Begin("##pcs_menu_btn", nil, flags) then
+            local dl = imgui.GetWindowDrawList()
+            local p = imgui.GetCursorScreenPos()
+            local mx, my = io.MousePos.x, io.MousePos.y
+            local hovered = (mx >= p.x and mx <= p.x + size and my >= p.y and my <= p.y + size)
+            local baseA = tonumber(cfg.menuButtonAlpha) or 0.7
+            local a = hovered and 1.0 or baseA
+            local ar, ag, ab = 0.3, 0.55, 0.95
+            pcall(function()
+                local t = getTheme and getTheme()
+                if t and t.acc then ar, ag, ab = t.acc[1], t.acc[2], t.acc[3] end
+            end)
+            dl:AddRectFilled(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x + size, p.y + size),
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(ar, ag, ab, a * 0.85)), 8)
+            dl:AddRect(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x + size, p.y + size),
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, a * 0.5)), 8, 0, 1.5)
+            local icon = ICON_GEAR or "*"
+            local ts = imgui.CalcTextSize(icon)
+            dl:AddText(imgui.ImVec2(p.x + (size - ts.x) / 2, p.y + (size - ts.y) / 2),
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, a)), icon)
+            if PCS_UPDATE and PCS_UPDATE.state and PCS_UPDATE.state.available then
+                dl:AddCircleFilled(imgui.ImVec2(p.x + size - 4, p.y + 4), 5,
+                    imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.3, 0.25, 1.0)))
+            end
+            imgui.InvisibleButton("##pcs_menu_btn_hit", imgui.ImVec2(size, size))
+            if imgui.IsItemClicked() then
+                pcall(function() if toggleMenuWindow then toggleMenuWindow() end end)
+            end
+        end
+        imgui.End()
+    end)
+    if not ok then print("[PC Stats] menu button: " .. tostring(err)) end
+end
+
+
+
 -- ============================================================
 --  AIS: Auto-Interaction Securities (особисті охоронці / pet)
 --  Префікс ais_ — без конфліктів з PC Stats
@@ -2069,6 +2130,13 @@ local cfg = {
     -- перекрывает cfg.outlineR/G/B бегущим по кругу HSV-цветом
     rainbowBorder = false,
     uiLightMode = false,
+    autoClosePhone       = true,
+    phoneCloseDelayMs    = 300,
+    menuButtonEnabled    = true,
+    menuButtonPos        = "top_right",
+    menuButtonSize       = 32,
+    menuButtonAlpha      = 0.7,
+
     -- false = старый единый ряд вкладок сверху (по умолчанию, как было
     -- раньше), true = новое боковое меню слева — по просьбе вкладки
     -- остаются НЕ слева, старый верхний ряд остаётся вариантом по умолчанию
@@ -2250,6 +2318,12 @@ local function applyCfgData(m)
     -- тумблер "чёрный/белый скрипт" (по просьбе, взамен убранного ручного
     -- пикера фона) — false = тёмный фон (по умолчанию), true = светлый
     cfg.uiLightMode     = toBool(m.uiLightMode, false)
+    cfg.autoClosePhone       = toBool(m.autoClosePhone, true)
+    cfg.phoneCloseDelayMs    = tonumber(m.phoneCloseDelayMs) or 300
+    cfg.menuButtonEnabled    = toBool(m.menuButtonEnabled, true)
+    cfg.menuButtonPos        = tostring(m.menuButtonPos or "top_right")
+    cfg.menuButtonSize       = tonumber(m.menuButtonSize) or 32
+    cfg.menuButtonAlpha      = tonumber(m.menuButtonAlpha) or 0.7
     cfg.sidebarLayout    = toBool(m.sidebarLayout, false)
     cfg.sidebarCollapsed = toBool(m.sidebarCollapsed, false)
     cfg.chatR         = clampNum(m.chatR, -1, 1, -1)
@@ -2370,6 +2444,12 @@ local function saveCfg()
             borderThickness = tostring(cfg.borderThickness),
             rainbowBorder   = tostring(cfg.rainbowBorder),
             uiLightMode     = tostring(cfg.uiLightMode),
+            autoClosePhone   = tostring(cfg.autoClosePhone ~= false),
+            phoneCloseDelayMs = tostring(cfg.phoneCloseDelayMs or 300),
+            menuButtonEnabled = tostring(cfg.menuButtonEnabled ~= false),
+            menuButtonPos    = tostring(cfg.menuButtonPos or "top_right"),
+            menuButtonSize   = tostring(cfg.menuButtonSize or 32),
+            menuButtonAlpha  = tostring(cfg.menuButtonAlpha or 0.7),
             sidebarLayout    = tostring(cfg.sidebarLayout),
             sidebarCollapsed = tostring(cfg.sidebarCollapsed),
             chatR         = tostring(cfg.chatR),
@@ -3106,18 +3186,15 @@ do
         PcsNotifyManager.set_enabled(cfg.toastEnabled ~= false)
     end
     pcs_apply_toast_settings()
+    if St then St._toastSessionActive = true end
+    pcall(function() PcsNotifyManager.set_enabled(cfg.toastEnabled ~= false) end)
 
     -- Публичная точка входа для всего остального скрипта:
     -- pcs_notify("текст в UTF-8", "info"/"success"/"warning"/"error"/"payday", длительность_сек)
     function pcs_notify(text, ntype, duration)
         if cfg.toastEnabled == false then return end
-        -- пока меню ни разу не открывали в сессии — тосты скрыты
-        if not St._toastSessionActive then return end
-        -- ФИКС "нет тоста, пока меню закрыто": раньше тут ещё была проверка
-        -- St.winOpen, которая обнуляла ЛЮБОЙ тост, показанный при закрытом
-        -- меню (вход в игру, курс валют) — тосты рисуются отдельным слоем
-        -- (см. PcsNotifyManager:_render), поэтому меню для их показа
-        -- открывать не нужно, проверка была лишней.
+        -- Тосты не зависят от открытия меню (ForegroundDrawList + OnFrame).
+        if St then St._toastSessionActive = true end
         return PcsNotifyManager.add(text, ntype, duration)
     end
 
@@ -5062,6 +5139,46 @@ function TX.addEntry(isAuto, amount, isNoTax)
 end
 
 -- фиксирует успешную оплату (своей учётки), обновляет время/сумму последней оплаты
+
+-- Полное закрытие телефона после налогов/курса (несколько Esc + снятие фокуса).
+local function closePhoneFully(maxAttempts, delayMs)
+    maxAttempts = tonumber(maxAttempts) or 3
+    delayMs = tonumber(delayMs) or (cfg and tonumber(cfg.phoneCloseDelayMs)) or 300
+    if delayMs < 100 then delayMs = 100 end
+    if delayMs > 1000 then delayMs = 1000 end
+    if cfg and cfg.autoClosePhone == false then
+        _phoneOpBusy = false
+        return
+    end
+    lua_thread.create(function()
+        local ok, err = pcall(function()
+            wait(math.max(200, delayMs))
+            for i = 1, maxAttempts do
+                local active = false
+                pcall(function()
+                    if sampIsDialogActive and sampIsDialogActive() then active = true end
+                end)
+                pcall(sampCloseCurrentDialog, -1)
+                wait(delayMs)
+                if not active then
+                    local still = false
+                    pcall(function()
+                        if sampIsDialogActive and sampIsDialogActive() then still = true end
+                    end)
+                    if not still then break end
+                end
+            end
+            pcall(function()
+                if sampIsChatInputActive and sampIsChatInputActive() then
+                    pcall(sampSendChat, "")
+                end
+            end)
+        end)
+        if not ok then print("[PC Stats] closePhoneFully: " .. tostring(err)) end
+        _phoneOpBusy = false
+    end)
+end
+
 local function onTaxPaymentSuccess(isAuto, amount)
     -- ФИКС: защита от двойного выполнения — см. _taxFinalizeDone и
     -- _taxState=3 выше (может быть вызвана и обработчиком доп. диалога-
@@ -5111,17 +5228,7 @@ local function onTaxPaymentSuccess(isAuto, amount)
     -- экране поверх интерфейса игрока — тот же приём, что и в фетче
     -- курса валют выше (sampCloseCurrentDialog(-1) с небольшой паузой,
     -- т.к. игра может ещё показывать экран-подтверждение оплаты) ──
-    lua_thread.create(function()
-        wait(400)
-        pcall(sampCloseCurrentDialog, -1)
-        wait(150)
-        pcall(sampCloseCurrentDialog, -1)
-        -- доп. пауза "на остывание" телефона перед тем, как разрешить
-        -- следующую операцию (крипту/повторную оплату) — без неё клиент
-        -- иногда не успевал доиграть анимацию закрытия предыдущего диалога
-        wait(250)
-        _phoneOpBusy = false -- телефон освободился, курс валют теперь можно обновлять
-    end)
+    closePhoneFully(3, (cfg and cfg.phoneCloseDelayMs) or 300)
 end
 
 -- запускает оплату: открывает телефон/приложение и переводит state-машину
@@ -8299,7 +8406,7 @@ function drawAboutInner(h)
                 imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.13,0.58,0.90,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.18,0.72,1.00,1.0))
                 do local _pbtg = prettyBtnPush(6.0)
-                if imgui.Button(u8"   Telegram##tgopen", imgui.ImVec2(btnCW, btnCH)) then
+                if imgui.Button((ICON_TG or "")..u8" Support##tgopen", imgui.ImVec2(btnCW, btnCH)) then
                     -- сначала пробуем открыть ссылку без консоли (WinAPI
                     -- ShellExecuteA), и только если ffi недоступен —
                     -- запасной os.execute('start ...'), который может на
@@ -8366,7 +8473,7 @@ function drawAboutInner(h)
                 imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.29,0.33,0.86,1.0))
                 imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.37,0.42,1.00,1.0))
                 do local _pbdc = prettyBtnPush(6.0)
-                if imgui.Button(u8"Discord##dccopy", imgui.ImVec2(btnCW, btnCH)) then
+                if imgui.Button((ICON_DISCORD or "")..u8" Discord##dccopy", imgui.ImVec2(btnCW, btnCH)) then
                     local copied = false
                     pcall(function()
                         if imgui.SetClipboardText then
@@ -10749,6 +10856,21 @@ function main()
     -- ── AIS (охоронці): команди /sppet /offpet /fasteat /ais... ──
     pcall(function()
         if AIS and AIS.init then AIS.init() end
+    end)
+
+    pcall(function()
+        if imgui and imgui.OnFrame and PCS_MENU_BUTTON then
+            imgui.OnFrame(
+                function()
+                    if not cfg or cfg.menuButtonEnabled == false then return false end
+                    if St and St.winOpen then return false end
+                    return true
+                end,
+                function()
+                    pcall(function() PCS_MENU_BUTTON.draw() end)
+                end
+            )
+        end
     end)
 
     -- ── команда чата для ручной оплаты налогов (по просьбе) ──
