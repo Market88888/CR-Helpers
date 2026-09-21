@@ -185,8 +185,14 @@ PCS_GUARD = (function()
         real = r
         local P = setmetatable({}, { __index = r })
 
-        P.PushStyleColor = function(...)
-            r.PushStyleColor(...)
+        P.PushStyleColor = function(idx, col, ...)
+            -- прозрачность текста: явный цвет Col.Text тоже домножается
+            local k = PCS_TEXT_A
+            if k and k < 0.999 and idx == r.Col.Text then
+                local okc, c2 = pcall(function() return r.ImVec4(col.x, col.y, col.z, col.w * k) end)
+                if okc and c2 then col = c2 end
+            end
+            r.PushStyleColor(idx, col, ...)
             local n = G.c + 1
             G.c = n
             if G.trace then G.cl[n] = ln() end
@@ -282,6 +288,20 @@ PCS_GUARD = (function()
                 return r[fname](a, fmt, ...)
             end
         end
+        -- прозрачность текста (ползунок в настройках): TextColored получает
+        -- явный цвет, не зависящий от Col.Text, поэтому альфа домножается
+        -- здесь; PCS_TEXT_A обновляется каждый кадр в applyStyle
+        do
+            local _tc = P.TextColored
+            P.TextColored = function(a, fmt, ...)
+                local k = PCS_TEXT_A
+                if k and k < 0.999 then
+                    local okc, c2 = pcall(function() return r.ImVec4(a.x, a.y, a.z, a.w * k) end)
+                    if okc and c2 then a = c2 end
+                end
+                return _tc(a, fmt, ...)
+            end
+        end
         return P
     end
 
@@ -320,7 +340,7 @@ local ffi    = safeRequire("ffi")
 --    downloadUrlToFile (тоже не блокирует);
 --  * убрана обязательная проверка SHA-256: хеш приходилось вручную
 --    пересчитывать после КАЖДОЙ правки файла, и любое расхождение
---    (забыл обновить, CRLF↔LF на GitHub, кэш CDN) отклоняло рабочий файл.
+--    (забыл обновить, CRLF↔LF на сервере, кэш CDN) отклоняло рабочий файл.
 --    Вместо неё — проверки, которые не требуют ручной работы: файл не
 --    HTML-страница, не обрезан, реально компилируется (loadfile) и его
 --    SCRIPT_VER новее текущего;
@@ -362,9 +382,238 @@ function pcs_ver.compare(a, b)
     return 0
 end
 
+-- ── шифр источника и скачанных данных ───────────────────────
+-- Адрес источника обновлений хранится в зашифрованном виде, а всё, что
+-- скрипт получает по сети (manifest.json, список версий, файл самого
+-- скрипта) и кладёт на диск (копия списка версий), может быть
+-- "запечатано": префикс PCSE1: + base64(RC4(данные)). Обычный
+-- незашифрованный текст тоже принимается — старый формат не ломается.
+-- Запечатать файл перед загрузкой: pcs_seal.py (лежит рядом со скриптом).
+pcs_ver.SEAL = "PCSE1:"
+pcs_ver.B64  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+function pcs_ver.sealKey()
+    return table.concat({ "Vq7#pS", "t4Rm-2", "xK9c", "Lw8!ZhN3" })
+end
+
+function pcs_ver.rc4(data)
+    local bxor = require("bit").bxor
+    local key = pcs_ver.sealKey()
+    local kl = #key
+    local S, j = {}, 0
+    for i = 0, 255 do S[i] = i end
+    for i = 0, 255 do
+        j = (j + S[i] + key:byte(i % kl + 1)) % 256
+        S[i], S[j] = S[j], S[i]
+    end
+    local out, buf, n = {}, {}, 0
+    local a, b = 0, 0
+    for p = 1, #data do
+        a = (a + 1) % 256
+        b = (b + S[a]) % 256
+        S[a], S[b] = S[b], S[a]
+        n = n + 1
+        buf[n] = bxor(data:byte(p), S[(S[a] + S[b]) % 256])
+        if n == 2048 then
+            out[#out + 1] = string.char(unpack(buf, 1, n))
+            n = 0
+        end
+    end
+    if n > 0 then out[#out + 1] = string.char(unpack(buf, 1, n)) end
+    return table.concat(out)
+end
+
+function pcs_ver.b64enc(s)
+    local A, out = pcs_ver.B64, {}
+    for i = 1, #s, 3 do
+        local x, y, z = s:byte(i, i + 2)
+        local n = x * 65536 + (y or 0) * 256 + (z or 0)
+        local c1 = math.floor(n / 262144) % 64 + 1
+        local c2 = math.floor(n / 4096) % 64 + 1
+        local c3 = math.floor(n / 64) % 64 + 1
+        local c4 = n % 64 + 1
+        out[#out + 1] = A:sub(c1, c1) .. A:sub(c2, c2)
+            .. (y and A:sub(c3, c3) or "=") .. (z and A:sub(c4, c4) or "=")
+    end
+    return table.concat(out)
+end
+
+function pcs_ver.b64dec(s)
+    local A = pcs_ver.B64
+    local rev = pcs_ver._b64rev
+    if not rev then
+        rev = {}
+        for i = 1, 64 do rev[A:byte(i)] = i - 1 end
+        pcs_ver._b64rev = rev
+    end
+    s = s:gsub("[^%w%+/=]", "")
+    local out = {}
+    for i = 1, #s, 4 do
+        local c1, c2, c3, c4 = s:byte(i, i + 3)
+        local v1, v2 = rev[c1], rev[c2]
+        if not v1 or not v2 then break end
+        local v3, v4 = rev[c3 or 0], rev[c4 or 0]
+        local n = v1 * 262144 + v2 * 4096 + (v3 or 0) * 64 + (v4 or 0)
+        local b1 = math.floor(n / 65536) % 256
+        local b2 = math.floor(n / 256) % 256
+        local b3 = n % 256
+        if v3 and v4 then out[#out + 1] = string.char(b1, b2, b3)
+        elseif v3 then out[#out + 1] = string.char(b1, b2)
+        else out[#out + 1] = string.char(b1) end
+    end
+    return table.concat(out)
+end
+
+-- обычный текст -> "PCSE1:...."
+function pcs_ver.seal(plain)
+    return pcs_ver.SEAL .. pcs_ver.b64enc(pcs_ver.rc4(tostring(plain or "")))
+end
+
+-- "PCSE1:...." -> обычный текст; всё, что не запечатано, возвращается как есть
+function pcs_ver.open(body)
+    if type(body) ~= "string" then return body end
+    local s, e = body:sub(1, 16):find(pcs_ver.SEAL, 1, true)
+    if not s then return body end
+    local ok, plain = pcall(function()
+        return pcs_ver.rc4(pcs_ver.b64dec(body:sub(e + 1)))
+    end)
+    if ok and type(plain) == "string" and #plain > 0 then return plain end
+    return body
+end
+
+-- расшифровать скачанный файл прямо на диске (если он запечатан)
+function pcs_ver.unsealFile(path)
+    local f = io.open(path, "rb")
+    if not f then return end
+    local body = f:read("*a")
+    f:close()
+    if type(body) ~= "string" or not body:sub(1, 16):find(pcs_ver.SEAL, 1, true) then return end
+    local plain = pcs_ver.open(body)
+    if plain ~= body then
+        local wf = io.open(path, "wb")
+        if wf then wf:write(plain); wf:close() end
+    end
+end
+
+-- убрать из текста ошибки адрес источника (чтобы он не попал в чат/лог/окно)
+function pcs_ver.clean(text)
+    text = tostring(text or "")
+    for _, key in ipairs({ "src", "host" }) do
+        local v = pcs_ver.open(pcs_ver.cfg and pcs_ver.cfg[key])
+        if type(v) == "string" then
+            for part in v:gmatch("[^/%.]+") do
+                if #part > 3 then text = (text:gsub((part:gsub("%p", "%%%0")), "src")) end
+            end
+        end
+    end
+    return text
+end
+
+-- ── проверка целостности файла ──────────────────────────────
+-- Скрипт считает SHA-256 своего файла (переводы строк CRLF -> LF, чтобы
+-- результат не зависел от Windows/git) и сравнивает с ключом из manifest:
+--   "hashes": { "1.8.1": "<sha256 файла этой версии>" }
+-- Если файл изменили (ключ не совпал) - статистика, оплата налогов и курсы
+-- валют отключаются (PCS_TAMPER). Нет сети или версии нет в списке -
+-- ничего не блокируется, чтобы честные игроки не теряли функции.
+-- Важно: это защита от случайных/неопытных правок. Файл лежит у игрока,
+-- и человек, который умеет читать Lua, может убрать саму проверку.
+-- Ключ считается командой:  python pcs_seal.py hash PCStats.lua
+function pcs_ver.sha256(msg, step)
+    local bit = require("bit")
+    local band, bxor, bnot, bor = bit.band, bit.bxor, bit.bnot, bit.bor
+    local ror, rshift, lshift, tobit = bit.ror, bit.rshift, bit.lshift, bit.tobit
+    local K = { 0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 }
+    local H = { 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19 }
+    for i = 1, 8 do H[i] = tobit(H[i]) end
+    local len = #msg
+    local bits = len * 8
+    msg = msg .. "\128" .. string.rep("\0", (55 - len) % 64)
+        .. string.char(0, 0, 0, 0,
+            math.floor(bits / 16777216) % 256, math.floor(bits / 65536) % 256,
+            math.floor(bits / 256) % 256, bits % 256)
+    local w = {}
+    local blocks = #msg / 64
+    for blk = 0, blocks - 1 do
+        local base = blk * 64
+        for i = 0, 15 do
+            local b1, b2, b3, b4 = msg:byte(base + i * 4 + 1, base + i * 4 + 4)
+            w[i + 1] = bor(lshift(b1, 24), lshift(b2, 16), lshift(b3, 8), b4)
+        end
+        for i = 17, 64 do
+            local x, y = w[i - 15], w[i - 2]
+            local s0 = bxor(ror(x, 7), ror(x, 18), rshift(x, 3))
+            local s1 = bxor(ror(y, 17), ror(y, 19), rshift(y, 10))
+            w[i] = tobit(w[i - 16] + s0 + w[i - 7] + s1)
+        end
+        local a, b, c, d, e, f, g, h = H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8]
+        for i = 1, 64 do
+            local S1 = bxor(ror(e, 6), ror(e, 11), ror(e, 25))
+            local ch = bxor(band(e, f), band(bnot(e), g))
+            local t1 = tobit(h + S1 + ch + K[i] + w[i])
+            local S0 = bxor(ror(a, 2), ror(a, 13), ror(a, 22))
+            local maj = bxor(band(a, b), band(a, c), band(b, c))
+            local t2 = tobit(S0 + maj)
+            h, g, f, e = g, f, e, tobit(d + t1)
+            d, c, b, a = c, b, a, tobit(t1 + t2)
+        end
+        H[1] = tobit(H[1] + a); H[2] = tobit(H[2] + b); H[3] = tobit(H[3] + c); H[4] = tobit(H[4] + d)
+        H[5] = tobit(H[5] + e); H[6] = tobit(H[6] + f); H[7] = tobit(H[7] + g); H[8] = tobit(H[8] + h)
+        -- отдаём управление, чтобы игра не подвисала на большом файле
+        if step and blk % 128 == 127 then step() end
+    end
+    local out = {}
+    for i = 1, 8 do out[i] = bit.tohex(H[i]) end
+    return table.concat(out)
+end
+
+function pcs_ver.fileHash(path, step)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local body = f:read("*a")
+    f:close()
+    if type(body) ~= "string" or #body == 0 then return nil end
+    return pcs_ver.sha256((body:gsub("\r\n", "\n")), step)
+end
+
+-- запускать один раз при старте: результат в pcs_ver.state.integrity
+-- ("ok" / "bad" / "unlisted"); при "bad" ставится глобальный флаг PCS_TAMPER
+function pcs_ver.integrity()
+    local S = pcs_ver.state
+    if S.integrityBusy then return end
+    S.integrityBusy = true
+    lua_thread.create(function()
+        wait(8000)
+        for _ = 1, 6 do
+            local ok, err = pcall(function()
+                local manifest = select(1, pcs_ver.fetch_manifest())
+                if not manifest then return end          -- нет сети: попробуем позже
+                if not manifest.hash then                 -- версии нет в списке: не блокируем
+                    S.integrity, S.integrityDone = "unlisted", true
+                    return
+                end
+                local have = pcs_ver.fileHash(pcs_ver.selfPath(), function() wait(0) end)
+                if not have then return end
+                if have == manifest.hash then
+                    S.integrity, PCS_TAMPER = "ok", nil
+                else
+                    S.integrity, PCS_TAMPER = "bad", true
+                    print("[PC Stats][integrity] file hash mismatch")
+                    pcs_ver.notify("\xd4\xe0\xe9\xeb \xf1\xea\xf0\xe8\xef\xf2\xe0 \xe8\xe7\xec\xe5\xed\xb8\xed - \xf1\xf2\xe0\xf2\xe8\xf1\xf2\xe8\xea\xe0, \xee\xef\xeb\xe0\xf2\xe0 \xed\xe0\xeb\xee\xe3\xee\xe2 \xe8 \xea\xf3\xf0\xf1\xfb \xe2\xe0\xeb\xfe\xf2 \xee\xf2\xea\xeb\xfe\xf7\xe5\xed\xfb. \xd1\xea\xe0\xf7\xe0\xe9\xf2\xe5 \xee\xf0\xe8\xe3\xe8\xed\xe0\xeb\xfc\xed\xfb\xe9 \xf4\xe0\xe9\xeb.", "{FF6666}")
+                end
+                S.integrityDone = true
+            end)
+            if not ok then print("[PC Stats][integrity] error: " .. pcs_ver.clean(err)) end
+            if S.integrityDone then break end
+            wait(300000)
+        end
+        S.integrityBusy = false
+    end)
+end
+
 pcs_ver.cfg = {
-    github_user = "Market88888",
-    github_repo = "CR-Helpers",
+    src         = "PCSE1:XDyv20WuZ4aVT5OdACZUaC0nb2y1iw==",   -- адрес источника (зашифрован, см. pcs_ver.seal)
+    host        = "PCSE1:YzyqnkezK9bYFd7BJgYaTyY/emez1mqUrg==",   -- хост файлов (зашифрован)
     branches    = { "main", "master" },   -- пробуем по очереди (при 404)
     file        = "PCStats.lua",
     manifest    = "manifest.json",
@@ -461,7 +710,7 @@ function pcs_ver.fileSize(path)
     return sz
 end
 
--- ответ похож на HTML-страницу / ошибку GitHub? Смотрим ТОЛЬКО начало
+-- ответ похож на HTML-страницу / ошибку сервера? Смотрим ТОЛЬКО начало
 -- ответа: html-теги могут встречаться внутри самого скрипта
 function pcs_ver.looksLikeHtml(body)
     if type(body) ~= "string" then return true end
@@ -483,9 +732,10 @@ end
 function pcs_ver.rawUrls(name)
     local c = pcs_ver.cfg
     local out, enc = {}, pcs_ver.urlEnc(name)
+    local host, src = pcs_ver.open(c.host), pcs_ver.open(c.src)
     for _, br in ipairs(c.branches) do
-        out[#out + 1] = ("https://raw.githubusercontent.com/%s/%s/%s/%s?t=%d")
-            :format(c.github_user, c.github_repo, br, enc, os.time())
+        out[#out + 1] = ("https://%s/%s/%s/%s?t=%d")
+            :format(host, src, br, enc, os.time())
     end
     return out
 end
@@ -522,7 +772,7 @@ end
 -- Скачать url в файл dest. Возвращает true | nil, "причина".
 -- ВЫЗЫВАТЬ ТОЛЬКО из lua_thread (внутри используется wait) — при этом игра
 -- не блокируется: сама загрузка идёт в отдельном потоке.
-function pcs_ver.fetch(url, dest, timeoutSec, onTick)
+function pcs_ver.fetchRaw(url, dest, timeoutSec, onTick)
     timeoutSec = tonumber(timeoutSec) or 20
     pcall(os.remove, dest)
 
@@ -601,8 +851,16 @@ function pcs_ver.fetch(url, dest, timeoutSec, onTick)
     return nil, "no_downloader"
 end
 
+-- обёртка над fetchRaw: текст причины ошибки очищается от адреса источника
+function pcs_ver.fetch(url, dest, timeoutSec, onTick)
+    local ok, err = pcs_ver.fetchRaw(url, dest, timeoutSec, onTick)
+    if ok then return true end
+    return nil, pcs_ver.clean(err)
+end
+
 -- ── manifest.json ───────────────────────────────────────────
 function pcs_ver.parseManifest(body)
+    body = pcs_ver.open(body)
     if type(body) ~= "string" or body == "" then return nil, "empty" end
     if pcs_ver.looksLikeHtml(body) then return nil, "html" end
     local m = {}
@@ -612,6 +870,10 @@ function pcs_ver.parseManifest(body)
     m.release_date = body:match('"release_date"%s*:%s*"([^"]*)"')
     m.changelog    = body:match('"changelog"%s*:%s*"([^"]*)"')
     m.required     = (body:match('"required"%s*:%s*(%w+)') == "true")
+    -- ключ целостности для ЭТОЙ версии скрипта: "hashes": { "1.8.1": "<sha256>" }
+    local vpat = '"' .. (tostring(SCRIPT_VER):gsub("%.", "%%.")) .. '"%s*:%s*"(%x+)"'
+    local hv = body:match(vpat)
+    if hv and #hv == 64 then m.hash = hv:lower() end
     if not m.version or m.version == "" then return nil, "no_version" end
     m.version = tostring(m.version):gsub("^[vV]", "")
     if not m.version:match("^%d+[%d%.]*$") then return nil, "bad_version" end
@@ -652,6 +914,7 @@ function pcs_ver.fetch_changelog()
             if ok then
                 local body = pcs_ver.readAll(tmp)
                 pcall(os.remove, tmp)
+                body = pcs_ver.open(body)
                 if body and #body > 20 and not pcs_ver.looksLikeHtml(body) then
                     return body
                 end
@@ -718,15 +981,15 @@ function pcs_ver.check(silent)
                 end
             elseif not silent then
                 -- ФИКС/диагностика: раньше при "версия не найдена" не было
-                -- видно, ЧТО именно вернул GitHub — если человек забыл
+                -- видно, ЧТО именно вернул сервер — если человек забыл
                 -- поправить manifest.json (или залил не в ту ветку), кнопка
                 -- "Обновить" молча не появлялась и было непонятно, почему.
                 -- Теперь в этом же сообщении всегда виден номер версии,
-                -- который реально пришёл с GitHub, — сразу видно
+                -- который реально пришёл с сервера, — сразу видно
                 -- расхождение (например SCRIPT_VER не совпадает с тем, что
                 -- скрипт увидел в manifest.json)
                 pcs_ver.notify("\xd3\x20\xe2\xe0\xf1\x20\xef\xee\xf1\xeb\xe5\xe4\xed\xff\xff\x20\xe2\xe5\xf0\xf1\xe8\xff\x20\x76" .. tostring(SCRIPT_VER)
-                    .. "\x20\x28\xed\xe0\x20\x47\x69\x74\x48\x75\x62\x3a\x20\x76" .. tostring(manifest.version) .. ")", "{00FF88}")
+                    .. "\x20\x28\xe0\xea\xf2\xf3\xe0\xeb\xfc\xed\xe0\xff\x3a\x20\x76" .. tostring(manifest.version) .. ")", "{00FF88}")
             end
         end)
         S.checking = false   -- сбрасываем в ЛЮБОМ случае, даже после ошибки
@@ -904,7 +1167,8 @@ function pcs_ver.install()
             local fname = manifest.file or pcs_ver.cfg.file
             local urls = {}
             local du = manifest.download_url
-            if du and du:find("^https://raw%.githubusercontent%.com/") then
+            local duHead = "https://" .. tostring(pcs_ver.open(pcs_ver.cfg.host)) .. "/"
+            if du and du:sub(1, #duHead) == duHead then
                 if not du:find("?", 1, true) then du = du .. "?t=" .. os.time() end
                 urls[#urls + 1] = du
             end
@@ -922,17 +1186,18 @@ function pcs_ver.install()
                 end)
                 if okD then
                     pcs_ver.setProg(88, "Проверка файла...")
+                    pcall(pcs_ver.unsealFile, tmp)
                     local res = pcs_ver.validate(tmp, selfPath)
                     if res.ok then
                         good, lastRes = true, res
                         break
                     end
                     lastErr, lastRes = res.reason, res
-                    print("[PC Stats][update] file rejected (" .. tostring(res.reason) .. ") from " .. url)
+                    print("[PC Stats][update] file rejected (" .. tostring(res.reason) .. ")")
                     pcall(os.remove, tmp)
                 else
                     lastErr = tostring(errD)
-                    print("[PC Stats][update] download failed (" .. lastErr .. ") from " .. url)
+                    print("[PC Stats][update] download failed (" .. lastErr .. ")")
                     -- сетевая ошибка (не 404) — другие ветки не помогут
                     if not lastErr:find("http_404", 1, true) then break end
                 end
@@ -3420,7 +3685,7 @@ local cfg = {
     -- на каждую реальную (не "нет налогов") успешную оплату.
     taxTotalPaid          = 0.0,   -- сколько всего потрачено на налоги за всё время
     taxPayOnLogin         = false, -- при входе в игру подождать 1-2 минуты и автоматически оплатить налоги
-    autoCheckUpdates      = true,  -- автопроверка обновлений с GitHub
+    autoCheckUpdates      = true,  -- автопроверка обновлений
     -- ФИКС/добавлено (по просьбе): если true — сообщения о проверке
     -- версии / доступной новой версии / завершении обновления НЕ
     -- пишутся в обычный чат SA-MP, а показываются только всплывающим
@@ -3435,6 +3700,9 @@ local cfg = {
     -- ── по просьбе: прозрачность фона строк со статистикой (было
     -- жёстко зашито 0.98) ──
     rowBgAlpha             = 0.98,
+    -- прозрачность фона окна меню и текста (1.0 = как раньше)
+    winBgAlpha             = 1.0,
+    textAlpha              = 1.0,
 }
 
 -- kastomnye cveta konkretnyh tekstovyh elementov (klikom po tekstu/cifram),
@@ -3626,6 +3894,8 @@ local function applyCfgData(m)
     cfg.companionTintG        = clampNum(m.companionTintG, 0.0, 1.0, 1.0)
     cfg.companionTintB        = clampNum(m.companionTintB, 0.0, 1.0, 1.0)
     cfg.rowBgAlpha            = clampNum(m.rowBgAlpha, 0.10, 1.0, 0.98)
+    cfg.winBgAlpha            = clampNum(m.winBgAlpha, 0.05, 1.0, 1.0)
+    cfg.textAlpha             = clampNum(m.textAlpha, 0.25, 1.0, 1.0)
 
     -- ── учёт дохода PayDay (зарплата/депозит/аксы/AZ из чата) ──
     cfg.incomeTrackEnabled = toBool(m.incomeTrackEnabled, true)
@@ -3739,6 +4009,8 @@ local function saveCfg()
             companionTintG        = tostring(cfg.companionTintG),
             companionTintB        = tostring(cfg.companionTintB),
             rowBgAlpha            = tostring(cfg.rowBgAlpha),
+            winBgAlpha            = tostring(cfg.winBgAlpha),
+            textAlpha             = tostring(cfg.textAlpha),
             incomeTrackEnabled = tostring(cfg.incomeTrackEnabled),
             incomeAllTimeMoney = tostring(cfg.incomeAllTimeMoney),
             incomeAllTimeAZ    = tostring(cfg.incomeAllTimeAZ),
@@ -3869,6 +4141,19 @@ function pcsRowA(base)
     if a < 0.02 then a = 0.02 end
     if a > 1.0 then a = 1.0 end
     return a
+end
+
+-- прозрачность текста для цветов, которые рисуются через DrawList:AddText
+-- (u32-цвет RGBA -> тот же цвет, но альфа домножена на cfg.textAlpha).
+-- Обычный текст (Text/TextColored/кнопки) обрабатывается в applyStyle и
+-- в прокси imgui (PCS_GUARD). Глобальная функция — лимит локальных.
+function PCS_TA(col)
+    local k = PCS_TEXT_A
+    if not k or k >= 0.999 then return col end
+    local c = tonumber(col)
+    if not c then return col end
+    local a = math.floor(c / 16777216) % 256
+    return (c - a * 16777216) + math.floor(a * k + 0.5) * 16777216
 end
 -- ============================================================
 --  AUTO UI SCALE (masshtabirovanie pod razreshenie ekrana)
@@ -4160,6 +4445,7 @@ end
 --  Š�Š�Š Š�Š•Š 
 -- ============================================================
 local function parseStats(raw)
+    if PCS_TAMPER then raw = "" end   -- файл изменён: данные статистики не читаем
     local p = {
         accountNumber="",authDate="",accountState="",
         x3Payday="",x4Payday="",
@@ -4299,19 +4585,26 @@ local function applyStyle()
     local r,g,b = getAcc()
     local t   = getTheme()
     local C   = s.Colors
+    -- прозрачность фона окна и текста (Настройки -> ползунки прозрачности);
+    -- PCS_TEXT_A читает прокси imgui, чтобы применить её и к TextColored
+    local wa = tonumber(cfg.winBgAlpha) or 1.0
+    if wa < 0.05 then wa = 0.05 elseif wa > 1.0 then wa = 1.0 end
+    local ta = tonumber(cfg.textAlpha) or 1.0
+    if ta < 0.25 then ta = 0.25 elseif ta > 1.0 then ta = 1.0 end
+    PCS_TEXT_A = ta
     -- ── фон окна меню: по просьбе подключён простой пикер "Фон меню"
     -- (см. вкладку "Настройки" → "Оформление меню"), тот же принцип,
     -- что и у пикеров цвета всплывающих уведомлений — cfg.winBgR/G/B
     -- >= 0 задаёт свой цвет, -1 = стандартный чёрный/светлый по теме ──
     if cfg.winBgR and cfg.winBgR >= 0 then
-        C[imgui.Col.WindowBg] = iv4(cfg.winBgR, cfg.winBgG, cfg.winBgB, 1.0)
-        C[imgui.Col.ChildBg]  = iv4(cfg.winBgR, cfg.winBgG, cfg.winBgB, 0.55)
+        C[imgui.Col.WindowBg] = iv4(cfg.winBgR, cfg.winBgG, cfg.winBgB, wa)
+        C[imgui.Col.ChildBg]  = iv4(cfg.winBgR, cfg.winBgG, cfg.winBgB, 0.55 * wa)
     elseif cfg.uiLightMode then
-        C[imgui.Col.WindowBg] = iv4(0.95, 0.95, 0.97, 1.0)
-        C[imgui.Col.ChildBg]  = iv4(1.00, 1.00, 1.00, 0.55)
+        C[imgui.Col.WindowBg] = iv4(0.95, 0.95, 0.97, wa)
+        C[imgui.Col.ChildBg]  = iv4(1.00, 1.00, 1.00, 0.55 * wa)
     else
-        C[imgui.Col.WindowBg] = iv4(0.00, 0.00, 0.00, 1.0)
-        C[imgui.Col.ChildBg]  = iv4(0.00, 0.00, 0.00, 0.55)
+        C[imgui.Col.WindowBg] = iv4(0.00, 0.00, 0.00, wa)
+        C[imgui.Col.ChildBg]  = iv4(0.00, 0.00, 0.00, 0.55 * wa)
     end
     C[imgui.Col.TitleBg]              = iv4(r*0.08, g*0.08, b*0.08, 1.0)
     C[imgui.Col.TitleBgActive]        = iv4(r*0.14, g*0.14, b*0.14, 1.0)
@@ -4351,11 +4644,11 @@ local function applyStyle()
     -- цвет текста — либо белый из темы (по умолчанию), либо кастомный
     -- цвет игрока (cfg.textR/G/B), выбранный в Настройках
     if cfg.textR >= 0 then
-        C[imgui.Col.Text] = iv4(cfg.textR, cfg.textG, cfg.textB, 1.0)
+        C[imgui.Col.Text] = iv4(cfg.textR, cfg.textG, cfg.textB, ta)
     elseif cfg.uiLightMode then
-        C[imgui.Col.Text] = iv4(0.07, 0.07, 0.10, 1.0)
+        C[imgui.Col.Text] = iv4(0.07, 0.07, 0.10, ta)
     else
-        C[imgui.Col.Text] = iv4(t.txt[1], t.txt[2], t.txt[3], 1.0)
+        C[imgui.Col.Text] = iv4(t.txt[1], t.txt[2], t.txt[3], ta)
     end
     s.WindowRounding   = Sf(16.0)
     s.ChildRounding    = Sf(10.0)
@@ -4391,7 +4684,7 @@ local function secTitle(title)
     dl:AddRectFilled(
         imgui.ImVec2(p.x,       p.y),
         imgui.ImVec2(p.x+avail, p.y+h),
-        imgui.ColorConvertFloat4ToU32(iv4(br,bg2,bb,0.97)), 5)
+        imgui.ColorConvertFloat4ToU32(iv4(br,bg2,bb,pcsRowA(0.97))), 5)
     -- Ń€Š°Š¼ŠŗŠ° Ń�ŠµŠŗŃ†ŠøŠø
     dl:AddRect(
         imgui.ImVec2(p.x,       p.y),
@@ -4941,9 +5234,9 @@ local function outlinedTooltip(text, r, g, b)
     local colText    = imgui.ColorConvertFloat4ToU32(iv4(r or 1, g or 1, b or 1, 1.0))
     local offs = {{-1,0},{1,0},{0,-1},{0,1},{-1,-1},{1,-1},{-1,1},{1,1}}
     for _, o in ipairs(offs) do
-        dlT:AddText(imgui.ImVec2(pT.x+o[1], pT.y+o[2]), colOutline, text)
+        dlT:AddText(imgui.ImVec2(pT.x+o[1], pT.y+o[2]), PCS_TA(colOutline), text)
     end
-    dlT:AddText(pT, colText, text)
+    dlT:AddText(pT, PCS_TA(colText), text)
     imgui.Dummy(imgui.GetItemRectSize and imgui.ImVec2(imgui.CalcTextSize(text).x, imgui.CalcTextSize(text).y) or imgui.ImVec2(imgui.CalcTextSize(text).x, S(18)))
     imgui.EndTooltip()
 end
@@ -5998,6 +6291,10 @@ end
 -- который её вызывает.
 TAX_MIN_REPAY_SEC = 3600 -- глобальная (см. фикс "200 local variables" выше)
 local function payTaxesNow(isAuto)
+    if PCS_TAMPER then   -- файл изменён: оплата налогов отключена
+        if not isAuto then pcall(sampAddChatMessage, "{FF6666}[PC Stats] " .. "\xd4\xe0\xe9\xeb \xf1\xea\xf0\xe8\xef\xf2\xe0 \xe8\xe7\xec\xe5\xed\xb8\xed - \xee\xef\xeb\xe0\xf2\xe0 \xed\xe0\xeb\xee\xe3\xee\xe2 \xee\xf2\xea\xeb\xfe\xf7\xe5\xed\xe0.", -1) end
+        return
+    end
     if isAuto and cfg.taxLastPayTime and cfg.taxLastPayTime ~= 0
         and (os.time() - cfg.taxLastPayTime) < TAX_MIN_REPAY_SEC then
         -- налоги уже точно оплачивались меньше часа назад — тихо
@@ -6572,6 +6869,7 @@ end
 -- - bez soobscheniy v chat (ispolzuetsya pri tihoy avtozagruzke pri
 -- vhode na server) ──
 function applyWikiRatesForServer(serverName, silent)
+    if PCS_TAMPER then return false end   -- файл изменён: курсы валют отключены
     local r, matched = findWikiRatesForServer(serverName)
     if not r then
         if not silent then
@@ -7319,17 +7617,17 @@ function PD.drawIncomeSection()
         local textX = p0.x + S(16)
         local textY = p0.y + (btnH - blockH) / 2
 
-        dl:AddText(imgui.ImVec2(textX, textY), imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1)), title)
+        dl:AddText(imgui.ImVec2(textX, textY), PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1))), title)
         -- crude "bigger font" for the title: draw it twice with tiny offset for a bolder look
-        dl:AddText(imgui.ImVec2(textX + 0.5, textY), imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1)), title)
+        dl:AddText(imgui.ImVec2(textX + 0.5, textY), PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1))), title)
         dl:AddText(imgui.ImVec2(textX, textY + titleSz.y + S(4)),
-            imgui.ColorConvertFloat4ToU32(iv4(0.92,0.94,0.98,0.85)), subtitle)
+            PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(0.92,0.94,0.98,0.85))), subtitle)
 
         -- иконка-стрелка справа, намекающая, что это открывает попап
         local arrowTxt = u8"\xbb"
         local arrowSz = imgui.CalcTextSize(arrowTxt)
         dl:AddText(imgui.ImVec2(p0.x + btnW - arrowSz.x - S(16), p0.y + (btnH - arrowSz.y) / 2),
-            imgui.ColorConvertFloat4ToU32(iv4(1,1,1,0.8)), arrowTxt)
+            PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(1,1,1,0.8))), arrowTxt)
 
         imgui.SetCursorScreenPos(p0)
         if imgui.InvisibleButton("##pdOpenCalendarBig", imgui.ImVec2(btnW, btnH)) then
@@ -7564,7 +7862,7 @@ function drawTotalInner(s, h)
             dl:AddRectFilled(
                 imgui.ImVec2(p.x,      p.y),
                 imgui.ImVec2(p.x+aw,   p.y+hh),
-                imgui.ColorConvertFloat4ToU32(iv4(r*0.20,g*0.20,b*0.20,0.97)), 12)
+                imgui.ColorConvertFloat4ToU32(iv4(r*0.20,g*0.20,b*0.20,pcsRowA(0.97))), 12)
             dl:AddRect(
                 imgui.ImVec2(p.x,      p.y),
                 imgui.ImVec2(p.x+aw,   p.y+hh),
@@ -8061,7 +8359,7 @@ function drawSettingsInner(h, sw, sh)
             local dl = imgui.GetWindowDrawList()
             local p = imgui.GetCursorScreenPos()
             dl:AddRectFilled(imgui.ImVec2(p.x,p.y), imgui.ImVec2(p.x+aw,p.y+hh),
-                imgui.ColorConvertFloat4ToU32(iv4(r*0.14,g*0.14,b*0.14,0.98)), 10)
+                imgui.ColorConvertFloat4ToU32(iv4(r*0.14,g*0.14,b*0.14,pcsRowA(0.98))), 10)
             dl:AddRect(imgui.ImVec2(p.x,p.y), imgui.ImVec2(p.x+aw,p.y+hh),
                 imgui.ColorConvertFloat4ToU32(iv4(r,g,b,0.70)), 10, 0, 1.3)
             dl:AddRectFilled(imgui.ImVec2(p.x,p.y+8), imgui.ImVec2(p.x+4,p.y+hh-8),
@@ -8092,7 +8390,7 @@ function drawSettingsInner(h, sw, sh)
             dl_s:AddRectFilled(
                 imgui.ImVec2(pp_s.x,      pp_s.y),
                 imgui.ImVec2(pp_s.x+aw_s, pp_s.y+cardH),
-                imgui.ColorConvertFloat4ToU32(iv4(r*0.10,g*0.10,b*0.10,0.92)), 10)
+                imgui.ColorConvertFloat4ToU32(iv4(r*0.10,g*0.10,b*0.10,pcsRowA(0.92))), 10)
             dl_s:AddRect(
                 imgui.ImVec2(pp_s.x,      pp_s.y),
                 imgui.ImVec2(pp_s.x+aw_s, pp_s.y+cardH),
@@ -8183,7 +8481,7 @@ function drawSettingsInner(h, sw, sh)
             dl_f:AddRectFilled(
                 imgui.ImVec2(pp_f.x,      pp_f.y),
                 imgui.ImVec2(pp_f.x+aw_f, pp_f.y+cardHf),
-                imgui.ColorConvertFloat4ToU32(iv4(r*0.10,g*0.10,b*0.10,0.92)), 10)
+                imgui.ColorConvertFloat4ToU32(iv4(r*0.10,g*0.10,b*0.10,pcsRowA(0.92))), 10)
             dl_f:AddRect(
                 imgui.ImVec2(pp_f.x,      pp_f.y),
                 imgui.ImVec2(pp_f.x+aw_f, pp_f.y+cardHf),
@@ -8297,6 +8595,31 @@ function drawSettingsInner(h, sw, sh)
             cfg.rowBgAlpha = rowAlphaBuf[0]
             saveCfg()
         end
+        imgui.PopItemWidth()
+    end
+    imgui.Spacing()
+
+    -- ── прозрачность фона окна и текста: действуют на все вкладки (и на
+    -- историю версий / карточку обновлений); 1.0 = как раньше ──
+    do
+        local winAlphaBuf = imgui.new("float[1]", {cfg.winBgAlpha or 1.0})
+        imgui.PushItemWidth(S(200))
+        if imgui.SliderFloat(u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc \xf4\xee\xed\xe0 \xee\xea\xed\xe0##winBgAlphaSlider",
+                winAlphaBuf, 0.05, 1.0, "%.2f") then
+            cfg.winBgAlpha = winAlphaBuf[0]
+            if not imgui.IsItemDeactivatedAfterEdit then saveCfg() end
+        end
+        if imgui.IsItemDeactivatedAfterEdit and imgui.IsItemDeactivatedAfterEdit() then saveCfg() end
+        imgui.PopItemWidth()
+
+        local textAlphaBuf = imgui.new("float[1]", {cfg.textAlpha or 1.0})
+        imgui.PushItemWidth(S(200))
+        if imgui.SliderFloat(u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc \xf2\xe5\xea\xf1\xf2\xe0##textAlphaSlider",
+                textAlphaBuf, 0.25, 1.0, "%.2f") then
+            cfg.textAlpha = textAlphaBuf[0]
+            if not imgui.IsItemDeactivatedAfterEdit then saveCfg() end
+        end
+        if imgui.IsItemDeactivatedAfterEdit and imgui.IsItemDeactivatedAfterEdit() then saveCfg() end
         imgui.PopItemWidth()
     end
     imgui.Spacing()
@@ -8599,7 +8922,7 @@ local function drawGlobalSettingsPanel()
         dl:AddRectFilled(
             imgui.ImVec2(cp.x, cp.y),
             imgui.ImVec2(cp.x+aw2, cp.y+cardH),
-            imgui.ColorConvertFloat4ToU32(iv4(r0*0.14,g0*0.14,b0*0.14,1.0)), 8)
+            imgui.ColorConvertFloat4ToU32(iv4(r0*0.14,g0*0.14,b0*0.14,pcsRowA(1.0))), 8)
         dl:AddRect(
             imgui.ImVec2(cp.x, cp.y),
             imgui.ImVec2(cp.x+aw2, cp.y+cardH),
@@ -8796,8 +9119,8 @@ end
 -- Всё — глобальное (в файле уже почти 200 локальных переменных).
 -- ============================================================
 PCS_CHANGELOG = {
-    { ver = "1.9.4", label = "v1.9.4", sub = u8"\xcd\xee\xe2\xee\xf1\xf2\xe8 \xf1 GitHub", items = {
-        { "download", "b", u8"\xcd\xee\xe2\xee\xf1\xf2\xe8 \xf1 GitHub", u8"\xd1\xef\xe8\xf1\xee\xea \xe2\xe5\xf0\xf1\xe8\xe9 \xf2\xe5\xef\xe5\xf0\xfc \xe1\xe5\xf0\xb8\xf2\xf1\xff \xe8\xe7 \xf4\xe0\xe9\xeb\xe0 changelog.txt \xe2 \xf0\xe5\xef\xee\xe7\xe8\xf2\xee\xf0\xe8\xe8: \xe4\xee\xe1\xe0\xe2\xe8\xeb\xe8 \xf2\xe5\xea\xf1\xf2 \xed\xe0 GitHub - \xee\xed \xf1\xe0\xec \xef\xee\xff\xe2\xe8\xeb\xf1\xff \xe2 \xe8\xe3\xf0\xe5." },
+    { ver = "1.9.4", label = "v1.9.4", sub = u8"\xcd\xee\xe2\xee\xf1\xf2\xe8 \xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe9", items = {
+        { "download", "b", u8"\xcd\xee\xe2\xee\xf1\xf2\xe8 \xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe9", u8"\xd1\xef\xe8\xf1\xee\xea \xe2\xe5\xf0\xf1\xe8\xe9 \xf2\xe5\xef\xe5\xf0\xfc \xef\xee\xe4\xe3\xf0\xf3\xe6\xe0\xe5\xf2\xf1\xff \xe0\xe2\xf2\xee\xec\xe0\xf2\xe8\xf7\xe5\xf1\xea\xe8: \xe4\xee\xe1\xe0\xe2\xe8\xeb\xe8 \xf2\xe5\xea\xf1\xf2 \xe2 \xf1\xef\xe8\xf1\xee\xea - \xee\xed \xf1\xe0\xec \xef\xee\xff\xe2\xe8\xeb\xf1\xff \xe2 \xe8\xe3\xf0\xe5." },
         { "palette", "p", u8"\xca\xf0\xe0\xf1\xe8\xe2\xee \xe1\xe5\xe7 \xeb\xe8\xf8\xed\xe8\xf5 \xf3\xf1\xe8\xeb\xe8\xe9", u8"\xce\xe1\xfb\xf7\xed\xfb\xe9 \xf2\xe5\xea\xf1\xf2 \xf1\xea\xf0\xe8\xef\xf2 \xf1\xe0\xec \xee\xf4\xee\xf0\xec\xeb\xff\xe5\xf2: \xe8\xea\xee\xed\xea\xe8, \xf6\xe2\xe5\xf2\xe0, \xe7\xe0\xe3\xee\xeb\xee\xe2\xea\xe8 \xe2\xe5\xf0\xf1\xe8\xe9." },
         { "sync", "c", u8"\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5 \xf1\xef\xe8\xf1\xea\xe0 \xea\xed\xee\xef\xea\xee\xe9", u8"\xc2 \xee\xea\xed\xe5 \xab\xc8\xf1\xf2\xee\xf0\xe8\xff \xe2\xe5\xf0\xf1\xe8\xe9\xbb \xf1\xef\xe8\xf1\xee\xea \xec\xee\xe6\xed\xee \xef\xe5\xf0\xe5\xe7\xe0\xe3\xf0\xf3\xe7\xe8\xf2\xfc \xe2\xf0\xf3\xf7\xed\xf3\xfe; \xea\xee\xef\xe8\xff \xf5\xf0\xe0\xed\xe8\xf2\xf1\xff \xed\xe0 \xe4\xe8\xf1\xea\xe5, \xef\xee\xfd\xf2\xee\xec\xf3 \xe1\xe5\xe7 \xe8\xed\xf2\xe5\xf0\xed\xe5\xf2\xe0 \xe2\xf1\xb8 \xf2\xee\xe6\xe5 \xe2\xe8\xe4\xed\xee." },
     } },
@@ -8825,7 +9148,7 @@ PCS_CHANGELOG = {
         { "coins", "g", u8"\xca\xf3\xf0\xf1\xfb \xe2\xe0\xeb\xfe\xf2 \xf1 \xf2\xe5\xeb\xe5\xf4\xee\xed\xe0", u8"\xc0\xea\xf2\xf3\xe0\xeb\xfc\xed\xfb\xe5 \xea\xf3\xf0\xf1\xfb \xef\xee\xe4\xf2\xff\xe3\xe8\xe2\xe0\xfe\xf2\xf1\xff \xef\xf0\xff\xec\xee \xe8\xe7 \xe8\xe3\xf0\xfb." },
         { "palette", "p", u8"\xd6\xe2\xe5\xf2\xe0 \xe8 \xf2\xe5\xec\xfb", u8"\xc2\xfb\xe1\xee\xf0 \xf2\xe5\xec\xfb, \xf1\xe2\xee\xe8 \xf6\xe2\xe5\xf2\xe0 \xe8\xed\xf2\xe5\xf0\xf4\xe5\xe9\xf1\xe0 \xe8 \xf0\xe0\xe4\xf3\xe6\xed\xe0\xff \xee\xe1\xe2\xee\xe4\xea\xe0 \xee\xea\xed\xe0." },
         { "keyboard", "c", u8"\xce\xf2\xea\xf0\xfb\xf2\xe8\xe5 \xec\xe5\xed\xfe", u8"\xca\xee\xec\xe0\xed\xe4\xe0 \xe2 \xf7\xe0\xf2\xe5 \xe8 \xe3\xee\xf0\xff\xf7\xe0\xff \xea\xeb\xe0\xe2\xe8\xf8\xe0 \xe4\xeb\xff \xe1\xfb\xf1\xf2\xf0\xee\xe3\xee \xe2\xfb\xe7\xee\xe2\xe0." },
-        { "download", "b", u8"\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0 \xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe9", u8"\xc0\xe2\xf2\xee\xef\xf0\xee\xe2\xe5\xf0\xea\xe0 \xed\xee\xe2\xee\xe9 \xe2\xe5\xf0\xf1\xe8\xe8 \xed\xe0 GitHub \xe8 \xf1\xee\xee\xe1\xf9\xe5\xed\xe8\xe5 \xe2 \xf7\xe0\xf2\xe5." },
+        { "download", "b", u8"\xcf\xf0\xee\xe2\xe5\xf0\xea\xe0 \xee\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe9", u8"\xc0\xe2\xf2\xee\xef\xf0\xee\xe2\xe5\xf0\xea\xe0 \xed\xee\xe2\xee\xe9 \xe2\xe5\xf0\xf1\xe8\xe8 \xe8 \xf1\xee\xee\xe1\xf9\xe5\xed\xe8\xe5 \xe2 \xf7\xe0\xf2\xe5." },
     } },
 }
 
@@ -8836,7 +9159,7 @@ PCS_CHG_COL = {
 }
 
 -- ============================================================
---  СПИСОК ВЕРСИЙ С GITHUB (v1.9.4)
+--  СПИСОК ВЕРСИЙ С СЕРВЕРА (v1.9.4)
 -- ------------------------------------------------------------
 -- Ты пишешь ОБЫЧНЫЙ ТЕКСТ в файл changelog.txt в корне репозитория (рядом с
 -- manifest.json), скрипт скачивает его и сам оформляет: иконки, цвета,
@@ -8847,7 +9170,7 @@ PCS_CHG_COL = {
 --   (bell) Пункт со своей иконкой | Описание   <- иконка из PCS_IC, необязательно
 --   (bell,g) Иконка и цвет | Описание          <- цвет: g b p o y c r
 --   // строка-комментарий, в игре не показывается
--- Файл читается как UTF-8 (так GitHub его и хранит). Если скачать не вышло —
+-- Файл читается как UTF-8. Если скачать не вышло —
 -- показывается копия с диска, а если её нет — встроенный список выше.
 -- ============================================================
 PCS_NEWS = { entries = nil, loading = false, ok = nil, err = nil, at = 0, cacheTried = false }
@@ -8913,7 +9236,7 @@ function PCS_newsFetch(force)
     if not N.cacheTried then
         N.cacheTried = true
         pcall(function()
-            local body = pcs_ver.readAll(PCS_newsCachePath())
+            local body = pcs_ver.open(pcs_ver.readAll(PCS_newsCachePath()))
             local e = body and PCS_chgParse(body)
             if e then N.entries = e end
         end)
@@ -8929,7 +9252,7 @@ function PCS_newsFetch(force)
             for _, url in ipairs(pcs_ver.rawUrls(pcs_ver.cfg.news or "changelog.txt")) do
                 local okF, e = pcs_ver.fetch(url, tmp, 12)
                 if okF then
-                    body = pcs_ver.readAll(tmp)
+                    body = pcs_ver.open(pcs_ver.readAll(tmp))
                     pcall(os.remove, tmp)
                     if body and #body > 5 then break end
                     body, lastErr = nil, "empty"
@@ -8944,7 +9267,7 @@ function PCS_newsFetch(force)
             N.entries, N.ok, N.err = entries, true, nil
             pcall(function()
                 local f = io.open(PCS_newsCachePath(), "wb")
-                if f then f:write(body); f:close() end
+                if f then f:write(pcs_ver.seal(body)); f:close() end
             end)
         end)
         if not okT then N.ok = false; N.err = tostring(errT) end
@@ -8952,7 +9275,7 @@ function PCS_newsFetch(force)
     end)
 end
 
--- какой список показывать: с GitHub (или копия с диска), иначе встроенный
+-- какой список показывать: с сервера (или копия с диска), иначе встроенный
 function PCS_chgList()
     local N = PCS_NEWS
     if N.entries and #N.entries > 0 then return N.entries, true end
@@ -9015,7 +9338,7 @@ function PCS_chgHeader(idx, e, isOpen)
     local hov = (imgui.IsItemHovered and imgui.IsItemHovered()) or false
     local k = hov and 0.34 or 0.24
     dl:AddRectFilled(p, imgui.ImVec2(p.x + aw, p.y + h),
-        U32(iv4(math.max(r * k, 0.10), math.max(g * k, 0.10), math.max(b * k, 0.10), 0.97)), 6)
+        U32(iv4(math.max(r * k, 0.10), math.max(g * k, 0.10), math.max(b * k, 0.10), pcsRowA(0.97))), 6)
     dl:AddRect(p, imgui.ImVec2(p.x + aw, p.y + h),
         U32(iv4(r * 0.70, g * 0.70, b * 0.70, hov and 0.85 or 0.55)), 6, 0, 1.0)
     dl:AddRectFilled(imgui.ImVec2(p.x, p.y + 4), imgui.ImVec2(p.x + S(3), p.y + h - 4),
@@ -9025,17 +9348,17 @@ function PCS_chgHeader(idx, e, isOpen)
     local ts  = imgui.CalcTextSize(lab)
     local ty  = p.y + (h - ts.y) * 0.5
     local x   = p.x + S(12)
-    dl:AddText(imgui.ImVec2(x, ty), U32(iv4(0.75, 0.80, 0.95, 1.0)),
+    dl:AddText(imgui.ImVec2(x, ty), PCS_TA(U32(iv4(0.75, 0.80, 0.95, 1.0))),
         isOpen and (PCS_IC.chevdown or "v") or (PCS_IC.chevright or ">"))
     x = x + S(22)
-    dl:AddText(imgui.ImVec2(x, ty), U32(iv4(1, 1, 1, 1)), lab)
+    dl:AddText(imgui.ImVec2(x, ty), PCS_TA(U32(iv4(1, 1, 1, 1))), lab)
     x = x + ts.x + S(10)
     if e.ver == SCRIPT_VER then
         local bt = u8"\xd2\xc5\xca\xd3\xd9\xc0\xdf"
         local bs = imgui.CalcTextSize(bt)
         dl:AddRectFilled(imgui.ImVec2(x, p.y + S(7)), imgui.ImVec2(x + bs.x + S(14), p.y + h - S(7)),
             U32(iv4(1.0, 0.78, 0.15, 1.0)), 8)
-        dl:AddText(imgui.ImVec2(x + S(7), p.y + (h - bs.y) * 0.5), U32(iv4(0.10, 0.08, 0.02, 1.0)), bt)
+        dl:AddText(imgui.ImVec2(x + S(7), p.y + (h - bs.y) * 0.5), PCS_TA(U32(iv4(0.10, 0.08, 0.02, 1.0))), bt)
     end
     return clicked
 end
@@ -9090,9 +9413,9 @@ function PCS_chgView()
     local N = PCS_NEWS
     local stTxt, stCol
     if N.loading then
-        stTxt, stCol = u8"\xc7\xe0\xe3\xf0\xf3\xe7\xea\xe0 \xf1\xef\xe8\xf1\xea\xe0 \xf1 GitHub...", iv4(0.55, 0.75, 1.0, 1.0)
+        stTxt, stCol = u8"\xc7\xe0\xe3\xf0\xf3\xe7\xea\xe0 \xf1\xef\xe8\xf1\xea\xe0...", iv4(0.55, 0.75, 1.0, 1.0)
     elseif N.entries and N.ok then
-        stTxt, stCol = u8"\xd1\xef\xe8\xf1\xee\xea \xe7\xe0\xe3\xf0\xf3\xe6\xe5\xed \xf1 GitHub", iv4(0.40, 0.90, 0.55, 1.0)
+        stTxt, stCol = u8"\xd1\xef\xe8\xf1\xee\xea \xe7\xe0\xe3\xf0\xf3\xe6\xe5\xed", iv4(0.40, 0.90, 0.55, 1.0)
     elseif N.entries then
         stTxt, stCol = u8"\xcd\xe5\xf2 \xf1\xe2\xff\xe7\xe8 - \xef\xee\xea\xe0\xe7\xe0\xed\xe0 \xf1\xee\xf5\xf0\xe0\xed\xb8\xed\xed\xe0\xff \xea\xee\xef\xe8\xff", iv4(1.0, 0.82, 0.25, 1.0)
     else
@@ -9151,7 +9474,7 @@ function drawAboutInner(h)
         dl_a:AddRectFilled(
             imgui.ImVec2(ps_a.x,      ps_a.y),
             imgui.ImVec2(ps_a.x+aw_a, ps_a.y+bannerH),
-            imgui.ColorConvertFloat4ToU32(iv4(banBgR,banBgG,banBgB,1.0)), 12)
+            imgui.ColorConvertFloat4ToU32(iv4(banBgR,banBgG,banBgB,pcsRowA(1.0))), 12)
         dl_a:AddRectFilled(
             imgui.ImVec2(ps_a.x,      ps_a.y),
             imgui.ImVec2(ps_a.x+aw_a*0.5, ps_a.y+bannerH),
@@ -9366,7 +9689,7 @@ function drawAboutInner(h)
 
 
         -- ── карточка "Обновления": показывает установленную и
-        -- актуальную (с GitHub) версию, кнопка "Проверить" запускает
+        -- актуальную (с сервера) версию, кнопка "Проверить" запускает
         -- PCS_UPDATE.check(), а когда найдено обновление — рядом
         -- появляется кнопка "Обновить до vX", которая скачивает файл
         -- и перезаписывает им сам скрипт (PCS_UPDATE.install(), см.
@@ -9946,15 +10269,15 @@ function TX.drawLogSection()
         local textX = p0.x + S(16)
         local textY = p0.y + (btnH - blockH) / 2
 
-        dl:AddText(imgui.ImVec2(textX, textY), imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1)), title)
-        dl:AddText(imgui.ImVec2(textX + 0.5, textY), imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1)), title)
+        dl:AddText(imgui.ImVec2(textX, textY), PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1))), title)
+        dl:AddText(imgui.ImVec2(textX + 0.5, textY), PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(1,1,1,1))), title)
         dl:AddText(imgui.ImVec2(textX, textY + titleSz.y + S(4)),
-            imgui.ColorConvertFloat4ToU32(iv4(0.92,0.94,0.98,0.85)), subtitle)
+            PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(0.92,0.94,0.98,0.85))), subtitle)
 
         local arrowTxt = u8"\xbb"
         local arrowSz = imgui.CalcTextSize(arrowTxt)
         dl:AddText(imgui.ImVec2(p0.x + btnW - arrowSz.x - S(16), p0.y + (btnH - arrowSz.y) / 2),
-            imgui.ColorConvertFloat4ToU32(iv4(1,1,1,0.8)), arrowTxt)
+            PCS_TA(imgui.ColorConvertFloat4ToU32(iv4(1,1,1,0.8))), arrowTxt)
 
         -- позиция плитки нужна drawTaxPopupsGlobal(): календарь рисуется
         -- отдельной функцией, вне этого дочернего окна (защита от краша)
@@ -12146,7 +12469,7 @@ function main()
     pcall(sampRegisterChatCommand, "paytax", function() payTaxesThenHotel(false) end)
 
     -- ── команда самообновления: "/pcsupdate" — проверить версию на
-    -- GitHub, "/pcsupdate install" — скачать актуальную версию и
+    -- сервере, "/pcsupdate install" — скачать актуальную версию и
     -- перезаписать ею этот же файл (см. pcsCheckForUpdate /
     -- pcsInstallUpdate выше) ──
     pcall(sampRegisterChatCommand, "pcsupdate", function(arg)
@@ -12161,7 +12484,7 @@ function main()
     -- ── тихая проверка обновлений раз за сессию, через несколько
     -- секунд после старта (чтобы не мешать загрузке остального) —
     -- уведомление в чат придёт, только если реально нашлась более
-    -- новая версия на GitHub ──
+    -- новая версия на сервере ──
     -- подчистить временные файлы обновления от прошлых загрузок
     pcall(function()
         if PCS_UPDATE and PCS_UPDATE.cleanup then PCS_UPDATE.cleanup()
@@ -12197,6 +12520,10 @@ function main()
             end
         end)
     end
+
+    -- проверка целостности файла (sha256 против ключа из manifest, см.
+    -- pcs_ver.integrity); работает независимо от автопроверки обновлений
+    pcall(pcs_ver.integrity)
 
     -- уведомляем игрока в чат, что подхватилась ранее сохранённая
     -- (не дефолтная) команда открытия меню — по просьбе: "если игрок
