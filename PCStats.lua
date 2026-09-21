@@ -2776,11 +2776,314 @@ local function ensureIconFontFile()
     return true
 end
 
+
+-- ============================================================
+--  ПЕРСОНАЖ-КОМПАНЬОН (значок скрипта) — по просьбе. PNG (360x360,
+--  с прозрачностью) зашит base64-строкой ниже, распаковывается на
+--  диск рядом с настройками при первом запуске и грузится как
+--  текстура mimgui (imgui.CreateTextureFromFileInMemory) один раз
+--  в imgui.OnInitialize — так же, как шрифт иконок выше.
+-- ============================================================
+local PCS_COMPANION_FILE = CFG_DIR .. "/pcstats-companion.png"
+local PCS_COMPANION_B64 = table.concat({
+    "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",
+})
+
+-- распаковывает картинку персонажа на диск, если её там ещё нет
+local function ensureCompanionFile()
+    local f = io.open(PCS_COMPANION_FILE, "rb")
+    if f then
+        local sz = f:seek("end")
+        f:close()
+        if sz and sz > 0 then return true end
+    end
+    ensureCfgDir()
+    local raw = b64decode(PCS_COMPANION_B64)
+    if not raw or #raw == 0 then return false end
+    local out = io.open(PCS_COMPANION_FILE, "wb")
+    if not out then return false end
+    out:write(raw)
+    out:close()
+    return true
+end
+
+-- грузит текстуру персонажа в PCS_COMPANION_TEX (вызывается один раз
+-- из imgui.OnInitialize ниже); при неудаче остаётся nil, и весь код
+-- отрисовки персонажа ниже просто ничего не рисует (проверяет тег)
+local function loadCompanionTexture()
+    if not ensureCompanionFile() then return end
+    local f = io.open(PCS_COMPANION_FILE, "rb")
+    if not f then return end
+    local raw = f:read("*a")
+    f:close()
+    if not raw or #raw == 0 then return end
+    PCS_COMPANION_TEX = imgui.CreateTextureFromFileInMemory(raw, #raw)
+end
+
 -- подключаем шрифт иконок в режиме MergeMode поверх обычного шрифта —
 -- после этого ICON_USER/ICON_FIST/ICON_SACK/ICON_GEAR/ICON_INFO можно
 -- вставлять прямо в любой imgui-текст как обычные символы
 imgui.OnInitialize(function()
     pcall(ensureIconFontFile)
+    pcall(loadCompanionTexture)
     pcall(function()
         -- как в рабочей PCStats 11: MergeMode поверх дефолтного шрифта
         local io = imgui.GetIO()
@@ -2942,7 +3245,7 @@ local cfg = {
     -- версии / доступной новой версии / завершении обновления НЕ
     -- пишутся в обычный чат SA-MP, а показываются только всплывающим
     -- уведомлением (тостом) поверх игры
-    updateToastOnly        = false,
+    companionBgEnabled     = true,
 }
 
 -- kastomnye cveta konkretnyh tekstovyh elementov (klikom po tekstu/cifram),
@@ -3128,7 +3431,7 @@ local function applyCfgData(m)
     cfg.taxTotalPaid          = clampNum(m.taxTotalPaid, 0, 1e18, 0.0)
     cfg.taxPayOnLogin         = toBool(m.taxPayOnLogin, false)
     cfg.autoCheckUpdates      = toBool(m.autoCheckUpdates, true)
-    cfg.updateToastOnly       = toBool(m.updateToastOnly, false)
+    cfg.companionBgEnabled    = toBool(m.companionBgEnabled, true)
 
     -- ── учёт дохода PayDay (зарплата/депозит/аксы/AZ из чата) ──
     cfg.incomeTrackEnabled = toBool(m.incomeTrackEnabled, true)
@@ -3236,7 +3539,7 @@ local function saveCfg()
             taxTotalPaid          = tostring(cfg.taxTotalPaid),
             taxPayOnLogin         = tostring(cfg.taxPayOnLogin),
             autoCheckUpdates      = tostring(cfg.autoCheckUpdates ~= false),
-            updateToastOnly       = tostring(cfg.updateToastOnly == true),
+            companionBgEnabled    = tostring(cfg.companionBgEnabled ~= false),
             incomeTrackEnabled = tostring(cfg.incomeTrackEnabled),
             incomeAllTimeMoney = tostring(cfg.incomeAllTimeMoney),
             incomeAllTimeAZ    = tostring(cfg.incomeAllTimeAZ),
@@ -3377,17 +3680,14 @@ local function SFtext(n)
 end
 
 -- ============================================================
---  ВСПЛЫВАЮЩИЕ УВЕДОМЛЕНИЯ (TOAST) — код временно удалён
---  Оставлены заглушки-пустышки, чтобы остальные вызовы pcs_notify /
---  pcs_apply_toast_settings / pcs_toast_test по файлу не падали.
+--  ВСПЛЫВАЮЩИЕ УВЕДОМЛЕНИЯ (TOAST) — код полностью удалён по просьбе.
+--  Все прежние вызовы pcs_notify/pcs_apply_toast_settings/pcs_toast_test,
+--  оставшиеся по файлу, обёрнуты в pcall (см. историю), поэтому
+--  отсутствие этих функций (обращение к неопределённому глобальному
+--  имени в Lua не ошибка) ничего не ломает — тосты просто не рисуются.
 -- ============================================================
-function pcs_notify(text, ntype, duration) end
-function pcs_apply_toast_settings() end
-function pcs_toast_test(kind) end
-PCS_Notify = nil
 
--- pcs_ver.notify теперь всегда пишет в обычный чат (тоста больше нет,
--- поэтому cfg.updateToastOnly больше не подавляет сообщение)
+-- pcs_ver.notify всегда пишет в обычный чат (тоста больше нет)
 function pcs_ver.notify(text, color)
     local plain = tostring(text or "")
     local msg = (color or "{66CCFF}") .. "[PC Stats] " .. plain
@@ -5913,24 +6213,6 @@ lua_thread.create(function()
             end
         end)
 
-        -- п.8: напоминание "до PayDay осталось 5 минут" — считаем от
-        -- времени последнего замеченного PayDay + ~1 час (см. PD.addIncomeEntry)
-        pcall(function()
-            if cfg.toastEnabled ~= false and cfg.notifyPaydayReminderEnabled ~= false and St._pdLastEpoch then
-                -- ФИКС "напоминание за 5 минут до PayDay не работает": тут
-                -- был расчёт "+3600" (через час), хотя сам PayDay на
-                -- сервере приходит примерно раз в ~30 минут (см. комментарий
-                -- в начале модуля PD выше) — окно "осталось <=5 минут"
-                -- почти никогда не совпадало с реальным временем следующей
-                -- выплаты, поэтому напоминание либо не показывалось вовсе,
-                -- либо всплывало в случайный момент.
-                local remain = (St._pdLastEpoch + 1800) - os.time()
-                if remain > 0 and remain <= 300 and not St._pdReminderFired then
-                    St._pdReminderFired = true
-                    pcs_notify(u8"\xc4\xee\x20PayDay\x20\xee\xf1\xf2\xe0\xeb\xee\xf1\xfc\x20\x35\x20\xec\xe8\xed\xf3\xf2\x21", "info")
-                end
-            end
-        end)
     end
 end)
 
@@ -7405,11 +7687,7 @@ function forceCloseMenuNow()
     _taxAnsweredThisDialog = false
     St.awaitingHotkeyBind = false
     St._dangerConfirmKind = nil
-    -- по просьбе: при закрытии меню сразу гасим все всплывающие
-    -- уведомления, а не ждём, пока они сами доиграют анимацию/таймер —
-    -- чтобы после закрытия меню на экране гарантированно ничего не
-    -- "зависало" поверх игры
-    pcall(function() if type(pcs_notify_clear) == "function" then pcs_notify_clear() end end)
+    -- (очистка тостов при закрытии меню убрана вместе с системой тостов)
 end
 
 -- маленькое тонкое окно-подтверждение по центру экрана; вызывается
@@ -8000,17 +8278,8 @@ secTitle(u8"\xd1\xeb\xf3\xf7\xe0\xe9\xed\xfb\xe9\x20\xf6\xe2\xe5\xf2")
         imgui.PopStyleColor(3)
     end
 
-    -- ── по просьбе: вкладка "Уведомления" перенесена сюда же, в
-    -- "Настройки", отдельным разделом ниже (была отдельной вкладкой) ──
-    imgui.Dummy(imgui.ImVec2(0, S(9)))
-    imgui.Separator()
-    imgui.Dummy(imgui.ImVec2(0, S(9)))
-    
-    
     -- (самообновление реализовано: карточка "Обновления" во вкладке
     -- "О скрипте", см. PCS_UPDATE / drawAboutInner)
-
-    drawNotificationsSection()
 
     -- ── нижний отступ, чтобы последний блок не прилипал к краю окна ──
     imgui.Dummy(imgui.ImVec2(0, S(40)))
@@ -8029,232 +8298,6 @@ local function drawSettings(h, sw, sh)
     end
 end
 
--- ============================================================
---  РАЗДЕЛ "УВЕДОМЛЕНИЯ" (по просьбе объединён внутрь вкладки "Настройки",
---  рисуется как продолжение того же скролла — своего собственного
---  child-окна и отступов сверху/снизу больше нет, см. вызов выше) —
---  оформление тостов + сообщение при входе + напоминание про PayDay +
---  уведомление об обновлении курса валют. cfg.toastEnabled — главный
---  переключатель, при выключении отключает ВСЕ уведомления разом ──
--- ============================================================
-function drawNotificationsSection()
-    local _tcAw = imgui.GetContentRegionAvail().x
-
-    -- ── главный переключатель: отключает АБСОЛЮТНО все всплывающие
-    -- уведомления разом (тосты + PayDay/курс/вход) — pcs_notify сам
-    -- проверяет cfg.toastEnabled на входе, так что остальным местам
-    -- ничего дополнительно проверять не нужно ──
-    secTitle(u8"\xc3\xeb\xe0\xe2\xed\xfb\xe9\x20\xef\xe5\xf0\xe5\xea\xeb\xfe\xf7\xe0\xf2\xe5\xeb\xfc")
-    do
-        local isOn = cfg.toastEnabled ~= false
-        if drawToggleSwitch("##toastEnabledToggle", isOn) then
-            cfg.toastEnabled = not isOn
-            saveCfg()
-            pcs_apply_toast_settings()
-        end
-        imgui.SameLine(0, S(8))
-        imgui.TextColored(iv4(1,1,1,1), u8"\xc2\xea\xeb\xfe\xf7\xe8\xf2\xfc\x20\xe2\xf1\xe5\x20\xe2\xf1\xef\xeb\xfb\xe2\xe0\xfe\xf9\xe8\xe5\x20\xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xff")
-    end
-
-    imgui.Dummy(imgui.ImVec2(0, S(9)))
-    imgui.Separator()
-    imgui.Dummy(imgui.ImVec2(0, S(6)))
-
-    -- ── три отдельных вида уведомлений — каждый со своим тумблером,
-    -- дополнительно к общему выключателю выше ──
-    secTitle(u8"\xd2\xe8\xef\xfb\x20\xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xe9")
-    do
-        local isOn = cfg.notifyWelcomeEnabled ~= false
-        if drawToggleSwitch("##notifyWelcomeToggle", isOn) then
-            cfg.notifyWelcomeEnabled = not isOn; saveCfg()
-        end
-        imgui.SameLine(0, S(8))
-        imgui.TextColored(iv4(1,1,1,1), u8"\xd1\xee\xee\xe1\xf9\xe5\xed\xe8\xe5\x20\xef\xf0\xe8\x20\xe2\xf5\xee\xe4\xe5\x20\x28\xea\xee\xec\xe0\xed\xe4\xe0\x20\xee\xf2\xea\xf0\xfb\xf2\xe8\xff\x20\xec\xe5\xed\xfe\x29")
-    end
-    imgui.Spacing()
-    do
-        local isOn = cfg.notifyPaydayReminderEnabled ~= false
-        if drawToggleSwitch("##notifyPdReminderToggle", isOn) then
-            cfg.notifyPaydayReminderEnabled = not isOn; saveCfg()
-        end
-        imgui.SameLine(0, S(8))
-        imgui.TextColored(iv4(1,1,1,1), u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5\x20\xe7\xe0\x20\x35\x20\xec\xe8\xed\xf3\xf2\x20\xe4\xee\x20PayDay")
-    end
-    imgui.Spacing()
-    do
-        -- ФИКС/ДОБАВЛЕНО (по просьбе): флаг "не показывать сообщения об
-        -- обновлении скрипта в обычном чате — только всплывающим
-        -- уведомлением поверх игры" (см. pcs_ver.notify выше по файлу)
-        local isOn = cfg.updateToastOnly == true
-        if drawToggleSwitch("##updateToastOnlyToggle", isOn) then
-            cfg.updateToastOnly = not isOn; saveCfg()
-        end
-        imgui.SameLine(0, S(8))
-        imgui.TextColored(iv4(1,1,1,1), u8"\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xff\x20\xf1\xea\xf0\xe8\xef\xf2\xe0\x20\x97\x20\xf2\xee\xeb\xfc\xea\xee\x20\xe2\xf1\xef\xeb\xfb\xe2\xe0\xfe\xf9\xe8\xec\x20\xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xe5\xec\x20\x28\xe1\xe5\xe7\x20\xf7\xe0\xf2\xe0\x29")
-    end
-
-    -- ФИКС (по просьбе): тумблер "Обновление курса валют" убран совсем.
-    -- ФИКС (по просьбе): тумблер "Автообновлять курс по таймеру" и слайдер
-    -- интервала убраны совсем — обновление курса больше не выполняется
-    -- по таймеру автоматически.
-
-    imgui.Dummy(imgui.ImVec2(0, S(9)))
-    imgui.Separator()
-    imgui.Dummy(imgui.ImVec2(0, S(6)))
-
-    -- ── оформление плашек (тосты) ──
-    secTitle(u8"\xce\xf4\xee\xf0\xec\xeb\xe5\xed\xe8\xe5\x20\xef\xeb\xe0\xf8\xe5\xea")
-
-    imgui.Spacing()
-    imgui.TextColored(thDim(), u8"\xcf\xee\xeb\xee\xe6\xe5\xed\xe8\xe5\x20\xed\xe0\x20\xfd\xea\xf0\xe0\xed\xe5")
-    do
-        local r0,g0,b0 = getAcc()
-        local function _posBtn(lbl, active, onClick)
-            if active then
-                imgui.PushStyleColor(imgui.Col.Button,        iv4(r0,g0,b0,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r0,g0,b0,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r0,g0,b0,1.0))
-            else
-                imgui.PushStyleColor(imgui.Col.Button,        iv4(r0*0.25,g0*0.25,b0*0.25,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(r0*0.45,g0*0.45,b0*0.45,1.0))
-                imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(r0*0.65,g0*0.65,b0*0.65,1.0))
-            end
-            if imgui.Button(lbl, imgui.ImVec2((_tcAw - S(12))/4, S(28))) then onClick() end
-            imgui.PopStyleColor(3)
-        end
-        _posBtn(u8"\xd1\xeb\xe5\xe2\xe0##toastPosLeft", cfg.toastPosH == "left", function()
-            cfg.toastPosH = "left"; saveCfg(); pcs_apply_toast_settings()
-        end)
-        imgui.SameLine(0, S(4))
-        _posBtn(u8"\xd1\xef\xf0\xe0\xe2\xe0##toastPosRight", cfg.toastPosH ~= "left", function()
-            cfg.toastPosH = "right"; saveCfg(); pcs_apply_toast_settings()
-        end)
-        imgui.SameLine(0, S(4))
-        _posBtn(u8"\xd1\xe2\xe5\xf0\xf5\xf3##toastPosTop", cfg.toastPosV == "top", function()
-            cfg.toastPosV = "top"; saveCfg(); pcs_apply_toast_settings()
-        end)
-        imgui.SameLine(0, S(4))
-        _posBtn(u8"\xd1\xed\xe8\xe7\xf3##toastPosBottom", cfg.toastPosV ~= "top", function()
-            cfg.toastPosV = "bottom"; saveCfg(); pcs_apply_toast_settings()
-        end)
-    end
-
-    imgui.Spacing()
-    do
-        if not St.toastWidthBuf then St.toastWidthBuf = imgui.new.float(cfg.toastWidth or 320) end
-        imgui.TextColored(thDim(), u8"\xd8\xe8\xf0\xe8\xed\xe0\x20\xef\xeb\xe0\xf8\xea\xe8")
-        imgui.SetNextItemWidth(_tcAw)
-        if imgui.SliderFloat("##toastWidth", St.toastWidthBuf, 200, 520, "%.0f px") then
-            cfg.toastWidth = St.toastWidthBuf[0]; saveCfg(); pcs_apply_toast_settings()
-        end
-    end
-
-    imgui.Spacing()
-    do
-        if not St.toastRoundBuf then St.toastRoundBuf = imgui.new.float(cfg.toastCornerRadius or 8) end
-        imgui.TextColored(thDim(), u8"\xd1\xea\xf0\xf3\xe3\xeb\xe5\xed\xe8\xe5\x20\xf3\xe3\xeb\xee\xe2")
-        imgui.SetNextItemWidth(_tcAw)
-        if imgui.SliderFloat("##toastRound", St.toastRoundBuf, 0, 20, "%.0f") then
-            cfg.toastCornerRadius = St.toastRoundBuf[0]; saveCfg(); pcs_apply_toast_settings()
-        end
-    end
-
-    imgui.Spacing()
-    do
-        if not St.toastDurBuf then St.toastDurBuf = imgui.new.float(cfg.toastDuration or 6.0) end
-        imgui.TextColored(thDim(), u8"\xc4\xeb\xe8\xf2\xe5\xeb\xfc\xed\xee\xf1\xf2\xfc\x20\xef\xee\xea\xe0\xe7\xe0\x2c\x20\xf1\xe5\xea")
-        imgui.SetNextItemWidth(_tcAw)
-        if imgui.SliderFloat("##toastDuration", St.toastDurBuf, 1.5, 20.0, "%.1f") then
-            cfg.toastDuration = St.toastDurBuf[0]; saveCfg(); pcs_apply_toast_settings()
-        end
-    end
-
-    imgui.Spacing()
-    do
-        if not St.toastAnimBuf then St.toastAnimBuf = imgui.new.float(cfg.toastAnimSpeed or 10.0) end
-        imgui.TextColored(thDim(), u8"\xd1\xea\xee\xf0\xee\xf1\xf2\xfc\x20\xe0\xed\xe8\xec\xe0\xf6\xe8\xe8\x20\xef\xee\xff\xe2\xeb\xe5\xed\xe8\xff\x2f\xe8\xf1\xf7\xe5\xe7\xed\xee\xe2\xe5\xed\xe8\xff")
-        imgui.SetNextItemWidth(_tcAw)
-        if imgui.SliderFloat("##toastAnim", St.toastAnimBuf, 2.0, 25.0, "%.1f") then
-            cfg.toastAnimSpeed = St.toastAnimBuf[0]; saveCfg(); pcs_apply_toast_settings()
-        end
-    end
-
-    imgui.Spacing()
-    do
-        if not St.toastMaxvBuf then St.toastMaxvBuf = imgui.new.float(cfg.toastMaxVisible or 5) end
-        imgui.TextColored(thDim(), u8"\xcc\xe0\xea\xf1\x2e\x20\xef\xeb\xe0\xf8\xe5\xea\x20\xee\xe4\xed\xee\xe2\xf0\xe5\xec\xe5\xed\xed\xee")
-        imgui.SetNextItemWidth(_tcAw)
-        if imgui.SliderFloat("##toastMaxv", St.toastMaxvBuf, 1, 10, "%.0f") then
-            cfg.toastMaxVisible = math.floor(St.toastMaxvBuf[0]); saveCfg(); pcs_apply_toast_settings()
-        end
-    end
-
-    imgui.Spacing()
-    do
-        if not St.toastBgBuf then
-            St.toastBgBuf = imgui.new.float[3](cfg.toastBgR or 0.08, cfg.toastBgG or 0.08, cfg.toastBgB or 0.10)
-        end
-        imgui.TextColored(thDim(), u8"\xd6\xe2\xe5\xf2\x20\xf4\xee\xed\xe0")
-        imgui.SetNextItemWidth(_tcAw)
-        if imgui.ColorEdit3("##toastBg", St.toastBgBuf) then
-            cfg.toastBgR, cfg.toastBgG, cfg.toastBgB = St.toastBgBuf[0], St.toastBgBuf[1], St.toastBgBuf[2]
-            saveCfg(); pcs_apply_toast_settings()
-        end
-    end
-
-    imgui.Spacing()
-    do
-        if not St.toastTextBuf then
-            St.toastTextBuf = imgui.new.float[3](cfg.toastTextR or 0.94, cfg.toastTextG or 0.94, cfg.toastTextB or 0.96)
-        end
-        imgui.TextColored(thDim(), u8"\xd6\xe2\xe5\xf2\x20\xf2\xe5\xea\xf1\xf2\xe0")
-        imgui.SetNextItemWidth(_tcAw)
-        if imgui.ColorEdit3("##toastText", St.toastTextBuf) then
-            cfg.toastTextR, cfg.toastTextG, cfg.toastTextB = St.toastTextBuf[0], St.toastTextBuf[1], St.toastTextBuf[2]
-            saveCfg(); pcs_apply_toast_settings()
-        end
-    end
-
-    -- ФИКС (по просьбе): ручной тумблер "Рамка плашки" убран — теперь
-    -- рамка у уведомлений включается автоматически, синхронно с
-    -- "Радужная (переливающейся) обводкой" главного меню (см. cfg.rainbowBorder,
-    -- вкладка "Настройки" → "Оформление меню"). См. _draw_toast ниже.
-
-    -- ── по просьбе: кнопки, чтобы проверить, как выглядят всплывающие
-    -- уведомления, прямо здесь в настройках, не выходя и не дожидаясь
-    -- реального события (оплаты, курса и т.п.) ──
-    imgui.Dummy(imgui.ImVec2(0, S(9)))
-    imgui.Separator()
-    imgui.Dummy(imgui.ImVec2(0, S(6)))
-    secTitle(u8"\xd2\xe5\xf1\xf2\x20\xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xe9")
-    imgui.Spacing()
-    do
-        local btnW = (_tcAw - S(12)) / 4
-        -- ФИКС (по просьбе): кнопки "Тест" теперь окрашены под цвет
-        -- реального уведомления этого типа (PCS_NOTIF_COLORS, см. выше по
-        -- файлу) — раньше все пять кнопок были одинаковыми серыми, и
-        -- нельзя было сразу понять, какая кнопка какой тип покажет
-        local function _testBtn(lbl, kind)
-            local c = (PCS_NOTIF_COLORS and PCS_NOTIF_COLORS[kind]) or {getAcc()}
-            imgui.PushStyleColor(imgui.Col.Button,        iv4(c[1]*0.45, c[2]*0.45, c[3]*0.45, 1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(c[1]*0.75, c[2]*0.75, c[3]*0.75, 1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(c[1],      c[2],      c[3],      1.0))
-            if imgui.Button(lbl, imgui.ImVec2(btnW, S(28))) then
-                pcall(pcs_toast_test, kind)
-            end
-            imgui.PopStyleColor(3)
-        end
-        _testBtn(u8"\xc8\xed\xf4\xee##toastTestInfo", "info")
-        imgui.SameLine(0, S(4))
-        _testBtn(u8"\xd3\xf1\xef\xe5\xf5##toastTestOk", "success")
-        imgui.SameLine(0, S(4))
-        _testBtn(u8"\xc2\xed\xe8\xec\xe0\xed\xe8\xe5##toastTestWarn", "warning")
-        imgui.SameLine(0, S(4))
-        _testBtn(u8"\xce\xf8\xe8\xe1\xea\xe0##toastTestErr", "error")
-        imgui.SameLine(0, S(4))
-        _testBtn(u8"PayDay##toastTestPd", "payday")
-    end
-end
 
 -- ============================================================
 --  Š’Š�Š›Š�Š”Š�Š� 4: Š˛ Š�Š�Š Š�Š�Š¢Š•  (Š²Ń�Šµ Š±Š»Š¾ŠŗŠø Ń� ŠŗŃ€Š°Ń�ŠøŠ²Š¾Š¹ Ń€Š°Š¼ŠŗŠ¾Š¹)
@@ -8367,14 +8410,13 @@ local function drawGlobalSettingsPanel()
 
         imgui.SetCursorPos(imgui.ImVec2(S(10), S(52)))
         do
-            local isOn = cfg.toastEnabled ~= false
-            if drawToggleSwitch("##profileToastToggle", isOn) then
-                cfg.toastEnabled = not isOn
+            local isOn = cfg.companionBgEnabled ~= false
+            if drawToggleSwitch("##companionBgToggle", isOn) then
+                cfg.companionBgEnabled = not isOn
                 saveCfg()
-                pcs_apply_toast_settings()
             end
             imgui.SameLine(0, S(8))
-            imgui.TextColored(iv4(1,1,1,1), u8"\xc2\xea\xeb\xfe\xf7\xe8\xf2\xfc\x20\xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xff")
+            imgui.TextColored(iv4(1,1,1,1), u8"\xcf\xe5\xf0\xf1\xee\xed\xe0\xe6\x20\xed\xe0\x20\xf4\xee\xed\xe5")
         end
         imgui.EndChild()
         imgui.PopStyleColor()
@@ -10139,6 +10181,25 @@ imgui.OnFrame(
         PCS_GUARD.mark("frame: Begin ok")
         imgui.SetWindowFontScale(St.UI_SCALE * (cfg.fontSize > 0 and cfg.fontSize or 1.25))
 
+        -- ── ПЕРСОНАЖ-КОМПАНЬОН НА ФОНЕ (по просьбе) — рисуется одним из
+        -- первых вызовов кадра, поэтому остаётся визуально "под" всем
+        -- остальным содержимым окна. Тумблер — карточка профиля →
+        -- "Персонаж на фоне" (cfg.companionBgEnabled); по умолчанию вкл ──
+        if PCS_COMPANION_TEX and cfg.companionBgEnabled ~= false then
+            pcall(function()
+                local dlBg = imgui.GetWindowDrawList()
+                local wpBg = imgui.GetWindowPos()
+                local wsBg = imgui.GetWindowSize()
+                local sizeBg = S(220)
+                local x2 = wpBg.x + wsBg.x - S(10)
+                local y2 = wpBg.y + wsBg.y - S(10)
+                dlBg:AddImage(PCS_COMPANION_TEX,
+                    imgui.ImVec2(x2 - sizeBg, y2 - sizeBg), imgui.ImVec2(x2, y2),
+                    imgui.ImVec2(0, 0), imgui.ImVec2(1, 1),
+                    imgui.ColorConvertFloat4ToU32(iv4(1, 1, 1, 0.14)))
+            end)
+        end
+
         -- закрытие главного меню по Esc теперь целиком в onKeyDown() —
         -- см. блок "ЗАКРЫТИЕ ГЛАВНОГО МЕНЮ ПО ESC" выше по файлу; там оно
         -- срабатывает надёжно независимо от фокуса ImGui-окна
@@ -10166,6 +10227,15 @@ imgui.OnFrame(
             imgui.PushStyleColor(imgui.Col.ChildBg, iv4(0,0,0,0))
             imgui.BeginChild("##titlebar", imgui.ImVec2(aw0, th0), false)
             pcall(function()
+                -- ── значок персонажа в шапке (по просьбе) — рисуется
+                -- всегда, без тумблера отключения, в отличие от фонового
+                -- персонажа ниже по окну ──
+                if PCS_COMPANION_TEX then
+                    local icoSz = th0 - S(10)
+                    imgui.SetCursorPos(imgui.ImVec2(S(6), (th0 - icoSz) * 0.5))
+                    imgui.Image(PCS_COMPANION_TEX, imgui.ImVec2(icoSz, icoSz))
+                end
+
                 local titleStr = u8"  PC Stats  v" .. SCRIPT_VER
                 local tsz = imgui.CalcTextSize(titleStr)
                 imgui.SetCursorPos(imgui.ImVec2(aw0*0.5 - tsz.x*0.5, (th0 - tsz.y)*0.5))
@@ -10577,25 +10647,9 @@ local _okSC, _errSC = pcall(function()
                         St.custRbuf[0]=a[1]; St.custGbuf[0]=a[2]; St.custBbuf[0]=a[3]
                         St.rowBgRbuf[0]=a[1]; St.rowBgGbuf[0]=a[2]; St.rowBgBbuf[0]=a[3]
                         _sw_win_init=nil
+                        cfg.companionBgEnabled = true
 
-                        -- по просьбе: сюда же влит сброс бывшей отдельной
-                        -- вкладки "Уведомления" (теперь просто раздел внутри
-                        -- "Настроек" — см. drawNotificationsSection)
-                        cfg.toastEnabled = true
-                        cfg.notifyWelcomeEnabled = true
-                        cfg.notifyPaydayReminderEnabled = true
-                        cfg.notifyCryptoUpdateEnabled = true
-                        cfg.updateToastOnly = false
-                        cfg.toastPosH = "right"; cfg.toastPosV = "bottom"
-                        cfg.toastWidth = 320; cfg.toastCornerRadius = 8
-                        cfg.toastDuration = 6.0; cfg.toastAnimSpeed = 10.0
-                        cfg.toastMaxVisible = 5
-                        cfg.toastBgR, cfg.toastBgG, cfg.toastBgB = 0.08, 0.08, 0.10
-                        cfg.toastTextR, cfg.toastTextG, cfg.toastTextB = 0.94, 0.94, 0.96
-                        St.toastWidthBuf, St.toastRoundBuf, St.toastDurBuf = nil, nil, nil
-                        St.toastAnimBuf, St.toastMaxvBuf, St.toastBgBuf, St.toastTextBuf = nil, nil, nil, nil
-
-                        saveCfg(); pcs_apply_toast_settings()
+                        saveCfg()
                     end
                     imgui.PopStyleColor(3)
                 elseif St.activeTab == 3 then
@@ -11495,20 +11549,6 @@ function main()
         end)
         pcall(sampAddChatMessage,
             "{00FF88}[MSW v" .. SCRIPT_VER .. "] {FFFFFF}PC Stats | Cmd: {00FF88}/sw", -1)
-        -- ── п.7: всплывающее уведомление при входе с той же командой,
-        -- что и в чате выше (по просьбе — не только текст в чат) ──
-        if cfg.notifyWelcomeEnabled ~= false then
-            pcall(function()
-                -- ФИКС "нет тоста при входе": pcs_notify() ничего не рисует,
-                -- пока St._toastSessionActive не true — раньше это выставлялось
-                -- только при первом открытии меню игроком, а приветственный
-                -- тост при входе срабатывал ДО этого момента и всегда молча
-                -- пропускался. Включаем тосты явно уже здесь.
-                St._toastSessionActive = true
-                pcs_notify(u8"\xd2\xf3\xea\xed\xe8\xf2\xe5\x20/" .. tostring(_registeredMenuCmd or cfg.menuOpenCmd or "sw") ..
-                    u8"\x20\xe4\xeb\xff\x20\xee\xf2\xea\xf0\xfb\xf2\xe8\xff\x20\xec\xe5\xed\xfe", "info")
-            end)
-        end
     end)
 
     -- ── оплата при входе: ждём ровно 1 минуту после спавна и сами
