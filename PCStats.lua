@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.2"
+local SCRIPT_VER = "1.8.3"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
