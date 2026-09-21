@@ -1,5 +1,6 @@
 {
-  "version": "1.8.0",
-  "release_date": "20.09.2026",
-  "required": false
+  "version": "1.9.2",
+  "release_date": "21.09.2026",
+  "required": false,
+  "file": "PCStats.lua"
 }
