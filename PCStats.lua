@@ -3,7 +3,7 @@ script_description("Statistika personazha | Arizona PC | by Marco_Santiago (PC p
 script_author("Marco_Santiago")
 
 
-local SCRIPT_VER = "1.8.1"
+local SCRIPT_VER = "1.9.4"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -368,6 +368,7 @@ pcs_ver.cfg = {
     branches    = { "main", "master" },   -- пробуем по очереди (при 404)
     file        = "PCStats.lua",
     manifest    = "manifest.json",
+    news        = "changelog.txt",       -- v1.9.4: текст "Что нового" (см. PCS_newsFetch)
     check_throttle  = 60,    -- сек между тихими проверками
     auto_interval   = 300,   -- автопроверка раз в 5 мин (см. PCS_UPDATE_AUTO_SECONDS)
     notify_interval = 0,     -- каждая автопроверка напоминает, пока не обновились
@@ -8795,6 +8796,11 @@ end
 -- Всё — глобальное (в файле уже почти 200 локальных переменных).
 -- ============================================================
 PCS_CHANGELOG = {
+    { ver = "1.9.4", label = "v1.9.4", sub = u8"\xcd\xee\xe2\xee\xf1\xf2\xe8 \xf1 GitHub", items = {
+        { "download", "b", u8"\xcd\xee\xe2\xee\xf1\xf2\xe8 \xf1 GitHub", u8"\xd1\xef\xe8\xf1\xee\xea \xe2\xe5\xf0\xf1\xe8\xe9 \xf2\xe5\xef\xe5\xf0\xfc \xe1\xe5\xf0\xb8\xf2\xf1\xff \xe8\xe7 \xf4\xe0\xe9\xeb\xe0 changelog.txt \xe2 \xf0\xe5\xef\xee\xe7\xe8\xf2\xee\xf0\xe8\xe8: \xe4\xee\xe1\xe0\xe2\xe8\xeb\xe8 \xf2\xe5\xea\xf1\xf2 \xed\xe0 GitHub - \xee\xed \xf1\xe0\xec \xef\xee\xff\xe2\xe8\xeb\xf1\xff \xe2 \xe8\xe3\xf0\xe5." },
+        { "palette", "p", u8"\xca\xf0\xe0\xf1\xe8\xe2\xee \xe1\xe5\xe7 \xeb\xe8\xf8\xed\xe8\xf5 \xf3\xf1\xe8\xeb\xe8\xe9", u8"\xce\xe1\xfb\xf7\xed\xfb\xe9 \xf2\xe5\xea\xf1\xf2 \xf1\xea\xf0\xe8\xef\xf2 \xf1\xe0\xec \xee\xf4\xee\xf0\xec\xeb\xff\xe5\xf2: \xe8\xea\xee\xed\xea\xe8, \xf6\xe2\xe5\xf2\xe0, \xe7\xe0\xe3\xee\xeb\xee\xe2\xea\xe8 \xe2\xe5\xf0\xf1\xe8\xe9." },
+        { "sync", "c", u8"\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xe8\xe5 \xf1\xef\xe8\xf1\xea\xe0 \xea\xed\xee\xef\xea\xee\xe9", u8"\xc2 \xee\xea\xed\xe5 \xab\xc8\xf1\xf2\xee\xf0\xe8\xff \xe2\xe5\xf0\xf1\xe8\xe9\xbb \xf1\xef\xe8\xf1\xee\xea \xec\xee\xe6\xed\xee \xef\xe5\xf0\xe5\xe7\xe0\xe3\xf0\xf3\xe7\xe8\xf2\xfc \xe2\xf0\xf3\xf7\xed\xf3\xfe; \xea\xee\xef\xe8\xff \xf5\xf0\xe0\xed\xe8\xf2\xf1\xff \xed\xe0 \xe4\xe8\xf1\xea\xe5, \xef\xee\xfd\xf2\xee\xec\xf3 \xe1\xe5\xe7 \xe8\xed\xf2\xe5\xf0\xed\xe5\xf2\xe0 \xe2\xf1\xb8 \xf2\xee\xe6\xe5 \xe2\xe8\xe4\xed\xee." },
+    } },
     { ver = "1.9.3", label = "v1.9.3", sub = u8"\xd7\xf2\xee \xed\xee\xe2\xee\xe3\xee \xe8 \xe8\xf1\xf2\xee\xf0\xe8\xff \xe2\xe5\xf0\xf1\xe8\xe9", items = {
         { "circleplus", "g", u8"\xc1\xeb\xee\xea \xab\xd7\xf2\xee \xed\xee\xe2\xee\xe3\xee\xbb", u8"\xc2\xee \xe2\xea\xeb\xe0\xe4\xea\xe5 \xab\xce \xf1\xea\xf0\xe8\xef\xf2\xe5\xbb \xf2\xe5\xef\xe5\xf0\xfc \xe2\xe8\xe4\xed\xee, \xf7\xf2\xee \xe4\xee\xe1\xe0\xe2\xeb\xe5\xed\xee \xe8\xec\xe5\xed\xed\xee \xe2 \xe2\xe0\xf8\xe5\xe9 \xe2\xe5\xf0\xf1\xe8\xe8." },
         { "history", "b", u8"\xca\xed\xee\xef\xea\xe0 \xab\xc2\xf1\xe5 \xe2\xe5\xf0\xf1\xe8\xe8\xbb", u8"\xce\xf2\xea\xf0\xfb\xe2\xe0\xe5\xf2 \xe8\xf1\xf2\xee\xf0\xe8\xfe: \xf3 \xea\xe0\xe6\xe4\xee\xe9 \xe2\xe5\xf0\xf1\xe8\xe8 \xf1\xe2\xee\xe9 \xf1\xef\xe8\xf1\xee\xea \xed\xee\xe2\xfb\xf5 \xf4\xf3\xed\xea\xf6\xe8\xe9, \xe1\xeb\xee\xea\xe8 \xf1\xe2\xee\xf0\xe0\xf7\xe8\xe2\xe0\xfe\xf2\xf1\xff." },
@@ -8829,12 +8835,140 @@ PCS_CHG_COL = {
     r = { 1.00, 0.45, 0.55 },
 }
 
--- запись, которая соответствует установленной версии (или самая новая)
+-- ============================================================
+--  СПИСОК ВЕРСИЙ С GITHUB (v1.9.4)
+-- ------------------------------------------------------------
+-- Ты пишешь ОБЫЧНЫЙ ТЕКСТ в файл changelog.txt в корне репозитория (рядом с
+-- manifest.json), скрипт скачивает его и сам оформляет: иконки, цвета,
+-- заголовки версий. Формат файла:
+--   ## 1.9.5 | Короткое название версии      <- заголовок версии
+--   Заголовок пункта | Описание пункта        <- каждая строка = пункт
+--   + Так тоже можно (плюс/минус в начале не обязательны)
+--   (bell) Пункт со своей иконкой | Описание   <- иконка из PCS_IC, необязательно
+--   (bell,g) Иконка и цвет | Описание          <- цвет: g b p o y c r
+--   // строка-комментарий, в игре не показывается
+-- Файл читается как UTF-8 (так GitHub его и хранит). Если скачать не вышло —
+-- показывается копия с диска, а если её нет — встроенный список выше.
+-- ============================================================
+PCS_NEWS = { entries = nil, loading = false, ok = nil, err = nil, at = 0, cacheTried = false }
+
+-- текст -> список версий { {ver=,label=,sub=,items={{ic,col,title,desc},...}}, ... } | nil
+function PCS_chgParse(body)
+    if type(body) ~= "string" then return nil end
+    if body:sub(1, 3) == "\239\187\191" then body = body:sub(4) end -- BOM
+    body = body:gsub("\r", "")
+    local out, cur = {}, nil
+    local pal = { "g", "b", "p", "o", "y", "c", "r" }
+    for line in (body .. "\n"):gmatch("(.-)\n") do
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line == "" or line:sub(1, 2) == "//" then
+            -- пусто / комментарий
+        elseif line:sub(1, 1) == "#" then
+            local h = line:gsub("^#+%s*", "")
+            local head, sub = h:match("^(.-)%s*|%s*(.*)$")
+            head = head or h
+            sub  = sub or ""
+            head = head:gsub("^[vV]%s*(%d)", "%1"):gsub("%s+$", "")
+            if head ~= "" then
+                cur = { ver = head, label = "v" .. head, sub = sub, items = {} }
+                out[#out + 1] = cur
+            end
+        elseif cur then
+            local txt = line:gsub("^[%+%-%*]+%s*", "")
+            txt = txt:gsub("^\226\128\162%s*", "") -- маркер-точка
+            local ic, col
+            local a, b, rest = txt:match("^%(([%a_]+)[,%s]*(%a?)%)%s*(.+)$")
+            if a then
+                if PCS_IC[a] then
+                    ic = a
+                    if b ~= "" and PCS_CHG_COL[b] then col = b end
+                    txt = rest
+                elseif #a == 1 and b == "" and PCS_CHG_COL[a] then
+                    col = a
+                    txt = rest
+                end
+            end
+            local t, d = txt:match("^(.-)%s*|%s*(.*)$")
+            if not t then t, d = txt, "" end
+            if t ~= "" then
+                cur.items[#cur.items + 1] = { ic or "circleplus", col or pal[(#cur.items % #pal) + 1], t, d }
+            end
+        end
+    end
+    local res = {}
+    for _, e in ipairs(out) do
+        if #e.items > 0 then res[#res + 1] = e end
+    end
+    if #res == 0 then return nil end
+    return res
+end
+
+function PCS_newsCachePath()
+    return pcs_ver.tmpDir() .. "/PCStats_news_cache.txt"
+end
+
+-- скачать changelog.txt в фоне (можно звать каждый кадр — есть троттлинг)
+function PCS_newsFetch(force)
+    local N = PCS_NEWS
+    if not N.cacheTried then
+        N.cacheTried = true
+        pcall(function()
+            local body = pcs_ver.readAll(PCS_newsCachePath())
+            local e = body and PCS_chgParse(body)
+            if e then N.entries = e end
+        end)
+    end
+    if N.loading then return end
+    if not force and os.time() - (N.at or 0) < (N.ok and 600 or 90) then return end
+    N.loading = true
+    N.at = os.time()
+    lua_thread.create(function()
+        local okT, errT = pcall(function()
+            local tmp = pcs_ver.tmpDir() .. "/PCStats_news.tmp"
+            local body, lastErr = nil, "no urls"
+            for _, url in ipairs(pcs_ver.rawUrls(pcs_ver.cfg.news or "changelog.txt")) do
+                local okF, e = pcs_ver.fetch(url, tmp, 12)
+                if okF then
+                    body = pcs_ver.readAll(tmp)
+                    pcall(os.remove, tmp)
+                    if body and #body > 5 then break end
+                    body, lastErr = nil, "empty"
+                else
+                    lastErr = tostring(e)
+                    if not lastErr:find("http_404", 1, true) then break end
+                end
+            end
+            if not body then N.ok = false; N.err = lastErr; return end
+            local entries = PCS_chgParse(body)
+            if not entries then N.ok = false; N.err = "parse"; return end
+            N.entries, N.ok, N.err = entries, true, nil
+            pcall(function()
+                local f = io.open(PCS_newsCachePath(), "wb")
+                if f then f:write(body); f:close() end
+            end)
+        end)
+        if not okT then N.ok = false; N.err = tostring(errT) end
+        N.loading = false
+    end)
+end
+
+-- какой список показывать: с GitHub (или копия с диска), иначе встроенный
+function PCS_chgList()
+    local N = PCS_NEWS
+    if N.entries and #N.entries > 0 then return N.entries, true end
+    return PCS_CHANGELOG, false
+end
+
+-- запись, которая соответствует установленной версии
 function PCS_chgCurrent()
+    local list = PCS_chgList()
+    for _, e in ipairs(list) do
+        if e.ver == SCRIPT_VER then return e end
+    end
     for _, e in ipairs(PCS_CHANGELOG) do
         if e.ver == SCRIPT_VER then return e end
     end
-    return PCS_CHANGELOG[1]
+    return list[1]
 end
 
 -- список пунктов: значок + заголовок + описание, слева тонкая линия
@@ -8908,8 +9042,10 @@ end
 
 -- окно "История версий": все версии, что добавлено в каждой
 function PCS_chgView()
+    PCS_newsFetch(false)
+    local list = PCS_chgList()
     St._chgOpen = St._chgOpen or {}
-    local n = #PCS_CHANGELOG
+    local n = #list
     local function isOpenAt(i)
         local o = St._chgOpen[i]
         if o == nil then o = (i == 1) or (n <= 4) end
@@ -8933,22 +9069,40 @@ function PCS_chgView()
 
     imgui.SameLine(0, S(12))
     local avail = imgui.GetContentRegionAvail().x
-    local bw = S(150)
-    if avail > bw then imgui.SetCursorPosX(imgui.GetCursorPosX() + avail - bw) end
+    local bw, rw, gp = S(150), S(38), S(8)
+    if avail > bw + rw + gp then imgui.SetCursorPosX(imgui.GetCursorPosX() + avail - bw - rw - gp) end
     imgui.PushStyleColor(imgui.Col.Button,        iv4(0.28, 0.32, 0.42, 1))
     imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(0.38, 0.42, 0.55, 1))
     imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(0.20, 0.24, 0.32, 1))
     do local _pb2 = prettyBtnPush(6.0)
+    if imgui.Button((PCS_IC.sync or "R") .. "##chgrefresh", imgui.ImVec2(rw, S(28))) then
+        PCS_newsFetch(true)
+    end
+    imgui.SameLine(0, gp)
     local tl = allOpen and (PCS_IC.chevright .. "  " .. u8"\xd1\xe2\xe5\xf0\xed\xf3\xf2\xfc \xe2\xf1\xe5") or (PCS_IC.chevdown .. "  " .. u8"\xd0\xe0\xe7\xe2\xe5\xf0\xed\xf3\xf2\xfc \xe2\xf1\xe5")
     if imgui.Button(tl .. "##chgtoggle", imgui.ImVec2(bw, S(28))) then
         for i = 1, n do St._chgOpen[i] = not allOpen end
     end
     prettyBtnPop(_pb2) end
     imgui.PopStyleColor(3)
+
+    -- строка статуса: откуда сейчас взят список
+    local N = PCS_NEWS
+    local stTxt, stCol
+    if N.loading then
+        stTxt, stCol = u8"\xc7\xe0\xe3\xf0\xf3\xe7\xea\xe0 \xf1\xef\xe8\xf1\xea\xe0 \xf1 GitHub...", iv4(0.55, 0.75, 1.0, 1.0)
+    elseif N.entries and N.ok then
+        stTxt, stCol = u8"\xd1\xef\xe8\xf1\xee\xea \xe7\xe0\xe3\xf0\xf3\xe6\xe5\xed \xf1 GitHub", iv4(0.40, 0.90, 0.55, 1.0)
+    elseif N.entries then
+        stTxt, stCol = u8"\xcd\xe5\xf2 \xf1\xe2\xff\xe7\xe8 - \xef\xee\xea\xe0\xe7\xe0\xed\xe0 \xf1\xee\xf5\xf0\xe0\xed\xb8\xed\xed\xe0\xff \xea\xee\xef\xe8\xff", iv4(1.0, 0.82, 0.25, 1.0)
+    else
+        stTxt, stCol = u8"\xcd\xe5\xf2 \xf1\xe2\xff\xe7\xe8 - \xef\xee\xea\xe0\xe7\xe0\xed \xe2\xf1\xf2\xf0\xee\xe5\xed\xed\xfb\xe9 \xf1\xef\xe8\xf1\xee\xea", iv4(0.65, 0.68, 0.78, 1.0)
+    end
+    imgui.TextColored(stCol, (PCS_IC.link or "") .. "  " .. stTxt)
     imgui.Spacing()
 
     imgui.BeginChild("##changelogview", imgui.ImVec2(0, 0), false)
-    for i, e in ipairs(PCS_CHANGELOG) do
+    for i, e in ipairs(list) do
         local open = isOpenAt(i)
         if PCS_chgHeader(i, e, open) then
             open = not open
@@ -9364,9 +9518,10 @@ function drawAboutInner(h)
         -- кнопка "Все версии" (история всех версий, см. PCS_chgView) ──
         do
             local okW, errW = PCS_GUARD.call(function()
+                PCS_newsFetch(false)
                 local ce = PCS_chgCurrent()
                 if not ce then return end
-                secTitle((PCS_IC.gift or "") .. "  " .. u8"\xd7\xf2\xee \xed\xee\xe2\xee\xe3\xee \xe2" .. "  v" .. tostring(SCRIPT_VER))
+                secTitle((PCS_IC.gift or "") .. "  " .. u8"\xd7\xf2\xee \xed\xee\xe2\xee\xe3\xee \xe2" .. "  " .. tostring(ce.label or ("v" .. SCRIPT_VER)))
                 PCS_chgItems(ce.items)
                 imgui.Spacing()
                 imgui.PushStyleColor(imgui.Col.Button,        iv4(0.25, 0.35, 0.55, 1.0))
