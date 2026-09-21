@@ -13,7 +13,7 @@ script_author("Marco_Santiago")
 --  Сравнение с GitHub: manifest.json в репо Market88888/CR-Helpers
 --  Если там версия НОВЕЕ SCRIPT_VER → доступно обновление
 -- ============================================================
-local SCRIPT_VER = "1.8.3"
+local SCRIPT_VER = "1.8.2"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -1162,9 +1162,9 @@ end
 
 local AIS = {}
 
-AIS.TAG   = "{c99732}[AIS]{ffffff}"
+AIS.TAG   = "{66CCFF}[PC Stats]{ffffff}"
 AIS.SMILE = ":man:"
-AIS.COLOR = 0xFFe69f35
+AIS.COLOR = -1
 
 -- типы еды (id предмета -> название)
 AIS.FOOD = {
@@ -1290,7 +1290,7 @@ end
 function AIS.dbg(text)
     if not (AIS.s and AIS.s.debug_msg) then return end
     if not text or text == "" then return end
-    print("[AIS] " .. tostring(text))
+    print("[PC Stats/guard] " .. tostring(text))
 end
 
 -- ── низкоуровневые отправки ──
@@ -1328,7 +1328,7 @@ function AIS.run(fn, ...)
     local args = { ... }
     lua_thread.create(function()
         local ok, err = pcall(fn, unpack(args))
-        if not ok then print("[AIS] error: " .. tostring(err)) end
+        if not ok then print("[PC Stats/guard] error: " .. tostring(err)) end
     end)
 end
 
@@ -1599,6 +1599,18 @@ function AIS.CheckAllPet()
         -- ответ сервера молча игнорируется, отчего и кажется, что
         -- "инвентарь открылся и дальше ничего не происходит"
         AIS.load()
+        if AIS.s and AIS.s.enabled == false then
+            -- ФИКС (по просьбе): раньше в этом случае показывалось
+            -- "модуль не инициализирован" — хотя на самом деле модуль
+            -- прекрасно загружен, просто в настройках выключен тумблер
+            -- "Модуль охранников" (AIS.s.enabled = false, сохраняется в
+            -- ais_settings.json между запусками игры). Раньше пользователь
+            -- мог бесконечно жать "Обновить список" без всякого эффекта.
+            -- Теперь при явном нажатии кнопки обновления сами включаем
+            -- модуль и продолжаем скан — заодно сохраняем это в файл ──
+            AIS.s.enabled = true
+            AIS.save()
+        end
         if not AIS.on() then
             AIS.msg("{ff6666}\xcd\xe5 \xe3\xee\xf2\xee\xe2\xee: \xec\xee\xe4\xf3\xeb\xfc \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 \xed\xe5 \xe8\xed\xe8\xf6\xe8\xe0\xeb\xe8\xe7\xe8\xf0\xee\xe2\xe0\xed. \xcf\xee\xef\xf0\xee\xe1\xf3\xe9\xf2\xe5 \xf1\xed\xee\xe2\xe0.")
             return
@@ -1684,7 +1696,7 @@ function AIS.AutoSpawnPet()
     st.CheckAutoSpawn = true
     local ok, err = pcall(AIS._autoSpawn)
     st.CheckAutoSpawn = false
-    if not ok then print("[AIS] AutoSpawnPet error: " .. tostring(err)) end
+    if not ok then print("[PC Stats/guard] AutoSpawnPet error: " .. tostring(err)) end
 end
 
 -- \\uXXXX из JSON -> байты CP1251 (имена охранников иногда приходят экранированными)
@@ -1765,7 +1777,7 @@ function AIS.parseSecurities(str, fullReset)
 
     if found == 0 then
         -- массив есть, но объекты не разобрались — покажем сырой фрагмент в консоли
-        print("[AIS] securities: \xed\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xf0\xe0\xe7\xee\xe1\xf0\xe0\xf2\xfc \xee\xe1\xfa\xe5\xea\xf2\xfb, \xf4\xf0\xe0\xe3\xec\xe5\xed\xf2: " .. tostring(arr):sub(1, 400))
+        print("[PC Stats/guard] securities: \xed\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xf0\xe0\xe7\xee\xe1\xf0\xe0\xf2\xfc \xee\xe1\xfa\xe5\xea\xf2\xfb, \xf4\xf0\xe0\xe3\xec\xe5\xed\xf2: " .. tostring(arr):sub(1, 400))
     end
     return changed
 end
@@ -1844,7 +1856,7 @@ function AIS.onReceivePacket(id, bs)
     pcall(raknetBitStreamResetReadPointer, bs)
     local ok, err = pcall(AIS._onPacket, id, bs)
     pcall(raknetBitStreamResetReadPointer, bs)
-    if not ok then print("[AIS] packet error: " .. tostring(err)) end
+    if not ok then print("[PC Stats/guard] packet error: " .. tostring(err)) end
 end
 
 function AIS._onPacket(id, bs)
@@ -1897,7 +1909,7 @@ function AIS._onPacket(id, bs)
                     end
                 end
             end)
-            if not ok then print("[AIS] inventory action error: " .. tostring(err)) end
+            if not ok then print("[PC Stats/guard] inventory action error: " .. tostring(err)) end
         end)
 
         AIS.hideInventory()
@@ -2107,7 +2119,7 @@ function AIS.loop()
     while true do
         wait(250)
         local ok, err = pcall(AIS.tick)
-        if not ok then print("[AIS] tick error: " .. tostring(err)) end
+        if not ok then print("[PC Stats/guard] tick error: " .. tostring(err)) end
     end
 end
 
@@ -2143,11 +2155,11 @@ function AIS.init()
         AIS._evReg = true
         pcall(addEventHandler, "onReceivePacket", function(id, bs)
             local ok, err = pcall(AIS.onReceivePacket, id, bs)
-            if not ok then print("[AIS] packet error: " .. tostring(err)) end
+            if not ok then print("[PC Stats/guard] packet error: " .. tostring(err)) end
         end)
     end
     lua_thread.create(AIS.loop)
-    print("[AIS] Auto-Interaction Securities 2.0.6 (\xef\xee\xf0\xf2) \xe7\xe0\xe3\xf0\xf3\xe6\xe5\xed")
+    print("[PC Stats] \xec\xee\xe4\xf3\xeb\xfc \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2 \xe7\xe0\xe3\xf0\xf3\xe6\xe5\xed")
 end
 
 -- глобальный доступ
@@ -3069,13 +3081,27 @@ end
 -- из imgui.OnInitialize ниже); при неудаче остаётся nil, и весь код
 -- отрисовки персонажа ниже просто ничего не рисует (проверяет тег)
 local function loadCompanionTexture()
-    if not ensureCompanionFile() then return end
+    if not ensureCompanionFile() then
+        print("[PC Stats] companion: \xed\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xf0\xe0\xf1\xef\xe0\xea\xee\xe2\xe0\xf2\xfc \xea\xe0\xf0\xf2\xe8\xed\xea\xf3 \xed\xe0 \xe4\xe8\xf1\xea")
+        return
+    end
     local f = io.open(PCS_COMPANION_FILE, "rb")
-    if not f then return end
+    if not f then
+        print("[PC Stats] companion: \xed\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xee\xf2\xea\xf0\xfb\xf2\xfc " .. tostring(PCS_COMPANION_FILE))
+        return
+    end
     local raw = f:read("*a")
     f:close()
-    if not raw or #raw == 0 then return end
-    PCS_COMPANION_TEX = imgui.CreateTextureFromFileInMemory(raw, #raw)
+    if not raw or #raw == 0 then
+        print("[PC Stats] companion: \xef\xf3\xf1\xf2\xfb\xe5 \xe4\xe0\xed\xed\xfb\xe5 \xf4\xe0\xe9\xeb\xe0")
+        return
+    end
+    local ok, texOrErr = pcall(imgui.CreateTextureFromFileInMemory, raw, #raw)
+    if not ok then
+        print("[PC Stats] companion: CreateTextureFromFileInMemory \xee\xf8\xe8\xe1\xea\xe0: " .. tostring(texOrErr))
+        return
+    end
+    PCS_COMPANION_TEX = texOrErr
 end
 
 -- подключаем шрифт иконок в режиме MergeMode поверх обычного шрифта —
@@ -3164,7 +3190,7 @@ local cfg = {
     uiLightMode = false,
     autoClosePhone       = true,
     phoneCloseDelayMs    = 300,
-    menuButtonEnabled    = true,
+    menuButtonEnabled    = false,
     menuButtonPos        = "top_right",
     menuButtonSize       = 32,
     menuButtonAlpha      = 0.7,
@@ -3246,6 +3272,15 @@ local cfg = {
     -- пишутся в обычный чат SA-MP, а показываются только всплывающим
     -- уведомлением (тостом) поверх игры
     companionBgEnabled     = true,
+    -- ── по просьбе: доп. настройки персонажа на фоне — прозрачность и
+    -- цветовой тон (тонирование исходной картинки) ──
+    companionBgAlpha       = 0.35,
+    companionTintR         = 1.0,
+    companionTintG         = 1.0,
+    companionTintB         = 1.0,
+    -- ── по просьбе: прозрачность фона строк со статистикой (было
+    -- жёстко зашито 0.98) ──
+    rowBgAlpha             = 0.98,
 }
 
 -- kastomnye cveta konkretnyh tekstovyh elementov (klikom po tekstu/cifram),
@@ -3364,7 +3399,7 @@ local function applyCfgData(m)
     cfg.uiLightMode     = toBool(m.uiLightMode, false)
     cfg.autoClosePhone       = toBool(m.autoClosePhone, true)
     cfg.phoneCloseDelayMs    = tonumber(m.phoneCloseDelayMs) or 300
-    cfg.menuButtonEnabled    = toBool(m.menuButtonEnabled, true)
+    cfg.menuButtonEnabled    = toBool(m.menuButtonEnabled, false)
     cfg.menuButtonPos        = tostring(m.menuButtonPos or "top_right")
     cfg.menuButtonSize       = tonumber(m.menuButtonSize) or 32
     cfg.menuButtonAlpha      = tonumber(m.menuButtonAlpha) or 0.7
@@ -3432,6 +3467,11 @@ local function applyCfgData(m)
     cfg.taxPayOnLogin         = toBool(m.taxPayOnLogin, false)
     cfg.autoCheckUpdates      = toBool(m.autoCheckUpdates, true)
     cfg.companionBgEnabled    = toBool(m.companionBgEnabled, true)
+    cfg.companionBgAlpha      = clampNum(m.companionBgAlpha, 0.05, 1.0, 0.35)
+    cfg.companionTintR        = clampNum(m.companionTintR, 0.0, 1.0, 1.0)
+    cfg.companionTintG        = clampNum(m.companionTintG, 0.0, 1.0, 1.0)
+    cfg.companionTintB        = clampNum(m.companionTintB, 0.0, 1.0, 1.0)
+    cfg.rowBgAlpha            = clampNum(m.rowBgAlpha, 0.10, 1.0, 0.98)
 
     -- ── учёт дохода PayDay (зарплата/депозит/аксы/AZ из чата) ──
     cfg.incomeTrackEnabled = toBool(m.incomeTrackEnabled, true)
@@ -3540,6 +3580,11 @@ local function saveCfg()
             taxPayOnLogin         = tostring(cfg.taxPayOnLogin),
             autoCheckUpdates      = tostring(cfg.autoCheckUpdates ~= false),
             companionBgEnabled    = tostring(cfg.companionBgEnabled ~= false),
+            companionBgAlpha      = tostring(cfg.companionBgAlpha),
+            companionTintR        = tostring(cfg.companionTintR),
+            companionTintG        = tostring(cfg.companionTintG),
+            companionTintB        = tostring(cfg.companionTintB),
+            rowBgAlpha            = tostring(cfg.rowBgAlpha),
             incomeTrackEnabled = tostring(cfg.incomeTrackEnabled),
             incomeAllTimeMoney = tostring(cfg.incomeAllTimeMoney),
             incomeAllTimeAZ    = tostring(cfg.incomeAllTimeAZ),
@@ -3654,6 +3699,22 @@ local function getRowBgColor()
     end
     local r,g,b = getAcc()
     return r, g, b
+end
+
+-- ФИКС "ползунок прозрачности фона за текстом не работает": раньше
+-- cfg.rowBgAlpha читала ТОЛЬКО dataRow(), а все остальные плашки
+-- (infoCard, metricTile, chip, строки PayDay/курсов/лога налогов,
+-- шапка, карточки "Своя оплата" и т.д.) имели зашитую прозрачность
+-- 0.85-0.98, поэтому ползунок ничего не менял на большинстве вкладок.
+-- Теперь у каждой плашки своя "базовая" прозрачность масштабируется
+-- ползунком: при значении по умолчанию (0.98) вид остаётся прежним.
+-- Глобальная функция — чтобы не тратить слот local (лимит 200).
+function pcsRowA(base)
+    local k = (tonumber(cfg.rowBgAlpha) or 0.98) / 0.98
+    local a = (base or 0.98) * k
+    if a < 0.02 then a = 0.02 end
+    if a > 1.0 then a = 1.0 end
+    return a
 end
 -- ============================================================
 --  AUTO UI SCALE (masshtabirovanie pod razreshenie ekrana)
@@ -4211,7 +4272,7 @@ local function infoCard(id, cardH, drawFn)
     dl:AddRectFilled(
         imgui.ImVec2(p.x,    p.y),
         imgui.ImVec2(p.x+aw, p.y+cardH),
-        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.97)), 10)
+        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,pcsRowA(0.97))), 10)
     -- Ń€Š°Š¼ŠŗŠ° Ń� Š°ŠŗŃ†ŠµŠ½Ń‚Š½Ń‹Š¼ Ń†Š²ŠµŃ‚Š¾Š¼
     dl:AddRect(
         imgui.ImVec2(p.x,    p.y),
@@ -4450,7 +4511,7 @@ local function dataRow(label, value, valColor, icon, iconCol)
     dl:AddRectFilled(
         imgui.ImVec2(p.x,       p.y),
         imgui.ImVec2(p.x+avail, p.y+h),
-        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.98)), 5)
+        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,cfg.rowBgAlpha or 0.98)), 5)
     -- Ń‚Š¾Š½ŠŗŠ°Ń¸ Ń€Š°Š¼ŠŗŠ° Ń�Ń‚Ń€Š¾ŠŗŠø Š¾Ń‚ Š°ŠŗŃ†ŠµŠ½Ń‚Š°
     dl:AddRect(
         imgui.ImVec2(p.x,       p.y),
@@ -4527,7 +4588,7 @@ local function metricTile(label, value, col, w, onClickFn)
     dl:AddRectFilled(
         imgui.ImVec2(p.x,   p.y),
         imgui.ImVec2(p.x+w, p.y+h),
-        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.97)), 10)
+        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,pcsRowA(0.97))), 10)
     -- Ń€Š°Š¼ŠŗŠ°
     dl:AddRect(
         imgui.ImVec2(p.x,   p.y),
@@ -4599,7 +4660,7 @@ local function chip(label, value)
         dl:AddRectFilled(
             imgui.ImVec2(p.x,   p.y),
             imgui.ImVec2(p.x+w, p.y+h),
-            imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.97)), 8)
+            imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,pcsRowA(0.97))), 8)
         -- Ń€Š°Š¼ŠŗŠ° Š¾Ń‚ Š°ŠŗŃ†ŠµŠ½Ń‚Š°
         local brR = math.max(r*0.55, 0.20)
         local brG = math.max(g*0.55, 0.20)
@@ -5604,6 +5665,64 @@ function TX.addEntry(isAuto, amount, isNoTax)
     TX.pruneOld()
 end
 
+-- ФИКС (по просьбе "при оплате налогов скрипт должен считать сумму со
+-- строки чата «Вы оплатили все налоги на сумму: 🰢11.400» и показывать её
+-- в логе оплаты налогов"): раньше сумма искалась ТОЛЬКО по знаку "$"
+-- ("%$%s*(...)"), а сервер в этой строке присылает не "$", а свой
+-- символ валюты (🰢) — шаблон не срабатывал, сумма всегда была 0, и в
+-- лог попадало "0" (или устаревшая сумма прошлой оплаты). Теперь берём
+-- первое число ПОСЛЕ слова "сумму", что бы перед ним ни стояло. Точки в
+-- "11.400" — разделители тысяч (см. parseGameNumber), результат 11400.
+function TX.extractChatAmount(clean)
+    if type(clean) ~= "string" or clean == "" then return 0 end
+    local low = cp1251Lower(clean)
+    -- 1) число после слова "сумм" (сумму / суммы) — независимо от символа валюты
+    local from = low:find("\xf1\xf3\xec\xec", 1, true)
+    if from then
+        local numStr = clean:sub(from):match("%d[%d%.,]*")
+        if numStr then
+            numStr = numStr:gsub("[%.,]+$", "")
+            local v = parseGameNumber(numStr)
+            if v and v > 0 then return v end
+        end
+    end
+    -- 2) запасной вариант — старый шаблон со знаком "$"
+    local sumStr = clean:match("%$%s*([%d%s%.,]+)")
+    local v2 = sumStr and parseGameNumber(sumStr) or 0
+    return v2 or 0
+end
+
+-- дописывает/исправляет сумму в САМОЙ СВЕЖЕЙ записи лога (сообщение чата
+-- "Вы оплатили..." иногда приходит уже после того, как скрипт записал
+-- оплату в лог с нулевой суммой), корректирует общий счётчик и
+-- перезаписывает файл на диске
+function TX.fixLastAmount(amount)
+    amount = math.floor((tonumber(amount) or 0) + 0.5)
+    if amount <= 0 then return false end
+    if not St.taxLogLoaded then TX.loadLog() end
+    local e = St.taxEntries[1]
+    if not e or e.noTax then return false end
+    local old = tonumber(e.amount) or 0
+    if old == amount then return true end
+    e.amount = amount
+    cfg.taxTotalPaid = math.max(0, (tonumber(cfg.taxTotalPaid) or 0) - old + amount)
+    pcall(function()
+        ensureCfgDir()
+        local out = io.open(TX.LOG_FILE, "w")
+        if out then
+            -- St.taxEntries хранит новые сверху — на диске пишем в
+            -- хронологическом порядке (как и pruneOld)
+            for i = #St.taxEntries, 1, -1 do
+                local x = St.taxEntries[i]
+                out:write(x.date .. "|" .. x.time .. "|" .. x.amount .. "|" ..
+                    (x.auto and "1" or "0") .. "|" .. (x.noTax and "1" or "0") .. "\n")
+            end
+            out:close()
+        end
+    end)
+    return true
+end
+
 -- фиксирует успешную оплату (своей учётки), обновляет время/сумму последней оплаты
 
 -- Полное закрытие телефона после налогов/курса (несколько Esc + снятие фокуса).
@@ -5651,6 +5770,11 @@ local function onTaxPaymentSuccess(isAuto, amount)
     -- подтверждения, и таймаутом ожидания этого диалога)
     if _taxFinalizeDone then return end
     _taxFinalizeDone = true
+    -- сумма: то, что передали; если 0 — то, что успело прийти из чата
+    -- ("Вы оплатили все налоги на сумму: ...") пока шла оплата
+    if not (amount and amount > 0) then
+        amount = (_taxPendingAmount and _taxPendingAmount > 0) and _taxPendingAmount or 0
+    end
     cfg.taxLastPayTime   = os.time()
     if amount and amount > 0 then
         cfg.taxLastPayAmount = amount
@@ -5665,9 +5789,11 @@ local function onTaxPaymentSuccess(isAuto, amount)
     pcall(sampAddChatMessage, "{00FF88}==============", -1)
     pcall(sampAddChatMessage, "{00FF88}[PC Stats] " ..
         "\xcd\xe0\xeb\xee\xe3\xe8\x20\xf3\xf1\xef\xe5\xf8\xed\xee\x20\xee\xef\xeb\xe0\xf7\xe5\xed\xfb\x21", -1)
-    if cfg.taxLastPayAmount and cfg.taxLastPayAmount > 0 then
+    -- ФИКС: показываем сумму ЭТОЙ оплаты, а не устаревшую cfg.taxLastPayAmount
+    -- от предыдущей (если сумму распознать не удалось)
+    if amount and amount > 0 then
         pcall(sampAddChatMessage, "{FFD700}  \xd1\xf3\xec\xec\xe0\x3a " ..
-            fmtMoney(string.format("%.0f", cfg.taxLastPayAmount)), -1)
+            fmtMoney(string.format("%.0f", amount)), -1)
     end
     -- строка "Способ: ..." убрана по просьбе — она смешивала сырые
     -- CP1251-байты с u8()-конвертированным текстом (u8() ожидает UTF-8
@@ -5677,14 +5803,14 @@ local function onTaxPaymentSuccess(isAuto, amount)
     pcall(sampAddChatMessage, "{00FF88}==============", -1)
     pcall(function()
         local msg = u8"\xcd\xe0\xeb\xee\xe3\xe8\x20\xf3\xf1\xef\xe5\xf8\xed\xee\x20\xee\xef\xeb\xe0\xf7\xe5\xed\xfb\x21"
-        if cfg.taxLastPayAmount and cfg.taxLastPayAmount > 0 then
-            msg = msg .. "  (" .. fmtMoney(string.format("%.0f", cfg.taxLastPayAmount)) .. ")"
+        if amount and amount > 0 then
+            msg = msg .. "  (" .. fmtMoney(string.format("%.0f", amount)) .. ")"
         end
         pcs_notify(msg, "success")
     end)
     _taxState = 0
     _taxExpectedDialogId = nil
-    TX.addEntry(isAuto, amount or cfg.taxLastPayAmount or 0)
+    TX.addEntry(isAuto, (amount and amount > 0) and amount or 0)
     -- ФИКС "крашит игру, если сразу после оплаты налогов делать что-то с
     -- криптой": раньше _phoneOpBusy сбрасывался в false СРАЗУ здесь, а
     -- реальная очистка телефона (программный Esc/закрытие диалога) шла
@@ -6889,7 +7015,7 @@ function PD.drawIncomeRow(entry)
     local bgG = math.max(rg*shade, minV)
     local bgB = math.max(rb*shade, minV)
     dl:AddRectFilled(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x+avail, p.y+h),
-        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.98)), 4)
+        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,pcsRowA(0.98))), 4)
 
     local cols = {
         { w = 0.14, txt = entry.time,                                                     col = thDim() },
@@ -7228,7 +7354,7 @@ function PCS_drawRatesCard()
             local shade = (i % 2 == 0) and 0.13 or 0.07
             local minV  = (i % 2 == 0) and 0.10 or 0.05
             dl:AddRectFilled(p, V2(p.x + aw, p.y + h),
-                U32(iv4(math.max(rr*shade, minV), math.max(rg*shade, minV), math.max(rb*shade, minV), 0.98)), 5)
+                U32(iv4(math.max(rr*shade, minV), math.max(rg*shade, minV), math.max(rb*shade, minV), pcsRowA(0.98))), 5)
             dl:AddRect(p, V2(p.x + aw, p.y + h), U32(iv4(r*0.45, g*0.45, b*0.45, 0.40)), 5, 0, 0.7)
             dl:AddRectFilled(V2(p.x, p.y + 3), V2(p.x + 2, p.y + h - 3),
                 U32(iv4(c.col[1], c.col[2], c.col[3], 0.95)), 1)
@@ -7786,139 +7912,11 @@ function drawSettingsInner(h, sw, sh)
             imgui.SetCursorPosY(imgui.GetCursorPosY()+S(10))
             imgui.TextColored(iv4(1,1,1,1), u8"\xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8")
             imgui.SetCursorPosX(imgui.GetCursorPosX()+S(14))
-            imgui.TextColored(thDim(), u8"\xe8\xed\xf2\xe5\xf0\xf4\xe5\xe9\xf1 \xb7 \xf3\xef\xf0\xe0\xe2\xeb\xe5\xed\xe8\xe5 \xb7 \xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xff")
+            imgui.TextColored(thDim(), u8"\xe8\xed\xf2\xe5\xf0\xf4\xe5\xe9\xf1 \xb7 \xf3\xef\xf0\xe0\xe2\xeb\xe5\xed\xe8\xe5")
             imgui.Dummy(imgui.ImVec2(0, S(14)))
         end
 
-        -- ── единая кнопка выбора цвета: вынесена наверх вкладки, открывает
-        -- одно окно сразу с готовыми цветами, своим цветом и цветом фона
-        -- строк (раньше было разбросано тремя блоками ниже по вкладке) ──
-        do
-            local prT,pgT,pbT = getAcc()
-            -- ярче, чем было (было ×0.20/0.36/0.52)
-            imgui.PushStyleColor(imgui.Col.Button,        iv4(math.min(1,prT*0.55),math.min(1,pgT*0.55),math.min(1,pbT*0.55),1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(math.min(1,prT*0.78),math.min(1,pgT*0.78),math.min(1,pbT*0.78),1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(prT,pgT,pbT,1.0))
-            do local _pbTop = prettyBtnPush(10.0)
-            if imgui.Button(u8"\xc2\xfb\xe1\xee\xf0\x20\xf6\xe2\xe5\xf2\xe0##openColorSettingsPopup", imgui.ImVec2(imgui.GetContentRegionAvail().x, S(34))) then
-                if cfg.custR < 0 then
-                    local _a = getTheme().acc
-                    St.custRbuf[0]=_a[1]; St.custGbuf[0]=_a[2]; St.custBbuf[0]=_a[3]
-                end
-                if cfg.rowBgR < 0 then
-                    local _a2 = getTheme().acc
-                    St.rowBgRbuf[0]=_a2[1]; St.rowBgGbuf[0]=_a2[2]; St.rowBgBbuf[0]=_a2[3]
-                end
-                imgui.OpenPopup("##colorSettingsPopup")
-            end
-            prettyBtnPop(_pbTop) end
-            imgui.PopStyleColor(3)
 
-            pcall(imgui.SetNextWindowSize, imgui.ImVec2(S(300), 0), imgui.Cond and imgui.Cond.Appearing or 0)
-            local _mpsTop = pushModernPopupStyle()
-            -- ФИКС: отдельный pcall именно вокруг BeginPopup/EndPopup этого
-            -- попапа. Раньше при ошибке где-то в его содержимом (например,
-            -- в переборе ALL_STYLE_PRESETS) внешний pcall в drawSettings
-            -- ловил ошибку и не крашил игру В ЭТОТ момент, но EndPopup для
-            -- "##colorSettingsPopup" при этом пропускался — стек imgui
-            -- оставался разбалансирован и мог крашнуть игру позже, на
-            -- следующем кадре (в том числе при переключении вкладки).
-            local beganTop = false
-            local okTop, errTop = pcall(function()
-            if imgui.BeginPopup("##colorSettingsPopup") then
-                beganTop = true
-                -- Edinyy spisok vseh presetov (temy + kombo), edinyy dizayn
-                -- knopok, dubley po tsvetu aktsenta sredi presetov net.
-                local ALL_STYLE_PRESETS = {
-                    {u8(THEMES[1].name), 0.43,0.71,1.0,  0.43*0.35,0.71*0.35,1.0*0.35,  1},
-                    {u8(THEMES[2].name), 0.30,0.85,0.45, 0.30*0.35,0.85*0.35,0.45*0.35, 2},
-                    {u8(THEMES[3].name), 1.0, 0.55,0.20, 1.0*0.35, 0.55*0.35,0.20*0.35, 3},
-                    {u8(THEMES[4].name), 0.75,0.45,1.0,  0.75*0.35,0.45*0.35,1.0*0.35,  4},
-                    {u8(THEMES[5].name), 1.0, 0.80,0.25, 1.0*0.35, 0.80*0.35,0.25*0.35, 5},
-                    {u8(THEMES[6].name), 1.0, 0.25,0.25, 1.0*0.35, 0.25*0.35,0.25*0.35, 6},
-                    {u8"\xce\xea\xe5\xe0\xed",         0.10,0.72,0.90, 0.05,0.35,0.55},  -- Ocean
-                    {u8"\xd0\xee\xe7\xe0",             0.98,0.35,0.65, 0.50,0.08,0.22},  -- Rose
-                    {u8"\xc4\xe6\xf3\xed\xe3\xeb\xe8", 0.35,0.88,0.55, 0.08,0.38,0.18},  -- Jungle
-                    {u8"\xc3\xf0\xee\xe7\xe0",         0.75,0.22,0.95, 0.28,0.05,0.42},  -- Thunder
-                    {u8"\xd5\xf0\xee\xec",             0.92,0.78,0.20, 0.42,0.32,0.04},  -- Chrome
-                    -- "Кровь" убрана (по просьбе, дубль по цвету и по
-                    -- смыслу с готовой темой "Blood" из THEMES[6] выше)
-                    {u8"\xd1\xed\xe5\xe3",             0.88,0.95,1.00, 0.22,0.38,0.52},  -- Snow
-                    {u8"\xd0\xf3\xf1\xf2\xfc",         0.60,0.88,0.35, 0.18,0.38,0.08},  -- Rust
-                    {u8"\xd0\xe5\xf1\xf3\xf0\xf1",     0.20,0.90,0.45, 0.05,0.30,0.14},  -- Resurs
-                    {u8"\xc7\xee\xeb\xee\xf2\xee",     0.98,0.80,0.15, 0.40,0.30,0.03},  -- Zoloto
-                    {u8"\xca\xee\xf0\xe0\xeb\xeb",     0.15,0.85,0.75, 0.04,0.32,0.30},  -- Korall
-                    -- ── добавленные по просьбе дополнительные цвета ──
-                    {u8"\xc0\xec\xe5\xf2\xe8\xf1\xf2", 0.65,0.35,0.90, 0.24,0.10,0.36},  -- Ametist
-                    {u8"\xcc\xff\xf2\xe0",             0.25,0.95,0.75, 0.06,0.36,0.28},  -- Myata
-                    {u8"\xcb\xe0\xe9\xec",             0.70,0.95,0.15, 0.24,0.34,0.03},  -- Laym
-                    {u8"\xc8\xed\xe4\xe8\xe3\xee",     0.30,0.35,0.95, 0.08,0.10,0.42},  -- Indigo
-                    {u8"\xd4\xeb\xe0\xec\xe8\xed\xe3\xee", 1.0,0.45,0.55, 0.42,0.10,0.16}, -- Flamingo
-                    {u8"\xd1\xf2\xe0\xeb\xfc",         0.55,0.65,0.75, 0.16,0.20,0.26},  -- Stal
-                }
-
-                imgui.TextColored(thDim(), u8"\xc3\xee\xf2\xee\xe2\xfb\xe5\x20\xf6\xe2\xe5\xf2\xe0\x3a")
-                imgui.Spacing()
-                local av_c  = imgui.GetContentRegionAvail().x
-                local perRow = 3
-                local gap    = S(6)
-                local btnWC  = (av_c - (perRow-1)*gap) / perRow
-                for i, cp in ipairs(ALL_STYLE_PRESETS) do
-                    local col = (i-1) % perRow
-                    if col > 0 then imgui.SameLine(0, gap) end
-                    local cName = cp[1]
-                    local aR,aG,aB = cp[2],cp[3],cp[4]
-                    local bR,bG,bB = cp[5],cp[6],cp[7]
-                    local themeIdx = cp[8]
-                    local isAct
-                    if themeIdx then
-                        isAct = (cfg.theme == themeIdx and cfg.custR < 0)
-                    else
-                        isAct = math.abs((cfg.custR>=0 and cfg.custR or getTheme().acc[1])-aR)<0.01
-                               and math.abs((cfg.custG>=0 and cfg.custG or getTheme().acc[2])-aG)<0.01
-                               and math.abs((cfg.custB>=0 and cfg.custB or getTheme().acc[3])-aB)<0.01
-                               and math.abs((cfg.rowBgR>=0 and cfg.rowBgR or aR)-bR)<0.01
-                    end
-                    local tip = u8"\xcf\xf0\xe5\xf1\xe5\xf2\x20\xab" .. cName .. u8"\xbb\x3a\x20\xed\xe0\xe6\xec\xe8\xf2\xe5\x2c\x20\xf7\xf2\xee\xe1\xfb\x20\xef\xf0\xe8\xec\xe5\xed\xe8\xf2\xfc"
-                    if drawStyleSwatchButton("stylepreset"..i, cName, aR,aG,aB, bR,bG,bB, btnWC, S(46), isAct, tip) then
-                        if themeIdx then
-                            cfg.theme=themeIdx; cfg.custR=-1; cfg.custG=-1; cfg.custB=-1
-                            St.custRbuf[0]=aR; St.custGbuf[0]=aG; St.custBbuf[0]=aB
-                        else
-                            cfg.custR=aR; cfg.custG=aG; cfg.custB=aB
-                            cfg.rowBgR=bR; cfg.rowBgG=bG; cfg.rowBgB=bB
-                            St.custRbuf[0]=aR; St.custGbuf[0]=aG; St.custBbuf[0]=aB
-                            St.rowBgRbuf[0]=bR; St.rowBgGbuf[0]=bG; St.rowBgBbuf[0]=bB
-                        end
-                        saveCfg()
-                    end
-                    if col == perRow-1 then imgui.Spacing() end
-                end
-
-                imgui.Spacing()
-                do
-                    local pr3,pg3,pb3 = getAcc()
-                    imgui.PushStyleColor(imgui.Col.Button,        iv4(pr3*0.22,pg3*0.22,pb3*0.22,1.0))
-                    imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(pr3*0.40,pg3*0.40,pb3*0.40,1.0))
-                    imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(pr3*0.58,pg3*0.58,pb3*0.58,1.0))
-                    do local _pbc = prettyBtnPush(8.0)
-                    if imgui.Button(u8"\xc7\xe0\xea\xf0\xfb\xf2\xfc##closeColorSettingsPopup", imgui.ImVec2(imgui.GetContentRegionAvail().x, S(30))) then
-                        imgui.CloseCurrentPopup()
-                    end
-                    prettyBtnPop(_pbc) end
-                    imgui.PopStyleColor(3)
-                end
-            end
-            end) -- конец pcall
-            if beganTop then pcall(imgui.EndPopup) end
-            popModernPopupStyle(_mpsTop)
-            if not okTop then
-                pcall(sampAddChatMessage, "{FF6666}[PC Stats] " ..
-                    "\xee\xf8\xe8\xe1\xea\xe0\x20\xef\xee\xef\xe0\xef\xe0\x20\xe2\xfb\xe1\xee\xf0\xe0\x20\xf6\xe2\xe5\xf2\xe0: " .. tostring(errTop), -1)
-            end
-        end
-        imgui.Spacing()
-        imgui.Dummy(imgui.ImVec2(0, S(9)))
 
 
         secTitle(u8"\xd0\xe0\xe7\xec\xe5\xf0 \xee\xea\xed\xe0")
@@ -8092,40 +8090,56 @@ function drawSettingsInner(h, sw, sh)
     -- ═══════════════════════════════════════════════════════════
     --  ЦВЕТА ИНТЕРФЕЙСА (как в MMT: пресеты + RGB-ряды)
     -- ═══════════════════════════════════════════════════════════
-    secTitle(u8"\xc6\xe2\xe5\xf2\xe0 \xe8\xed\xf2\xe5\xf0\xf4\xe5\xe9\xf1\xe0")
+    secTitle(u8"\xd6\xe2\xe5\xf2\xe0 \xe8\xed\xf2\xe5\xf0\xf4\xe5\xe9\xf1\xe0")
     imgui.Spacing()
 
-    -- пресеты (2×3)
+    -- ФИКС (по просьбе): вместо списка из 21 пресета, спрятанного в
+    -- попапе "Выбор цвета" (кнопка и весь попап убраны), оставлено
+    -- только 5 базовых цветов прямо здесь, в виде кнопок-плиток —
+    -- тот же красивый стиль (drawStyleSwatchButton), что был у пресетов
     do
-        local presets = {
-            {u8"\xc7\xe5\xeb\xb8\xed\xe0\xff",     0.25, 0.85, 0.35},
-            {u8"\xd1\xe8\xed\xff\xff",             0.25, 0.55, 0.95},
-            {u8"\xd4\xe8\xee\xeb\xe5\xf2\xee\xe2\xe0\xff", 0.60, 0.35, 0.90},
-            {u8"\xce\xf0\xe0\xed\xe6\xe5\xe2\xe0\xff",     0.95, 0.55, 0.15},
-            {u8"\xc2\xe8\xf8\xed\xb8\xe2\xe0\xff",         0.80, 0.20, 0.35},
-            {u8"\xc3\xf0\xe0\xf4\xe8\xf2",                 0.55, 0.58, 0.62},
+        local presets5 = {
+            {u8"\xc7\xe5\xeb\xb8\xed\xfb\xe9",         0.30,0.85,0.45, 0.30*0.35,0.85*0.35,0.45*0.35},
+            {u8"\xd1\xe8\xed\xe8\xe9",                 0.25,0.55,0.95, 0.25*0.35,0.55*0.35,0.95*0.35},
+            {u8"\xc1\xe5\xe6\xe5\xe2\xfb\xe9",          0.85,0.75,0.55, 0.85*0.35,0.75*0.35,0.55*0.35},
+            {u8"\xce\xf0\xe0\xed\xe6\xe5\xe2\xfb\xe9",  0.95,0.55,0.15, 0.95*0.35,0.55*0.35,0.15*0.35},
+            {u8"\xca\xf0\xe0\xf1\xed\xfb\xe9",          0.90,0.20,0.20, 0.90*0.35,0.20*0.35,0.20*0.35},
         }
-        local gap = S(6)
-        local aw = imgui.GetContentRegionAvail().x
-        local btnW = (aw - gap * 2) / 3
-        for i, p in ipairs(presets) do
-            local name, pr, pg, pb = p[1], p[2], p[3], p[4]
-            if i > 1 and (i - 1) % 3 ~= 0 then imgui.SameLine(0, gap) end
-            imgui.PushStyleColor(imgui.Col.Button,        iv4(pr * 0.55, pg * 0.55, pb * 0.55, 1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(pr * 0.75, pg * 0.75, pb * 0.75, 1.0))
-            imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(pr, pg, pb, 1.0))
-            if imgui.Button(name .. "##preset" .. i, imgui.ImVec2(btnW, S(30))) then
-                cfg.custR, cfg.custG, cfg.custB = pr, pg, pb
-                if St.custRbuf then St.custRbuf[0], St.custGbuf[0], St.custBbuf[0] = pr, pg, pb end
-                cfg.rowBgR, cfg.rowBgG, cfg.rowBgB = pr * 0.35, pg * 0.35, pb * 0.35
-                if St.rowBgRbuf then St.rowBgRbuf[0], St.rowBgGbuf[0], St.rowBgBbuf[0] = pr * 0.35, pg * 0.35, pb * 0.35 end
-                cfg.outlineR, cfg.outlineG, cfg.outlineB = pr, pg, pb
-                if St.outlineRbuf then St.outlineRbuf[0], St.outlineGbuf[0], St.outlineBbuf[0] = pr, pg, pb end
+        local gap5 = S(6)
+        local aw5  = imgui.GetContentRegionAvail().x
+        local n5   = #presets5
+        local btnW5 = (aw5 - gap5*(n5-1)) / n5
+        for i, cp in ipairs(presets5) do
+            if i > 1 then imgui.SameLine(0, gap5) end
+            local cName, aR,aG,aB, bR,bG,bB = cp[1],cp[2],cp[3],cp[4],cp[5],cp[6],cp[7]
+            local isAct = math.abs((cfg.custR>=0 and cfg.custR or getTheme().acc[1])-aR)<0.01
+                      and math.abs((cfg.custG>=0 and cfg.custG or getTheme().acc[2])-aG)<0.01
+                      and math.abs((cfg.custB>=0 and cfg.custB or getTheme().acc[3])-aB)<0.01
+            local tip = u8"\xcf\xf0\xe5\xf1\xe5\xf2\x20\xab" .. cName .. u8"\xbb\x3a\x20\xed\xe0\xe6\xec\xe8\xf2\xe5\x2c\x20\xf7\xf2\xee\xe1\xfb\x20\xef\xf0\xe8\xec\xe5\xed\xe8\xf2\xfc"
+            if drawStyleSwatchButton("presetmain"..i, cName, aR,aG,aB, bR,bG,bB, btnW5, S(46), isAct, tip) then
+                cfg.custR, cfg.custG, cfg.custB = aR, aG, aB
+                if St.custRbuf then St.custRbuf[0], St.custGbuf[0], St.custBbuf[0] = aR, aG, aB end
+                cfg.rowBgR, cfg.rowBgG, cfg.rowBgB = bR, bG, bB
+                if St.rowBgRbuf then St.rowBgRbuf[0], St.rowBgGbuf[0], St.rowBgBbuf[0] = bR, bG, bB end
+                cfg.outlineR, cfg.outlineG, cfg.outlineB = aR, aG, aB
+                if St.outlineRbuf then St.outlineRbuf[0], St.outlineGbuf[0], St.outlineBbuf[0] = aR, aG, aB end
                 saveCfg()
             end
-            imgui.PopStyleColor(3)
-            if i % 3 == 0 and i < #presets then imgui.Dummy(imgui.ImVec2(0, S(4))) end
         end
+    end
+    imgui.Spacing()
+
+    -- ── по просьбе: прозрачность фона за текстом (карточки-строки со
+    -- статистикой) — было жёстко зашито 0.98 (почти непрозрачно) ──
+    do
+        local rowAlphaBuf = imgui.new("float[1]", {cfg.rowBgAlpha or 0.98})
+        imgui.PushItemWidth(S(200))
+        if imgui.SliderFloat(u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc\x20\xf4\xee\xed\xe0\x20\xe7\xe0\x20\xf2\xe5\xea\xf1\xf2\xee\xec##rowBgAlphaSlider",
+                rowAlphaBuf, 0.10, 1.0) then
+            cfg.rowBgAlpha = rowAlphaBuf[0]
+            saveCfg()
+        end
+        imgui.PopItemWidth()
     end
     imgui.Spacing()
 
@@ -8188,8 +8202,8 @@ function drawSettingsInner(h, sw, sh)
 
     local ar, ag, ab = getAcc()
     mmtColorRow(u8"\xce\xf1\xed\xee\xe2\xed\xee\xe9 \xf6\xe2\xe5\xf2", "custR", "custG", "custB", ar, ag, ab, "main")
-    mmtColorRow(u8"\xc6\xe2\xe5\xf2 \xf2\xe5\xea\xf1\xf2\xe0", "textR", "textG", "textB", 1.0, 1.0, 1.0, "text")
-    mmtColorRow(u8"\xc6\xe2\xe5\xf2 \xf4\xee\xed\xe0", "winBgR", "winBgG", "winBgB", 0.0, 0.0, 0.0, "bg")
+    mmtColorRow(u8"\xd6\xe2\xe5\xf2 \xf2\xe5\xea\xf1\xf2\xe0", "textR", "textG", "textB", 1.0, 1.0, 1.0, "text")
+    mmtColorRow(u8"\xd6\xe2\xe5\xf2 \xf4\xee\xed\xe0", "winBgR", "winBgG", "winBgB", 0.0, 0.0, 0.0, "bg")
     mmtColorRow(u8"\xc0\xea\xf6\xe5\xed\xf2", "outlineR", "outlineG", "outlineB", ar, ag, ab, "acc")
     mmtColorRow(u8"\xcf\xf0\xe5\xf4\xe8\xea\xf1 \xf1\xea\xf0\xe8\xef\xf2\xe0 \xe2 \xf7\xe0\xf2\xe5", "chatR", "chatG", "chatB", 0.0, 1.0, 0.53, "chat")
     imgui.Spacing()
@@ -8280,6 +8294,45 @@ secTitle(u8"\xd1\xeb\xf3\xf7\xe0\xe9\xed\xfb\xe9\x20\xf6\xe2\xe5\xf2")
 
     -- (самообновление реализовано: карточка "Обновления" во вкладке
     -- "О скрипте", см. PCS_UPDATE / drawAboutInner)
+
+    imgui.Spacing()
+    imgui.Dummy(imgui.ImVec2(0, S(6)))
+
+    -- ── по просьбе: блок управления персонажем на фоне перенесён в
+    -- самый низ вкладки "Настройки" (тот же cfg.companionBgEnabled/
+    -- companionBgAlpha/companionTintR/G/B, что и в панели "Игрок и
+    -- настройки") — тумблер показать/скрыть + прозрачность + цвет ──
+    secTitle(u8"\xcf\xe5\xf0\xf1\xee\xed\xe0\xe6\x20\xed\xe0\x20\xf4\xee\xed\xe5")
+    do
+        local isOnMain = cfg.companionBgEnabled ~= false
+        if drawToggleSwitch("##companionBgToggleMain", isOnMain) then
+            cfg.companionBgEnabled = not isOnMain
+            saveCfg()
+        end
+        imgui.SameLine(0, S(8))
+        imgui.TextColored(iv4(1,1,1,1), u8"\xcf\xee\xea\xe0\xe7\xfb\xe2\xe0\xf2\xfc")
+        if isOnMain then
+            imgui.Spacing()
+            local alphaBufMain = imgui.new("float[1]", {cfg.companionBgAlpha or 0.35})
+            imgui.PushItemWidth(S(180))
+            if imgui.SliderFloat(u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc##companionAlphaMain",
+                    alphaBufMain, 0.05, 1.0) then
+                cfg.companionBgAlpha = alphaBufMain[0]
+                saveCfg()
+            end
+            imgui.PopItemWidth()
+            imgui.Spacing()
+            local ctRm = imgui.new("float[1]", {cfg.companionTintR or 1.0})
+            local ctGm = imgui.new("float[1]", {cfg.companionTintG or 1.0})
+            local ctBm = imgui.new("float[1]", {cfg.companionTintB or 1.0})
+            drawSimpleColorPicker(u8"\xd6\xe2\xe5\xf2\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0",
+                "companionTintMain", ctRm, ctGm, ctBm,
+                "companionTintR", "companionTintG", "companionTintB",
+                nil, 1.0, 1.0, 1.0)
+        end
+        imgui.Spacing()
+        imgui.Dummy(imgui.ImVec2(0, S(9)))
+    end
 
     -- ── нижний отступ, чтобы последний блок не прилипал к краю окна ──
     imgui.Dummy(imgui.ImVec2(0, S(40)))
@@ -8378,7 +8431,11 @@ local function drawGlobalSettingsPanel()
     do
         local r0,g0,b0 = getAcc()
         local aw2 = imgui.GetContentRegionAvail().x
-        local cardH = S(78)
+        -- ── по просьбе: доп. строка с прозрачностью/цветом персонажа
+        -- видна только пока тумблер "Персонаж на фоне" включён, поэтому
+        -- карточка становится выше только в этом случае ──
+        local companionOnNow = cfg.companionBgEnabled ~= false
+        local cardH = companionOnNow and S(78 + 56) or S(78)
         local dl = imgui.GetWindowDrawList()
         local cp = imgui.GetCursorScreenPos()
         dl:AddRectFilled(
@@ -8417,6 +8474,35 @@ local function drawGlobalSettingsPanel()
             end
             imgui.SameLine(0, S(8))
             imgui.TextColored(iv4(1,1,1,1), u8"\xcf\xe5\xf0\xf1\xee\xed\xe0\xe6\x20\xed\xe0\x20\xf4\xee\xed\xe5")
+        end
+
+        -- ── по просьбе: доп. настройки персонажа на фоне — прозрачность
+        -- (SliderFloat) и цветовой тон (тот же попап-пикер, что и у
+        -- прочих цветовых настроек скрипта) — показаны только пока
+        -- персонаж на фоне включён ──
+        if companionOnNow then
+            imgui.SetCursorPos(imgui.ImVec2(S(10), S(78)))
+            do
+                local alphaBuf = imgui.new("float[1]", {cfg.companionBgAlpha or 0.35})
+                imgui.PushItemWidth(S(150))
+                if imgui.SliderFloat(u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc##companionAlpha",
+                        alphaBuf, 0.05, 1.0) then
+                    cfg.companionBgAlpha = alphaBuf[0]
+                    saveCfg()
+                end
+                imgui.PopItemWidth()
+            end
+
+            imgui.SetCursorPos(imgui.ImVec2(S(170), S(76)))
+            do
+                local ctR = imgui.new("float[1]", {cfg.companionTintR or 1.0})
+                local ctG = imgui.new("float[1]", {cfg.companionTintG or 1.0})
+                local ctB = imgui.new("float[1]", {cfg.companionTintB or 1.0})
+                drawSimpleColorPicker(u8"\xd6\xe2\xe5\xf2\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0",
+                    "companionTint", ctR, ctG, ctB,
+                    "companionTintR", "companionTintG", "companionTintB",
+                    nil, 1.0, 1.0, 1.0)
+            end
         end
         imgui.EndChild()
         imgui.PopStyleColor()
@@ -8590,12 +8676,27 @@ function drawAboutInner(h)
             imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
             local title1 = "PC Stats"
             local title2 = "v" .. SCRIPT_VER .. "  |  Arizona RP PC"
+            -- ФИКС (по просьбе): текст заголовка баннера сделан немного
+            -- крупнее (было в базовом масштабе 1.0) — размеры sz1/sz2
+            -- пересчитаны ПОСЛЕ увеличения масштаба, чтобы центрирование
+            -- осталось верным
+            local titleFontScale = 1.12
+            imgui.SetWindowFontScale(titleFontScale)
             local sz1 = imgui.CalcTextSize(title1)
             local sz2 = imgui.CalcTextSize(title2)
+            -- ФИКС (по просьбе): персонаж-компаньон перенесён от центра
+            -- (где он налезал на заголовок) к правому краю баннера —
+            -- больше не перекрывается с текстом
+            if PCS_COMPANION_TEX then
+                local icoSzA = bannerH * 0.60
+                imgui.SetCursorPos(imgui.ImVec2(aw_a - icoSzA - SFtext(16), (bannerH - icoSzA)*0.5))
+                imgui.Image(PCS_COMPANION_TEX, imgui.ImVec2(icoSzA, icoSzA))
+            end
             imgui.SetCursorPos(imgui.ImVec2(aw_a*0.5 - sz1.x*0.5, SFtext(14)))
             imgui.TextColored(banTitleCol, title1)
             imgui.SetCursorPos(imgui.ImVec2(aw_a*0.5 - sz2.x*0.5, SFtext(44)))
             imgui.TextColored(thAccBright(), title2)
+            imgui.SetWindowFontScale(1.0)
         imgui.EndChild()
         imgui.PopStyleColor()
         imgui.Spacing()
@@ -8611,10 +8712,15 @@ function drawAboutInner(h)
             local bgR = math.max(rr2*0.13, 0.07)
             local bgG = math.max(rg2*0.13, 0.07)
             local bgB = math.max(rb2*0.13, 0.07)
+            -- ФИКС (по просьбе): пока персонаж на фоне включён, фон
+            -- карточек делается заметно прозрачнее, чтобы персонаж был
+            -- виден сквозь текстовые блоки (было жёстко 0.97 — почти
+            -- непрозрачно); без персонажа фон остаётся как раньше
+            local cardBgAlpha = pcsRowA((cfg.companionBgEnabled ~= false) and 0.55 or 0.97)
             dlc:AddRectFilled(
                 imgui.ImVec2(pc.x,     pc.y),
                 imgui.ImVec2(pc.x+awc, pc.y+cardH),
-                imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.97)), 10)
+                imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,cardBgAlpha)), 10)
             dlc:AddRect(
                 imgui.ImVec2(pc.x,     pc.y),
                 imgui.ImVec2(pc.x+awc, pc.y+cardH),
@@ -9206,7 +9312,7 @@ function TX.drawLogRow(e)
     local bgG = math.max(rg*shade, minV)
     local bgB = math.max(rb*shade, minV)
     dl:AddRectFilled(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x+avail, p.y+h),
-        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,0.98)), 4)
+        imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,pcsRowA(0.98))), 4)
 
     local cols = {
         { w = 0.16, txt = e.time, col = thDim() },
@@ -9393,7 +9499,7 @@ function drawTaxesInner(h)
         local hasTotal = cfg.taxTotalPaid and cfg.taxTotalPaid > 0
         local cardH_sp = (hasAmt and S(64) or S(44)) + (hasTotal and S(20) or 0)
         dl_sp:AddRectFilled(p_sp, imgui.ImVec2(p_sp.x+aw_sp, p_sp.y+cardH_sp),
-            imgui.ColorConvertFloat4ToU32(iv4(r*0.08,g*0.08,b*0.08,0.85)), 10)
+            imgui.ColorConvertFloat4ToU32(iv4(r*0.08,g*0.08,b*0.08,pcsRowA(0.85))), 10)
         dl_sp:AddRect(p_sp, imgui.ImVec2(p_sp.x+aw_sp, p_sp.y+cardH_sp),
             imgui.ColorConvertFloat4ToU32(iv4(r,g,b,0.55)), 10, 0, 1.3)
         imgui.SetCursorScreenPos(imgui.ImVec2(p_sp.x + S(12), p_sp.y + S(9)))
@@ -9775,7 +9881,7 @@ function PCS_gdPetCard(i, pet, avW)
     local dl = imgui.GetWindowDrawList()
     local p = imgui.GetCursorScreenPos()
     local e = spawned and { 0.25, 0.92, 0.48 } or { 0.55, 0.58, 0.66 }
-    dl:AddRectFilled(p, V2(p.x + avW, p.y + cardH), U32(iv4(r*0.07, g*0.07, b*0.07, 0.92)), 10)
+    dl:AddRectFilled(p, V2(p.x + avW, p.y + cardH), U32(iv4(r*0.07, g*0.07, b*0.07, pcsRowA(0.92))), 10)
     dl:AddRect(p, V2(p.x + avW, p.y + cardH), U32(iv4(e[1], e[2], e[3], 0.55)), 10, 0, 1.2)
     dl:AddRectFilled(V2(p.x, p.y + 6), V2(p.x + 4, p.y + cardH - 6), U32(iv4(e[1], e[2], e[3], 1.0)), 2)
 
@@ -9878,7 +9984,7 @@ function PCS_drawGuardInner(h)
             total = total + 1
             if tonumber(pet.spawned) == 1 then spawnedN = spawnedN + 1 end
         end
-        dl:AddRectFilled(p, V2(p.x + avW, p.y + cardH), U32(iv4(r*0.08, g*0.08, b*0.08, 0.85)), 10)
+        dl:AddRectFilled(p, V2(p.x + avW, p.y + cardH), U32(iv4(r*0.08, g*0.08, b*0.08, pcsRowA(0.85))), 10)
         dl:AddRect(p, V2(p.x + avW, p.y + cardH), U32(iv4(r, g, b, 0.55)), 10, 0, 1.3)
         imgui.SetCursorScreenPos(V2(p.x + S(12), p.y + S(9)))
         imgui.TextColored(thAcc(), ic.shield .. "  " .. u8"\xcb\xe8\xf7\xed\xfb\xe5 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xe8")
@@ -10183,20 +10289,29 @@ imgui.OnFrame(
 
         -- ── ПЕРСОНАЖ-КОМПАНЬОН НА ФОНЕ (по просьбе) — рисуется одним из
         -- первых вызовов кадра, поэтому остаётся визуально "под" всем
-        -- остальным содержимым окна. Тумблер — карточка профиля →
-        -- "Персонаж на фоне" (cfg.companionBgEnabled); по умолчанию вкл ──
+        -- остальным содержимым окна. По центру, по размеру под всё окно.
+        -- Тумблер — карточка профиля → "Персонаж на фоне"
+        -- (cfg.companionBgEnabled); по умолчанию вкл ──
         if PCS_COMPANION_TEX and cfg.companionBgEnabled ~= false then
             pcall(function()
                 local dlBg = imgui.GetWindowDrawList()
                 local wpBg = imgui.GetWindowPos()
                 local wsBg = imgui.GetWindowSize()
-                local sizeBg = S(220)
-                local x2 = wpBg.x + wsBg.x - S(10)
-                local y2 = wpBg.y + wsBg.y - S(10)
+                local sizeBg = math.min(wsBg.x, wsBg.y) * 0.62
+                local cx = wpBg.x + wsBg.x * 0.5
+                local cy = wpBg.y + wsBg.y * 0.5
+                -- прозрачность и цветовой тон теперь настраиваются
+                -- (cfg.companionBgAlpha / cfg.companionTintR/G/B) —
+                -- см. тумблер "Персонаж на фоне" в панели настроек
+                local cbAlpha = cfg.companionBgAlpha or 0.35
+                local cbTintR = cfg.companionTintR or 1.0
+                local cbTintG = cfg.companionTintG or 1.0
+                local cbTintB = cfg.companionTintB or 1.0
                 dlBg:AddImage(PCS_COMPANION_TEX,
-                    imgui.ImVec2(x2 - sizeBg, y2 - sizeBg), imgui.ImVec2(x2, y2),
+                    imgui.ImVec2(cx - sizeBg * 0.5, cy - sizeBg * 0.5),
+                    imgui.ImVec2(cx + sizeBg * 0.5, cy + sizeBg * 0.5),
                     imgui.ImVec2(0, 0), imgui.ImVec2(1, 1),
-                    imgui.ColorConvertFloat4ToU32(iv4(1, 1, 1, 0.14)))
+                    imgui.ColorConvertFloat4ToU32(iv4(cbTintR, cbTintG, cbTintB, cbAlpha)))
             end)
         end
 
@@ -10231,7 +10346,7 @@ imgui.OnFrame(
                 -- всегда, без тумблера отключения, в отличие от фонового
                 -- персонажа ниже по окну ──
                 if PCS_COMPANION_TEX then
-                    local icoSz = th0 - S(10)
+                    local icoSz = th0 - S(4)
                     imgui.SetCursorPos(imgui.ImVec2(S(6), (th0 - icoSz) * 0.5))
                     imgui.Image(PCS_COMPANION_TEX, imgui.ImVec2(icoSz, icoSz))
                 end
@@ -10416,7 +10531,7 @@ local _okSC, _errSC = pcall(function()
             dl2:AddRectFilled(
                 imgui.ImVec2(ph.x,    ph.y),
                 imgui.ImVec2(ph.x+aw, ph.y+hdrH),
-                imgui.ColorConvertFloat4ToU32(iv4(hdrBgR,hdrBgG,hdrBgB,0.97)), 12)
+                imgui.ColorConvertFloat4ToU32(iv4(hdrBgR,hdrBgG,hdrBgB,pcsRowA(0.97))), 12)
             dl2:AddRectFilled(
                 imgui.ImVec2(ph.x,    ph.y),
                 imgui.ImVec2(ph.x+aw*0.6, ph.y+hdrH),
@@ -11187,18 +11302,35 @@ function sampev.onServerMessage(color, text)
         -- своя оплата — если ждали подтверждение диалогом, оно уже
         -- зафиксировано в onTaxPaymentSuccess, но сумму отсюда всё же
         -- пробуем уточнить (диалог не всегда содержит точную сумму)
-        local sumStr = clean:match("%$%s*([%d%s%.,]+)")
-        local amount = sumStr and parseGameNumber(sumStr) or 0
+        -- ФИКС: символ валюты в этой строке — не "$", а 🰢, поэтому сумму
+        -- берём по слову "сумму", см. TX.extractChatAmount
+        local amount = TX.extractChatAmount(clean)
         if low:find("\xe2\xfb\x20\xee\xef\xeb\xe0\xf2\xe8\xeb", 1, true) then -- "вы оплатил"
-            if amount > 0 then cfg.taxLastPayAmount = amount end
-            if cfg.taxLastPayTime == 0 or os.time() - cfg.taxLastPayTime > 10 then
-                -- игрок оплатил вручную ИЗ ИГРЫ (не через кнопку скрипта) —
-                -- всё равно фиксируем время последней оплаты
-                onTaxPaymentSuccess(false, amount)
-            else
+            if _taxState ~= 0 and not _taxFinalizeDone then
+                -- оплату сейчас делает сам скрипт и ещё не завершил её —
+                -- просто запоминаем точную сумму из чата, onTaxPaymentSuccess
+                -- возьмёт её (см. _taxPendingAmount) и запишет в лог
+                if amount > 0 then _taxPendingAmount = amount end
+                return
+            end
+            local sinceLast = (cfg.taxLastPayTime ~= 0) and (os.time() - cfg.taxLastPayTime) or math.huge
+            if _taxFinalizeDone and sinceLast <= 15 then
+                -- скрипт только что записал оплату (возможно, с нулевой
+                -- суммой) — дописываем сумму из чата в лог/статистику
+                if amount > 0 then
+                    TX.fixLastAmount(amount)
+                    cfg.taxLastPayAmount = amount
+                end
                 cfg.taxLastPayTime = os.time()
                 saveCfg()
+                return
             end
+            -- игрок оплатил вручную ИЗ ИГРЫ (не через кнопку скрипта) —
+            -- фиксируем время, сумму и запись в лог. Флаг сбрасываем: он
+            -- остаётся true после предыдущей оплаты скриптом и раньше
+            -- молча блокировал onTaxPaymentSuccess для ручных оплат
+            _taxFinalizeDone = false
+            onTaxPaymentSuccess(false, amount)
             return
         end
     end)
@@ -11441,20 +11573,10 @@ function main()
         if AIS and AIS.init then AIS.init() end
     end)
 
-    pcall(function()
-        if imgui and imgui.OnFrame and PCS_MENU_BUTTON then
-            imgui.OnFrame(
-                function()
-                    if not cfg or cfg.menuButtonEnabled == false then return false end
-                    if St and St.winOpen then return false end
-                    return true
-                end,
-                function()
-                    pcall(function() PCS_MENU_BUTTON.draw() end)
-                end
-            )
-        end
-    end)
+    -- ── плавающая кнопка-шестерёнка для открытия меню при закрытом окне
+    -- убрана полностью (по просьбе — она и была тем самым "мешком",
+    -- который появлялся поверх игры). Открыть меню можно хоткеем
+    -- (cfg.menuHotkeyVK) или командой чата (registerMenuCommand выше) ──
 
     -- ── команда чата для ручной оплаты налогов (по просьбе) ──
     pcall(sampRegisterChatCommand, "paytax", function() payTaxesThenHotel(false) end)
