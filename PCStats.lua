@@ -3,7 +3,7 @@ script_description("Statistika personazha | Arizona PC | by Marco_Santiago (PC p
 script_author("Marco_Santiago")
 
 
-local SCRIPT_VER = "1.9.4"
+local SCRIPT_VER = "1.8.1"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
