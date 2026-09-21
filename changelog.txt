@@ -1,3 +1,24 @@
+// ============================================================
+//  changelog.txt - список версий PC Stats.
+//  Этот файл лежит в корне репозитория (рядом с manifest.json),
+//  скрипт скачивает его и сам делает красиво: иконки, цвета, заголовки.
+//
+//  КАК ПИСАТЬ:
+//  ## 1.9.5 | Короткое название версии     <- заголовок версии
+//  Заголовок пункта | Описание пункта       <- одна строка = один пункт
+//  (bell) Пункт со своей иконкой | Описание  <- иконка необязательна
+//  (bell,g) Иконка и цвет | Описание         <- цвет: g зелёный, b синий,
+//                                               p фиолетовый, o оранжевый,
+//                                               y жёлтый, c бирюзовый, r розовый
+//  Описание после | необязательно. Плюс или минус в начале строки можно не ставить.
+//  Новые версии пиши СВЕРХУ. Строки с // в игре не показываются.
+//
+//  ИКОНКИ: circleplus rocket gift star heart bell palette tag link eye
+//  clock calendar history coins sack taxes wallet money gem bitcoin euro
+//  shield lock unlock bolt fire check warn info gear tools wrench sliders
+//  keyboard terminal user usergroup phone idcard paw bone food download
+//  sync save search trash chart puzzle layers book home headset telegram discord
+// ============================================================
 
 
 ## 1.8.1 | Новости с GitHub
