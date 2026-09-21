@@ -509,108 +509,6 @@ function pcs_ver.clean(text)
     return text
 end
 
--- ── проверка целостности файла ──────────────────────────────
--- Скрипт считает SHA-256 своего файла (переводы строк CRLF -> LF, чтобы
--- результат не зависел от Windows/git) и сравнивает с ключом из manifest:
---   "hashes": { "1.8.1": "<sha256 файла этой версии>" }
--- Если файл изменили (ключ не совпал) - статистика, оплата налогов и курсы
--- валют отключаются (PCS_TAMPER). Нет сети или версии нет в списке -
--- ничего не блокируется, чтобы честные игроки не теряли функции.
--- Важно: это защита от случайных/неопытных правок. Файл лежит у игрока,
--- и человек, который умеет читать Lua, может убрать саму проверку.
--- Ключ считается командой:  python pcs_seal.py hash PCStats.lua
-function pcs_ver.sha256(msg, step)
-    local bit = require("bit")
-    local band, bxor, bnot, bor = bit.band, bit.bxor, bit.bnot, bit.bor
-    local ror, rshift, lshift, tobit = bit.ror, bit.rshift, bit.lshift, bit.tobit
-    local K = { 0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 }
-    local H = { 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19 }
-    for i = 1, 8 do H[i] = tobit(H[i]) end
-    local len = #msg
-    local bits = len * 8
-    msg = msg .. "\128" .. string.rep("\0", (55 - len) % 64)
-        .. string.char(0, 0, 0, 0,
-            math.floor(bits / 16777216) % 256, math.floor(bits / 65536) % 256,
-            math.floor(bits / 256) % 256, bits % 256)
-    local w = {}
-    local blocks = #msg / 64
-    for blk = 0, blocks - 1 do
-        local base = blk * 64
-        for i = 0, 15 do
-            local b1, b2, b3, b4 = msg:byte(base + i * 4 + 1, base + i * 4 + 4)
-            w[i + 1] = bor(lshift(b1, 24), lshift(b2, 16), lshift(b3, 8), b4)
-        end
-        for i = 17, 64 do
-            local x, y = w[i - 15], w[i - 2]
-            local s0 = bxor(ror(x, 7), ror(x, 18), rshift(x, 3))
-            local s1 = bxor(ror(y, 17), ror(y, 19), rshift(y, 10))
-            w[i] = tobit(w[i - 16] + s0 + w[i - 7] + s1)
-        end
-        local a, b, c, d, e, f, g, h = H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8]
-        for i = 1, 64 do
-            local S1 = bxor(ror(e, 6), ror(e, 11), ror(e, 25))
-            local ch = bxor(band(e, f), band(bnot(e), g))
-            local t1 = tobit(h + S1 + ch + K[i] + w[i])
-            local S0 = bxor(ror(a, 2), ror(a, 13), ror(a, 22))
-            local maj = bxor(band(a, b), band(a, c), band(b, c))
-            local t2 = tobit(S0 + maj)
-            h, g, f, e = g, f, e, tobit(d + t1)
-            d, c, b, a = c, b, a, tobit(t1 + t2)
-        end
-        H[1] = tobit(H[1] + a); H[2] = tobit(H[2] + b); H[3] = tobit(H[3] + c); H[4] = tobit(H[4] + d)
-        H[5] = tobit(H[5] + e); H[6] = tobit(H[6] + f); H[7] = tobit(H[7] + g); H[8] = tobit(H[8] + h)
-        -- отдаём управление, чтобы игра не подвисала на большом файле
-        if step and blk % 128 == 127 then step() end
-    end
-    local out = {}
-    for i = 1, 8 do out[i] = bit.tohex(H[i]) end
-    return table.concat(out)
-end
-
-function pcs_ver.fileHash(path, step)
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local body = f:read("*a")
-    f:close()
-    if type(body) ~= "string" or #body == 0 then return nil end
-    return pcs_ver.sha256((body:gsub("\r\n", "\n")), step)
-end
-
--- запускать один раз при старте: результат в pcs_ver.state.integrity
--- ("ok" / "bad" / "unlisted"); при "bad" ставится глобальный флаг PCS_TAMPER
-function pcs_ver.integrity()
-    local S = pcs_ver.state
-    if S.integrityBusy then return end
-    S.integrityBusy = true
-    lua_thread.create(function()
-        wait(8000)
-        for _ = 1, 6 do
-            local ok, err = pcall(function()
-                local manifest = select(1, pcs_ver.fetch_manifest())
-                if not manifest then return end          -- нет сети: попробуем позже
-                if not manifest.hash then                 -- версии нет в списке: не блокируем
-                    S.integrity, S.integrityDone = "unlisted", true
-                    return
-                end
-                local have = pcs_ver.fileHash(pcs_ver.selfPath(), function() wait(0) end)
-                if not have then return end
-                if have == manifest.hash then
-                    S.integrity, PCS_TAMPER = "ok", nil
-                else
-                    S.integrity, PCS_TAMPER = "bad", true
-                    print("[PC Stats][integrity] file hash mismatch")
-                    pcs_ver.notify("\xd4\xe0\xe9\xeb \xf1\xea\xf0\xe8\xef\xf2\xe0 \xe8\xe7\xec\xe5\xed\xb8\xed - \xf1\xf2\xe0\xf2\xe8\xf1\xf2\xe8\xea\xe0, \xee\xef\xeb\xe0\xf2\xe0 \xed\xe0\xeb\xee\xe3\xee\xe2 \xe8 \xea\xf3\xf0\xf1\xfb \xe2\xe0\xeb\xfe\xf2 \xee\xf2\xea\xeb\xfe\xf7\xe5\xed\xfb. \xd1\xea\xe0\xf7\xe0\xe9\xf2\xe5 \xee\xf0\xe8\xe3\xe8\xed\xe0\xeb\xfc\xed\xfb\xe9 \xf4\xe0\xe9\xeb.", "{FF6666}")
-                end
-                S.integrityDone = true
-            end)
-            if not ok then print("[PC Stats][integrity] error: " .. pcs_ver.clean(err)) end
-            if S.integrityDone then break end
-            wait(300000)
-        end
-        S.integrityBusy = false
-    end)
-end
-
 pcs_ver.cfg = {
     src         = "PCSE1:XDyv20WuZ4aVT5OdACZUaC0nb2y1iw==",   -- адрес источника (зашифрован, см. pcs_ver.seal)
     host        = "PCSE1:YzyqnkezK9bYFd7BJgYaTyY/emez1mqUrg==",   -- хост файлов (зашифрован)
@@ -870,10 +768,6 @@ function pcs_ver.parseManifest(body)
     m.release_date = body:match('"release_date"%s*:%s*"([^"]*)"')
     m.changelog    = body:match('"changelog"%s*:%s*"([^"]*)"')
     m.required     = (body:match('"required"%s*:%s*(%w+)') == "true")
-    -- ключ целостности для ЭТОЙ версии скрипта: "hashes": { "1.8.1": "<sha256>" }
-    local vpat = '"' .. (tostring(SCRIPT_VER):gsub("%.", "%%.")) .. '"%s*:%s*"(%x+)"'
-    local hv = body:match(vpat)
-    if hv and #hv == 64 then m.hash = hv:lower() end
     if not m.version or m.version == "" then return nil, "no_version" end
     m.version = tostring(m.version):gsub("^[vV]", "")
     if not m.version:match("^%d+[%d%.]*$") then return nil, "bad_version" end
@@ -4445,7 +4339,6 @@ end
 --  Š�Š�Š Š�Š•Š 
 -- ============================================================
 local function parseStats(raw)
-    if PCS_TAMPER then raw = "" end   -- файл изменён: данные статистики не читаем
     local p = {
         accountNumber="",authDate="",accountState="",
         x3Payday="",x4Payday="",
@@ -6291,10 +6184,6 @@ end
 -- который её вызывает.
 TAX_MIN_REPAY_SEC = 3600 -- глобальная (см. фикс "200 local variables" выше)
 local function payTaxesNow(isAuto)
-    if PCS_TAMPER then   -- файл изменён: оплата налогов отключена
-        if not isAuto then pcall(sampAddChatMessage, "{FF6666}[PC Stats] " .. "\xd4\xe0\xe9\xeb \xf1\xea\xf0\xe8\xef\xf2\xe0 \xe8\xe7\xec\xe5\xed\xb8\xed - \xee\xef\xeb\xe0\xf2\xe0 \xed\xe0\xeb\xee\xe3\xee\xe2 \xee\xf2\xea\xeb\xfe\xf7\xe5\xed\xe0.", -1) end
-        return
-    end
     if isAuto and cfg.taxLastPayTime and cfg.taxLastPayTime ~= 0
         and (os.time() - cfg.taxLastPayTime) < TAX_MIN_REPAY_SEC then
         -- налоги уже точно оплачивались меньше часа назад — тихо
@@ -6869,7 +6758,6 @@ end
 -- - bez soobscheniy v chat (ispolzuetsya pri tihoy avtozagruzke pri
 -- vhode na server) ──
 function applyWikiRatesForServer(serverName, silent)
-    if PCS_TAMPER then return false end   -- файл изменён: курсы валют отключены
     local r, matched = findWikiRatesForServer(serverName)
     if not r then
         if not silent then
@@ -12520,10 +12408,6 @@ function main()
             end
         end)
     end
-
-    -- проверка целостности файла (sha256 против ключа из manifest, см.
-    -- pcs_ver.integrity); работает независимо от автопроверки обновлений
-    pcall(pcs_ver.integrity)
 
     -- уведомляем игрока в чат, что подхватилась ранее сохранённая
     -- (не дефолтная) команда открытия меню — по просьбе: "если игрок
