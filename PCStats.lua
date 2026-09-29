@@ -44,6 +44,40 @@ local function safeRequire(name)
     return lib
 end
 
+-- ============================================================
+--  PCS_SAFE_THREAD: глобальная защита ВСЕХ lua_thread.create()
+-- ------------------------------------------------------------
+-- В скрипте десятки lua_thread.create(function() ... end) (оплата
+-- налогов, спавн/кормление охранников, запросы статов, обновления
+-- курсов и т.п.). Часть из них уже оборачивает своё тело в
+-- pcall(function() ... end) вручную, но часть — нет. Необработанная
+-- ошибка Lua внутри такого потока просто убивает поток молча (или
+-- спамит лог), оставляя флаги состояния (St.waitingStats,
+-- _phoneOpBusy, AIS.st.AddVerifi и т.п.) "залипшими" до срабатывания
+-- watchdog'а — до этого момента выглядит как зависание/потенциальный
+-- источник дальнейших ошибок. Ниже — единая точка: lua_thread.create
+-- подменяется на версию, которая сама оборачивает переданную функцию
+-- в pcall, печатает ошибку в лог (если она возникла) и корректно
+-- пробрасывает переданные аргументы. pcall(fn, ...) внутри потока —
+-- уже проверенный в этом же файле паттерн (используется вручную в
+-- доброй половине существующих lua_thread.create), в т.ч. с wait()
+-- внутри — LuaJIT (в отличие от ванильного Lua 5.1) разрешает yield
+-- через границу pcall, поэтому это безопасно и для потоков с wait().
+do
+    local _realCreateThread = lua_thread.create
+    if type(_realCreateThread) == 'function' then
+        lua_thread.create = function(fn, ...)
+            if type(fn) ~= 'function' then return _realCreateThread(fn, ...) end
+            return _realCreateThread(function(...)
+                local ok, err = pcall(fn, ...)
+                if not ok then
+                    print('[PC Stats][thread] unhandled error: ' .. tostring(err))
+                end
+            end, ...)
+        end
+    end
+end
+
 -- PCS_GUARD BEGIN
 -- ============================================================
 --  ЗАЩИТА СТЕКА IMGUI (PCS_GUARD)
@@ -122,7 +156,13 @@ PCS_GUARD = (function()
         line = line .. string.rep(' ', G.SL - 1 - #line) .. '\n'
         f:seek('set', ((n - 1) % G.NS) * G.SL)
         f:write(line)
-        f:flush()
+        -- ФИКС: "frame:" метки шли КАЖДЫЙ кадр с flush на диск -> лишняя нагрузка при
+        -- открытом меню. Кадровые метки сбрасываем не чаще 4 раз/сек, остальные - сразу.
+        local tc = os.clock()
+        if tc - (G.lastFlush or 0) > 0.25 or not tostring(text):find('^frame:') then
+            G.lastFlush = tc
+            f:flush()
+        end
     end
 
     -- ImGui.Text* принимает printf-формат. Строка из данных сервера с одиночным '%'
@@ -130,12 +170,15 @@ PCS_GUARD = (function()
     -- invalid-parameter handler и процесс умирает без единой строки в логе.
     -- Если аргументов формата нет — экранируем % → %% (текст на экране не меняется).
     local function esc(str)
-        if type(str) ~= 'string' or not str:find('%', 1, true) then return str end
+        if type(str) ~= 'string' then return str end
+        if not str:find('%', 1, true) then return str end
+        -- якщо є реальні специфікатори (%s %d %f %% тощо) і виклик з аргументами —
+        -- esc викликається лише коли аргументів немає (див. wrappers нижче)
         G.escN = (G.escN or 0) + 1
-        if G.escN <= 6 then
-            local a = str:sub(1, 60):gsub('[^\32-\126]', '?')
-            print('[PC Stats][guard] lone % in ImGui text escaped (would crash ImGui printf): ' .. a)
-            G.mark('escaped % in text: ' .. a)
+        if G.escN <= 3 then
+            local a = str:sub(1, 50):gsub('[^\32-\126]', '?')
+            print('[PC Stats][guard] escaped lone % in text: ' .. a)
+            pcall(function() G.mark('escaped %: ' .. a) end)
         end
         return (str:gsub('%%', '%%%%'))
     end
@@ -302,6 +345,18 @@ PCS_GUARD = (function()
                 return _tc(a, fmt, ...)
             end
         end
+
+        -- додатковий захист: заголовки дерев/вікон теж можуть піти в printf
+        for _, fname in ipairs({ 'TreeNode', 'CollapsingHeader', 'SetWindowTitle' }) do
+            if r[fname] then
+                local orig = r[fname]
+                P[fname] = function(fmt, ...)
+                    if type(fmt) == 'string' and select('#', ...) == 0 then fmt = esc(fmt) end
+                    return orig(fmt, ...)
+                end
+            end
+        end
+
         return P
     end
 
@@ -519,7 +574,7 @@ pcs_ver.cfg = {
     check_throttle  = 60,    -- сек между тихими проверками
     auto_interval   = 300,   -- автопроверка раз в 5 мин (см. PCS_UPDATE_AUTO_SECONDS)
     notify_interval = 0,     -- каждая автопроверка напоминает, пока не обновились
-    autoCheck       = true,  -- совместимость со старым UI
+    autoCheck       = false, -- автопроверка отключена (тумблер убран), только вручную
     channel_url     = "https://t.me/helper_stats",
     channel_short   = "t.me/helper_stats",
 }
@@ -1591,8 +1646,8 @@ function AIS.AddVerifiSecurity(action)
         -- диалог/меню перекрывает CEF, слишком большой пинг). Теперь видно
         -- количество попыток и общее время ожидания — это можно
         -- скопировать и прислать для дальнейшей диагностики
-        AIS.msg(u8"\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xee\xe1\xed\xee\xe2\xe8\xf2\xfc\x20\xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xfe\x20\xee\x20\xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8\x20\xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2\x20\xe7\xe0\x20" .. tostring(i or 40) ..
-            u8"\x20\xef\xee\xef\xfb\xf2\xee\xea\x20\x28\x7e" .. tostring(math.floor((i or 40) * 2.25)) ..
+        AIS.msg(u8"\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xee\xe1\xed\xee\xe2\xe8\xf2\xfc\x20\xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xfe\x20\xee\x20\xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8\x20\xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2\x20\xe7\xe0\x20" .. tostring(40) ..
+            u8"\x20\xef\xee\xef\xfb\xf2\xee\xea\x20\x28\x7e" .. tostring(math.floor(40 * 2.25)) ..
             u8"\x20\xf1\xe5\xea\x29\x2e\x20\xd1\xe5\xf0\xe2\xe5\xf0\x20\xed\xe5\x20\xee\xf2\xe2\xe5\xf2\xe8\xeb\x20\xed\xe0\x20\x2f\x69\x6e\x76\x65\x6e\x74\x20\x97\x20\xef\xf0\xee\xe2\xe5\xf0\xfc\xf2\xe5\x2c\x20\xed\xe5\x20\xe7\xe0\xed\xff\xf2\xfb\x20\xeb\xe8\x20\xf0\xf3\xea\xe8\x2f\xe8\xed\xe2\xe5\xed\xf2\xe0\xf0\xfc\x2c\x20\xe8\x20\xef\xee\xef\xf0\xee\xe1\xf3\xe9\xf2\xe5\x20\xe5\xf9\xb8\x20\xf0\xe0\xe7\x2e", "{FF6666}")
         AIS.dbg("[AddVer] \xcd\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xee\xe1\xed\xee\xe2\xe8\xf2\xfc \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xfe \xee \xf1\xee\xf1\xf2\xee\xff\xed\xe8\xe8 \xee\xf5\xf0\xe0\xed\xed\xe8\xea\xee\xe2!")
         return false
@@ -2488,6 +2543,7 @@ if type(sampAddChatMessage) == "function" then
         -- тост — отдельно; pcs_notify определяется позже по файлу
         pcall(function()
             if type(pcs_notify) ~= "function" then return end
+            if PCS_NO_TOAST_ONCE then PCS_NO_TOAST_ONCE = false; return end
             local clean = _pcsStripColorTags(rawText)
             -- коды смайлов Arizona (:man: и т.п.) в тосте не нужны
             for _, tag in pairs(PCS_EMOJI or {}) do
@@ -2549,19 +2605,19 @@ end
 -- ссылки открываем через ShellExecuteA — оба варианта работают
 -- без создания какого-либо окна консоли ──
 local _winApiOk = false
+local _shellOk  = false
 if ffi then
-    _winApiOk = pcall(function()
-        ffi.cdef[[
-            int CreateDirectoryA(const char *lpPathName, void *lpSecurityAttributes);
-            void *ShellExecuteA(void *hwnd, const char *lpOperation, const char *lpFile,
-                                 const char *lpParameters, const char *lpDirectory, int nShowCmd);
-        ]]
-    end)
+    -- каждая функция объявляется отдельным cdef: если объявление уже есть (или
+    -- конфликтует) - это не ломает остальное; главное - чтобы символ был доступен
+    pcall(ffi.cdef, "int CreateDirectoryA(const char *lpPathName, void *lpSecurityAttributes);")
+    pcall(ffi.cdef, "void *ShellExecuteA(void *hwnd, const char *lpOperation, const char *lpFile, const char *lpParameters, const char *lpDirectory, int nShowCmd);")
+    _winApiOk = pcall(function() return ffi.C.CreateDirectoryA end)
+    _shellOk  = pcall(function() return ffi.C.ShellExecuteA end)
 end
 local _shell32 = nil
-if _winApiOk then
+if ffi and _shellOk then
     local okLib, lib = pcall(ffi.load, "shell32")
-    if okLib then _shell32 = lib end
+    if okLib then _shell32 = lib else _shell32 = ffi.C end
 end
 
 -- создаёт папку через WinAPI (без консоли); возвращает true при успехе
@@ -2602,15 +2658,19 @@ local CFG_FILE_OLD = "moonloader/config/PCStats.ini"
 -- всякой консоли; на всякий случай (если ffi недоступен) оставлен
 -- запасной вариант через os.execute ──
 local function ensureCfgDir()
-    -- ФИКС (п.25): saveCfg() (а с ней и ensureCfgDir) дёргается из
-    -- слайдеров настроек при движении — десятки раз в секунду. Кэшируем
-    -- успех первого вызова, чтобы не дёргать CreateDirectoryA/mkdir
-    -- на каждое сохранение.
-    if St._cfgDirOk then return end
-    if not winCreateDir(CFG_DIR:gsub("/", "\\")) then
-        pcall(os.execute, 'mkdir "' .. CFG_DIR:gsub("/", "\\") .. '" 2>nul')
+    -- НИКАКОГО os.execute: на Windows он открывает окно cmd.exe (терминал).
+    -- Папку создаём встроенным createDirectory() MoonLoader, запасной вариант - WinAPI.
+    if St and St._cfgDirOk then return end
+    local okD = false
+    if type(createDirectory) == "function" then
+        pcall(createDirectory, "moonloader/config")
+        okD = pcall(createDirectory, CFG_DIR)
     end
-    St._cfgDirOk = true
+    if not okD then
+        winCreateDir("moonloader\\config")
+        winCreateDir((CFG_DIR:gsub("/", "\\")))
+    end
+    if St then St._cfgDirOk = true end
 end
 
 -- ФИКС (п.24): читаем не весь файл лога построчно через :lines(), а
@@ -3039,6 +3099,7 @@ PCS_IC = {
     sliders = "\239\135\158", -- fa-sliders
     wrench = "\239\130\173", -- fa-wrench
     arrowup = "\239\129\162", -- fa-arrow-up
+    calc = "\239\135\172", -- fa-calculator
 }
 -- ── валюты: иконка (ключ PCS_IC), цвет иконки, ключ курса в cfg и буфер ввода ──
 PCS_CUR = {
@@ -3372,49 +3433,493 @@ local PCS_COMPANION_B64 = table.concat({
     "urVaoFugW6sFugW6Bbq1WqBboFurBboFugW6tVqgW6BbqwW6BboFurVaoP9r1v8FwxsSLKwqym8AAAAASUVORK5CYII=",
 })
 
--- распаковывает картинку персонажа на диск, если её там ещё нет
-local function ensureCompanionFile()
-    local f = io.open(PCS_COMPANION_FILE, "rb")
+-- (всё ниже завёрнуто в do...end: в Lua 5.1 лимит 200 локальных на функцию)
+local loadCompanionTexture
+do
+local PCS_COMPANION_FILE_2 = CFG_DIR .. "/pcstats-companion-2.png"
+local PCS_COMPANION_B64_2 = table.concat({
+    "iVBORw0KGgoAAAANSUhEUgAAANIAAAI6CAMAAABlz+a2AAADAFBMVEUAAAACAxAECSgOEy0GFk0BCUwCF20IJnAHZ+8PJVEAC2wG",
+    "KIwG1/wKNpAOV88JR84KdfEORrAJOK0BGIsONnEEWekAFq7x9/4RZdMvVsjP1/cORZEuVrBKZ8wCJ6wvZ6+qt+0OVrKSp+y3xfQv",
+    "Zs8pR40oSbADOcsoOGwwRXEBC4ssx/8uVpEPdtItd87X5f0YITkMER0QhewydrItp/MiKU3l6vwTp/JTdtAxh82Jl9MNVpDFy/AP",
+    "RHUrt/11mO4rNlQoTMQomO9RZrRwh9FpiOgCSecp1f4QluuVtfgOhtIPM1gCDKoUyf2WpNUAKMkQZ68VtvokOYgwZpOKnOQBGMhJ",
+    "WI5Lh8ooiOywts8pd+gxltNGWa8SdbNJeLGQx/VNVnMjJjdKmdFPtfZUeuNyd49pdq10hrJQZZBLpNd2ldIPZJVVhelKqemv1/5v",
+    "p8pESm6hrunU9P8yhLmRmLGO1v0uVXgpauWmrNVKh7N1pvGEirARldUjLGlmeMxvuvKU5v5la4w5pNi15/9JmvJGyP+FhpMRgrc4",
+    "QFhja64O4PwkPaREXcWnqblXk7aDjcnGyNkRU3oudJhjZnV0t9p0xvG8w9VygZd11f8AOONJSVRGTYxbYW9ylrcgHjxFdZaIudq4",
+    "9P8PQV0wND83krtQhJ1H1v9gbslxdH1gfeNio7qSpb2usbgbZX4gL4IxYHw6sdxAPkNVWlZGbuBUoLpVsNyJkJjR09/i5N8AAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8A479AAABAHRSTlMA////",
+    "////////////////////////////////////////////////////////////////////////////////////////////////////",
+    "////////////////////////////////////////////////////////////////////////////////////////////////////",
+    "/////////////////////////////////////////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQ39BmwAAWEFJREFUeNrtvYdj28aS+C9sAQTCIAUSlmmRJkVJlMSoN8uSLFmRlFiW",
+    "4p64d8ctidPLS7+83u7Ve+/ue/Xb+6/XP++3s7sAFiTYSUf3/d3mzrHzZBIfzOzszOzsbE/Pv4x/Gf9/HTgYcxqMf24AmoYQxrPm",
+    "/vqn/8vlf7rz+W/eek+O//pff/Ob//CHT0v7JsYIoYOPgoDENDc/ffof/uG9v7r7yV944xM+7rLxV2y8996zBw+ufpTPmOhAiwsE",
+    "s/n0yVtnht/9ERt/8cndP3377cOHzx/cXFnIr62tu65rmiYhBGP2i2m662v5O5f3ETqAUBqe3bz36OP/9t/+4R/ODb/77rvDd8+c",
+    "uhFPJMaSuVzOsizD0AkfFGEE2oYI/xV+497JGwcMCpHSk8GBD4+w8eGHM+/e/WLn6omiYdlJRjQ2dr6/P5XSORAWFOxXgjwgNijJ",
+    "LEyaBwcK4fevzxxhJGe+eOdYNjvqjGaz+WNXd7KWHtMZ1ujLL49aAIQDIiaqskHW82vmwWBC+MrwkZlz25PFTMa2LT5AJrpuF4su",
+    "oWzEQEJgt5FAwgj+K0VlWCSTLx0EQaESA9oGAmIYrsckZg6lbP4T9qzCGogBWJiT8lmFQ1CTeff7ZkLmuSMzjw2iUyrnhG4Y467B",
+    "hm6YwqphbtIRx5HziOHodkwXtkId1MhP4u/VoKN7M0d+C4aM6YuGuDcA79pkUMIaSNmw/ww8AgrULqZnnjsgWRBXGGoyv/49Lr3o",
+    "yyMD40TnQOpgVOPjXxsKE4OSase4CGUwUxPXhBGkZVDUXch/X2YCkcEjq3olkKDCJocy5fTBSEPytwxDT1nLZzcKekqXVGEzkZ/O",
+    "fC/ahzYHjmxXI+JU5OuvpV1AnqDYagREeio9sXxxKyUsI/uQMqbMyvchKFSamSnGdFoNSIhqfNzwzTeDgl9B7VKZxYl0esNJpSzL",
+    "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",
+})
+
+-- ── по просьбе: выбор персонажа. skin: 1 = классический, 2 = худи,
+-- (своя картинка убрана по просьбе). cfg объявлен ниже по файлу, поэтому
+-- выбор хранится в отдельной таблице (синхронизируется в loadCfg и
+-- при клике в настройках) ──
+PCS_CompanionSel = { skin = 1 }
+PCS_COMPANION_ASPECT = 1.0   -- ширина/высота текущей картинки
+
+local function pcsReadFile(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local raw = f:read("*a")
+    f:close()
+    if not raw or #raw == 0 then return nil end
+    return raw
+end
+
+-- размер картинки из заголовка (PNG / BMP / JPEG) — чтобы не растягивать
+-- нестандартные пропорции в квадрат
+local function pcsImageSize(raw)
+    local function be32(o) local a,b,c,d = raw:byte(o,o+3); return ((a*256+b)*256+c)*256+d end
+    local function le32(o) local a,b,c,d = raw:byte(o,o+3); return ((d*256+c)*256+b)*256+a end
+    if raw:sub(1,8) == "\137PNG\r\n\26\n" and #raw > 24 then
+        return be32(17), be32(21)
+    end
+    if raw:sub(1,2) == "BM" and #raw > 26 then
+        local w, h = le32(19), le32(23)
+        if h > 2147483647 then h = 4294967296 - h end
+        return w, h
+    end
+    if raw:byte(1) == 0xFF and raw:byte(2) == 0xD8 then
+        local i, n = 3, #raw
+        while i < n - 8 do
+            if raw:byte(i) ~= 0xFF then
+                i = i + 1
+            else
+                local m = raw:byte(i+1)
+                if m == 0xFF then
+                    i = i + 1
+                elseif m == 0xD8 or m == 0x01 or (m >= 0xD0 and m <= 0xD7) then
+                    i = i + 2
+                elseif m >= 0xC0 and m <= 0xCF and m ~= 0xC4 and m ~= 0xC8 and m ~= 0xCC then
+                    return raw:byte(i+7)*256 + raw:byte(i+8), raw:byte(i+5)*256 + raw:byte(i+6)
+                else
+                    i = i + 2 + raw:byte(i+2)*256 + raw:byte(i+3)
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- распаковывает встроенную картинку персонажа на диск, если её там ещё нет
+local function ensureCompanionFileFor(file, b64)
+    local f = io.open(file, "rb")
     if f then
         local sz = f:seek("end")
         f:close()
         if sz and sz > 0 then return true end
     end
     ensureCfgDir()
-    local raw = b64decode(PCS_COMPANION_B64)
+    local raw = b64decode(b64)
     if not raw or #raw == 0 then return false end
-    local out = io.open(PCS_COMPANION_FILE, "wb")
+    local out = io.open(file, "wb")
     if not out then return false end
     out:write(raw)
     out:close()
     return true
 end
 
--- грузит текстуру персонажа в PCS_COMPANION_TEX (вызывается один раз
--- из imgui.OnInitialize ниже); при неудаче остаётся nil, и весь код
--- отрисовки персонажа ниже просто ничего не рисует (проверяет тег)
-local function loadCompanionTexture()
-    if not ensureCompanionFile() then
+-- байты выбранной картинки: встроенная "худи" (2) или классическая (1)
+local function pcsCompanionRaw()
+    local skin = tonumber(PCS_CompanionSel.skin) or 1
+    local file, b64 = PCS_COMPANION_FILE, PCS_COMPANION_B64
+    if skin == 2 then file, b64 = PCS_COMPANION_FILE_2, PCS_COMPANION_B64_2 end
+    if not ensureCompanionFileFor(file, b64) then
         print("[PC Stats] companion: \xed\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xf0\xe0\xf1\xef\xe0\xea\xee\xe2\xe0\xf2\xfc \xea\xe0\xf0\xf2\xe8\xed\xea\xf3 \xed\xe0 \xe4\xe8\xf1\xea")
-        return
+        return nil
     end
-    local f = io.open(PCS_COMPANION_FILE, "rb")
-    if not f then
-        print("[PC Stats] companion: \xed\xe5 \xf3\xe4\xe0\xeb\xee\xf1\xfc \xee\xf2\xea\xf0\xfb\xf2\xfc " .. tostring(PCS_COMPANION_FILE))
-        return
-    end
-    local raw = f:read("*a")
-    f:close()
-    if not raw or #raw == 0 then
-        print("[PC Stats] companion: \xef\xf3\xf1\xf2\xfb\xe5 \xe4\xe0\xed\xed\xfb\xe5 \xf4\xe0\xe9\xeb\xe0")
-        return
-    end
+    return pcsReadFile(file)
+end
+
+-- ФИКС КРАША "при переключении персонажа на фоне": раньше эта функция
+-- сразу писала новую текстуру в PCS_COMPANION_TEX прямо внутри обработчика
+-- клика по кнопке смены персонажа — то есть ПОСЕРЕДИНЕ уже начавшегося
+-- кадра. Но блок отрисовки персонажа на фоне рисуется РАНЬШЕ вкладки
+-- "Настройки" в этом же кадре и к моменту клика уже успевает добавить в
+-- список отрисовки ImGui команду со СТАРЫМ указателем текстуры — а сам
+-- GPU-рендер этого списка движок делает уже ПОСЛЕ того, как весь Lua-код
+-- кадра отработал. Как только глобальная Lua-переменная переставала
+-- ссылаться на старую текстуру, её мог собрать GC/освободить mimgui ДО
+-- того, как GPU успевал её реально отрисовать — обращение к уже
+-- уничтоженному DirectX-ресурсу и роняло игру. Теперь loadCompanionTexture
+-- только ГОТОВИТ новую текстуру в PCS_COMPANION_TEX_PENDING, а реальное
+-- переключение делает PCS_applyPendingCompanionTex() — она вызывается
+-- один раз в самом начале кадра, ДО первой отрисовки персонажа, когда
+-- предыдущий кадр (и его рисование старой текстурой) уже гарантированно
+-- отрисован GPU целиком.
+local PCS_COMPANION_TEX_PENDING = nil
+local PCS_COMPANION_ASPECT_PENDING = nil
+
+function loadCompanionTexture()
+    local raw = pcsCompanionRaw()
+    if not raw then return end
     local ok, texOrErr = pcall(imgui.CreateTextureFromFileInMemory, raw, #raw)
-    if not ok then
+    if not ok or not texOrErr then
         print("[PC Stats] companion: CreateTextureFromFileInMemory \xee\xf8\xe8\xe1\xea\xe0: " .. tostring(texOrErr))
         return
     end
-    PCS_COMPANION_TEX = texOrErr
+    local w, h = pcsImageSize(raw)
+    local aspect = 1.0
+    if w and h and w > 0 and h > 0 then aspect = w / h end
+    PCS_COMPANION_TEX_PENDING    = texOrErr
+    PCS_COMPANION_ASPECT_PENDING = aspect
+end
+
+-- переносит подготовленную (PENDING) текстуру персонажа в боевую
+-- PCS_COMPANION_TEX; вызывать ТОЛЬКО один раз в самом начале отрисовки
+-- кадра, до первого использования PCS_COMPANION_TEX — см. комментарий выше
+function PCS_applyPendingCompanionTex()
+    if PCS_COMPANION_TEX_PENDING == nil then return end
+    PCS_COMPANION_TEX    = PCS_COMPANION_TEX_PENDING
+    PCS_COMPANION_ASPECT = PCS_COMPANION_ASPECT_PENDING or 1.0
+    PCS_COMPANION_TEX_PENDING = nil
+end
+
+-- вписывает прямоугольник w x h под пропорции текущего персонажа
+function PCS_companionFit(w, h)
+    local a = PCS_COMPANION_ASPECT or 1.0
+    if a >= 1 then return w, h / a end
+    return w * a, h
+end
+end
+
+-- ФИКС КРАША "ошибка отрисовки окна, окно закрыто: userdata: 0x...":
+-- текстура-компаньон создаётся ОДИН раз в imgui.OnInitialize и привязана
+-- к DirectX-устройству; если устройство "сбрасывается" (alt-tab,
+-- сворачивание игры, смена разрешения/настроек графики и т.п.), старый
+-- указатель на текстуру становится невалидным, а mimgui НЕ пересоздаёт
+-- пользовательские текстуры автоматически (в отличие от своих шрифтов).
+-- Любой дальнейший imgui.Image()/AddImage() с таким указателем кидает
+-- НЕ строковую, а userdata-ошибку, которая раньше долетала до внешнего
+-- pcall кадра и закрывала всё окно. Теперь оба места отрисовки
+-- компаньона обёрнуты в pcall и при неудаче зовут эту функцию: она
+-- один раз безопасно "забывает" мёртвую текстуру и один раз пробует
+-- перезагрузить её с диска (без спама повторных попыток каждый кадр)
+local _pcsCompanionRetried = false
+function PCS_disableCompanionTex()
+    if PCS_COMPANION_TEX == nil then return end
+    PCS_COMPANION_TEX = nil
+    if not _pcsCompanionRetried then
+        _pcsCompanionRetried = true
+        pcall(loadCompanionTexture)
+        -- старая текстура здесь уже мертва (иначе мы бы сюда не попали),
+        -- поэтому применить новую можно сразу же, без ожидания следующего
+        -- кадра — никакой ещё-не-отрисованной команды со старым
+        -- указателем в этом случае не существует
+        PCS_applyPendingCompanionTex()
+    end
+end
+
+-- по просьбе: смена персонажа на лету (кнопки в "Настройки")
+function PCS_reloadCompanion()
+    _pcsCompanionRetried = false
+    pcall(loadCompanionTexture)
 end
 
 -- подключаем шрифт иконок в режиме MergeMode поверх обычного шрифта —
@@ -3533,6 +4038,13 @@ local cfg = {
     -- автоматически из parsePhoneRatesText вместе с обычным rateVC,
     -- редактируется вручную так же, как остальные курсы) ──
     rateVCSell = 0.0,
+    -- сайт PC Stats (бекенд pcs_backend.py): порожній url = вимкнено
+    siteApiUrl      = "http://127.0.0.1:8080",
+    siteSyncEnabled = false,
+    siteSyncMoney   = true,   -- топ багатих
+    siteSyncRates   = true,   -- курси на сайт
+    siteSyncPresence= true,   -- нік+сервер+версія (хто зі скриптом)
+
     -- ASC ne chitaetsya avtomaticheski iz staty servera, kolichestvo vvoditsya vruchnuyu
     ascAmount = 0.0,
     rateASC   = 0.0,
@@ -3579,7 +4091,10 @@ local cfg = {
     -- на каждую реальную (не "нет налогов") успешную оплату.
     taxTotalPaid          = 0.0,   -- сколько всего потрачено на налоги за всё время
     taxPayOnLogin         = false, -- при входе в игру подождать 1-2 минуты и автоматически оплатить налоги
-    autoCheckUpdates      = true,  -- автопроверка обновлений
+    smoothMenuAnim        = true,  -- плавное открытие/закрытие главного меню
+    smoothTabAnim         = true,  -- плавный переход между вкладками
+    animAllOff            = false, -- общий тумблер "отключить все анимации сразу"
+    autoCheckUpdates      = false, -- по просьбе: автопроверка обновлений отключена, тумблер убран
     -- ФИКС/добавлено (по просьбе): если true — сообщения о проверке
     -- версии / доступной новой версии / завершении обновления НЕ
     -- пишутся в обычный чат SA-MP, а показываются только всплывающим
@@ -3597,6 +4112,34 @@ local cfg = {
     -- прозрачность фона окна меню и текста (1.0 = как раньше)
     winBgAlpha             = 1.0,
     textAlpha              = 1.0,
+    -- ── галочки видимости валют на панели "Курс валют" (по умолчанию
+    -- показаны все) ──
+    chartShowAZ  = true,
+    chartShowBTC = true,
+    chartShowEUR = true,
+    chartShowVC  = true,
+    chartShowASC = true,
+    -- ── по просьбе: радужный (переливающийся) персонаж на фоне —
+    -- вместо статичного цветового тона крутит HSV-круг, как rainbowBorder
+    -- выше ──
+    companionRainbow = false,
+    -- ── по просьбе: переливающаяся (радужная) обводка вокруг персонажа
+    -- на фоне — по умолчанию включена; тумблер ниже гасит только
+    -- переливание (обводка остаётся статичным акцентным цветом) ──
+    companionOutlineRainbow = true,
+    -- ── по просьбе: тумблер полного отключения обводки персонажа
+    -- на фоне (не только переливания, а самой обводки целиком) ──
+    companionOutlineEnabled = true,
+    -- ── по просьбе: выбор персонажа (1 классический, 2 худи) ──
+    companionSkin = 1,
+    -- ── по просьбе: толщина обводки персонажа на фоне (множитель
+    -- к базовым отступам "ореола"/"кромки", см. отрисовку ниже);
+    -- 1.0 = как было раньше, диапазон 0.3..3.0 ──
+    companionOutlineThickness = 1.0,
+    -- ── по просьбе: цвет темы, подтягиваемый с сайта — URL заполняется
+    -- игроком/автором скрипта; -1 = ещё ни разу не получен ──
+    -- (по просьбе: функция "цвет темы с сайта" полностью удалена —
+    -- убран и блок UI во вкладке "Настройки", и весь код фичи)
 }
 
 -- kastomnye cveta konkretnyh tekstovyh elementov (klikom po tekstu/cifram),
@@ -3733,6 +4276,11 @@ local function applyCfgData(m)
     cfg.rateEUR       = clampNum(m.rateEUR, 0, 1e9, 0.0)
     cfg.rateVC        = clampNum(m.rateVC, 0, 1e9, 0.0)
     cfg.rateVCSell    = clampNum(m.rateVCSell, 0, 1e9, 0.0)
+    cfg.siteApiUrl       = tostring(m.siteApiUrl or cfg.siteApiUrl or "http://127.0.0.1:8080")
+    cfg.siteSyncEnabled  = toBool(m.siteSyncEnabled, true)
+    cfg.siteSyncMoney    = toBool(m.siteSyncMoney, true)
+    cfg.siteSyncRates    = toBool(m.siteSyncRates, true)
+    cfg.siteSyncPresence = toBool(m.siteSyncPresence, true)
     cfg.ascAmount     = clampNum(m.ascAmount, 0, 1e12, 0.0)
     cfg.rateASC       = clampNum(m.rateASC, 0, 1e9, 0.0)
     cfg.vcServerName  = (m.vcServerName and m.vcServerName ~= "") and m.vcServerName or "Tucson"
@@ -3781,12 +4329,28 @@ local function applyCfgData(m)
     cfg.taxLastPayAmount      = clampNum(m.taxLastPayAmount, 0, 1e15, 0.0)
     cfg.taxTotalPaid          = clampNum(m.taxTotalPaid, 0, 1e18, 0.0)
     cfg.taxPayOnLogin         = toBool(m.taxPayOnLogin, false)
-    cfg.autoCheckUpdates      = toBool(m.autoCheckUpdates, true)
+    -- ФИКС (по просьбе): тумблеры этих трёх настроек убраны из интерфейса —
+    -- как и с cfg.hideNativeStats выше, теперь всегда жёстко true/false,
+    -- даже если в старом файле настроек на диске когда-то было сохранено
+    -- "выключено" через прежний тумблер (иначе анимации остались бы
+    -- навсегда выключены без возможности снова включить их из меню)
+    cfg.smoothMenuAnim = true
+    cfg.smoothTabAnim  = true
+    cfg.animAllOff      = false
+    -- ── по просьбе: тумблер "автопроверка обновлений" убран — теперь
+    -- всегда жёстко false (скрипт больше не проверяет и не напоминает
+    -- об обновлении сам, независимо от того, что раньше было сохранено
+    -- в файле настроек). Ручная команда /pcsupdate по-прежнему работает,
+    -- если она осталась в скрипте — это отдельное, осознанное действие
+    -- игрока, а не автоматика ──
+    cfg.autoCheckUpdates      = false
     cfg.companionBgEnabled    = toBool(m.companionBgEnabled, true)
     cfg.companionBgAlpha      = clampNum(m.companionBgAlpha, 0.05, 1.0, 0.35)
     cfg.companionTintR        = clampNum(m.companionTintR, 0.0, 1.0, 1.0)
     cfg.companionTintG        = clampNum(m.companionTintG, 0.0, 1.0, 1.0)
     cfg.companionTintB        = clampNum(m.companionTintB, 0.0, 1.0, 1.0)
+    cfg.companionOutlineEnabled   = toBool(m.companionOutlineEnabled, true)
+    cfg.companionOutlineThickness = clampNum(m.companionOutlineThickness, 0.3, 3.0, 1.0)
     cfg.rowBgAlpha            = clampNum(m.rowBgAlpha, 0.10, 1.0, 0.98)
     cfg.winBgAlpha            = clampNum(m.winBgAlpha, 0.05, 1.0, 1.0)
     cfg.textAlpha             = clampNum(m.textAlpha, 0.25, 1.0, 1.0)
@@ -3795,6 +4359,19 @@ local function applyCfgData(m)
     cfg.incomeTrackEnabled = toBool(m.incomeTrackEnabled, true)
     cfg.incomeAllTimeMoney = clampNum(m.incomeAllTimeMoney, 0, 1e18, 0.0)
     cfg.incomeAllTimeAZ    = clampNum(m.incomeAllTimeAZ,    0, 1e18, 0.0)
+
+    -- ── галочки видимости валют на панели "Курс валют" ──
+    cfg.chartShowAZ  = toBool(m.chartShowAZ,  true)
+    cfg.chartShowBTC = toBool(m.chartShowBTC, true)
+    cfg.chartShowEUR = toBool(m.chartShowEUR, true)
+    cfg.chartShowVC  = toBool(m.chartShowVC,  true)
+    cfg.chartShowASC = toBool(m.chartShowASC, true)
+    cfg.companionRainbow = toBool(m.companionRainbow, false)
+    cfg.companionOutlineRainbow = toBool(m.companionOutlineRainbow, true)
+    cfg.companionSkin = math.floor(clampNum(m.companionSkin, 1, 3, 1))
+    if cfg.companionSkin > 2 then cfg.companionSkin = 1 end -- "своё фото" (3) убрано
+    PCS_CompanionSel.skin = cfg.companionSkin
+    if PCS_COMPANION_TEX and cfg.companionSkin ~= 1 then PCS_reloadCompanion() end
 end
 
 local function loadCfg()
@@ -3815,7 +4392,7 @@ local function loadCfg()
     end
 end
 
-local function saveCfg()
+function PCS_saveCfgNow()
     -- п.12: помечаем, что настройки менялись в течение ТЕКУЩЕЙ открытой
     -- сессии меню — используется требованием закрытия с подтверждением
     -- (см. requestCloseMenu/drawCloseConfirmPopup ниже). Пока меню
@@ -3869,6 +4446,11 @@ local function saveCfg()
             rateEUR       = tostring(cfg.rateEUR),
             rateVC        = tostring(cfg.rateVC),
             rateVCSell    = tostring(cfg.rateVCSell),
+            siteApiUrl      = tostring(cfg.siteApiUrl or ""),
+            siteSyncEnabled = tostring(cfg.siteSyncEnabled ~= false),
+            siteSyncMoney   = tostring(cfg.siteSyncMoney ~= false),
+            siteSyncRates   = tostring(cfg.siteSyncRates ~= false),
+            siteSyncPresence= tostring(cfg.siteSyncPresence ~= false),
             ascAmount     = tostring(cfg.ascAmount),
             rateASC       = tostring(cfg.rateASC),
             vcServerName  = tostring(cfg.vcServerName or "Tucson"),
@@ -3896,6 +4478,9 @@ local function saveCfg()
             taxLastPayAmount      = tostring(cfg.taxLastPayAmount),
             taxTotalPaid          = tostring(cfg.taxTotalPaid),
             taxPayOnLogin         = tostring(cfg.taxPayOnLogin),
+            smoothMenuAnim  = tostring(cfg.smoothMenuAnim ~= false),
+            smoothTabAnim   = tostring(cfg.smoothTabAnim ~= false),
+            animAllOff      = tostring(cfg.animAllOff == true),
             autoCheckUpdates      = tostring(cfg.autoCheckUpdates ~= false),
             companionBgEnabled    = tostring(cfg.companionBgEnabled ~= false),
             companionBgAlpha      = tostring(cfg.companionBgAlpha),
@@ -3908,8 +4493,33 @@ local function saveCfg()
             incomeTrackEnabled = tostring(cfg.incomeTrackEnabled),
             incomeAllTimeMoney = tostring(cfg.incomeAllTimeMoney),
             incomeAllTimeAZ    = tostring(cfg.incomeAllTimeAZ),
+            chartShowAZ  = tostring(cfg.chartShowAZ  ~= false),
+            chartShowBTC = tostring(cfg.chartShowBTC ~= false),
+            chartShowEUR = tostring(cfg.chartShowEUR ~= false),
+            chartShowVC  = tostring(cfg.chartShowVC  ~= false),
+            chartShowASC = tostring(cfg.chartShowASC ~= false),
+            companionRainbow = tostring(cfg.companionRainbow == true),
+            companionOutlineRainbow = tostring(cfg.companionOutlineRainbow ~= false),
+            companionOutlineEnabled = tostring(cfg.companionOutlineEnabled ~= false),
+            companionOutlineThickness = tostring(cfg.companionOutlineThickness or 1.0),
+            companionSkin = tostring(cfg.companionSkin or 1),
         }}, CFG_FILE)
     end)
+end
+
+-- PERF: раньше каждый saveCfg() (а он вызывается из слайдеров КАЖДЫЙ кадр
+-- при перетаскивании) синхронно писал весь ini на диск -> просадки FPS.
+-- Теперь запись откладывается и делается из главного цикла через 0.6с
+-- после последнего изменения (и принудительно при выгрузке скрипта).
+local function saveCfg()
+    if St.winOpen then St._settingsTouchedThisSession = true end
+    St._cfgDirtyAt = os.clock()
+end
+function PCS_saveCfgFlush()
+    if St._cfgDirtyAt then
+        St._cfgDirtyAt = nil
+        PCS_saveCfgNow()
+    end
 end
 
 -- ============================================================
@@ -4074,14 +4684,690 @@ local function SFtext(n)
 end
 
 -- ============================================================
---  ВСПЛЫВАЮЩИЕ УВЕДОМЛЕНИЯ (TOAST) — код полностью удалён по просьбе.
+--  ВСПЛЫВАЮЩИЕ УВЕДОМЛЕНИЯ (TOAST) — возвращены (перенос из Market Helper 5.1.5), модуль ниже.
 --  Все прежние вызовы pcs_notify/pcs_apply_toast_settings/pcs_toast_test,
 --  оставшиеся по файлу, обёрнуты в pcall (см. историю), поэтому
 --  отсутствие этих функций (обращение к неопределённому глобальному
 --  имени в Lua не ошибка) ничего не ломает — тосты просто не рисуются.
 -- ============================================================
 
--- pcs_ver.notify всегда пишет в обычный чат (тоста больше нет)
+-- ============================================================
+--  ВСПЛЫВАЮЩИЕ УВЕДОМЛЕНИЯ (ПЛАШКИ) — перенесены из Market Helper 5.1.5
+--  (Embedded NotificationToastSystem). Стиль и настройки те же:
+--  позиция, размеры, цвета, рамка, время показа, анимация, тест.
+--  Настройки лежат в moonloader/config/PCStats/toast.json, редактируются
+--  во вкладке "Настройки" -> "Всплывающие уведомления".
+--
+--  ВАЖНО (мешают ли плашки игре): окно каждой плашки создаётся с флагом
+--  imgui.WindowFlags.NoInputs, а сам кадр помечен HideCursor = true
+--  (imgui.ShowCursor = false) — плашки не перехватывают мышь/клавиатуру
+--  и не показывают курсор.
+--
+--  Все сообщения скрипта в чат (sampAddChatMessage, AIS.msg и т.д.)
+--  дублируются плашкой через хук в sampAddChatMessage выше по файлу.
+--  Весь модуль в do...end и наружу отдаёт только глобальные функции —
+--  локальные переменные файла и так почти на лимите LuaJIT.
+-- ============================================================
+
+-- ── PCS_TR: журнал последних событий (уведомления, автооплата налогов). Пишется с flush
+-- в файл config/PCStats/tax_trace.txt (кольцо на 40 строк). Если игра вылетает, файл
+-- остаётся; при следующем запуске он копируется в tax_trace_prev.txt — по нему видно,
+-- что происходило прямо перед вылетом ──
+PCS_TR = (function()
+    local path = CFG_DIR .. "/tax_trace.txt"
+    local prev = CFG_DIR .. "/tax_trace_prev.txt"
+    pcall(function() createDirectory("moonloader/config") end)
+    pcall(function() createDirectory(CFG_DIR) end)
+    pcall(function()
+        local f = io.open(path, "rb")
+        if f then
+            local b = f:read("*a"); f:close()
+            if b and #b > 0 then
+                local o = io.open(prev, "wb")
+                if o then o:write(b); o:close() end
+            end
+        end
+    end)
+    local f = io.open(path, "wb")
+    local n, LW, NL = 0, 100, 40
+    return function(text)
+        if not f then return end
+        n = n + 1
+        pcall(function()
+            local line = string.format("%06d %.2f %s", n, os.clock(), tostring(text)):gsub("[\r\n]", " "):sub(1, LW - 1)
+            line = line .. string.rep(" ", LW - 1 - #line) .. "\n"
+            f:seek("set", ((n - 1) % NL) * LW)
+            f:write(line)
+            f:flush()
+        end)
+    end
+end)()
+
+do
+    local imgui = imgui
+    local TOAST_FILE = CFG_DIR .. "/toast.json"
+
+    local DEF = {
+        enabled       = true,
+        width         = 320,
+        padding_x     = 14,
+        padding_y     = 10,
+        accent_width  = 4,
+        corner_radius = 8,
+        spacing       = 8,
+        margin_x      = 18,
+        margin_y      = 34,
+        duration      = 6.0,
+        anim_speed    = 10.0,
+        max_visible   = 5,
+        pos_h         = "right",
+        pos_v         = "bottom",
+        bg_r = 0.08, bg_g = 0.08, bg_b = 0.10, bg_a = 0.90,
+        text_r = 0.94, text_g = 0.94, text_b = 0.96, text_a = 1.00,
+        border_enabled = false,
+        border_r = 1.00, border_g = 1.00, border_b = 1.00, border_a = 0.25,
+        border_size = 1.0,
+        font_scale  = 1.0,
+        char_enabled     = true,  -- персонаж-стикер «говорит» уведомление
+        char_size        = 76,
+        typewriter       = true,  -- текст «печатается», как речь
+        typewriter_speed = 60,    -- символов в секунду
+        show_progress    = true,  -- полоска оставшегося времени
+        clock_enabled    = true,  -- часы реального времени на экране
+        clock_x          = 0.5,   -- положение часов: 0 = слева, 1 = справа
+        clock_y          = 0.0,   -- 0 = сверху, 1 = снизу
+        clock_scale      = 1.0,
+        payday_remind    = true,  -- напоминание за 5 минут до PayDay (в :25 и :55)
+    }
+    local T = {}
+    for k, v in pairs(DEF) do T[k] = v end
+    pcall(function()
+        local f = io.open(TOAST_FILE, "rb")
+        if not f then return end
+        local body = f:read("*a"); f:close()
+        if type(decodeJson) ~= "function" or not body or body == "" then return end
+        local ok, t = pcall(decodeJson, body)
+        if ok and type(t) == "table" then
+            for k, v in pairs(t) do
+                if DEF[k] ~= nil and type(v) == type(DEF[k]) then T[k] = v end
+            end
+        end
+    end)
+    PCS_TOAST     = T
+    PCS_TOAST_DEF = DEF
+
+    -- ── отложенное сохранение настроек (слайдеры дёргают каждый кадр) ──
+    local dirtyAt = nil
+    function PCS_toastSave() dirtyAt = os.clock() end
+    function PCS_toastFlush(force)
+        if not dirtyAt then return end
+        if not force and os.clock() - dirtyAt < 0.6 then return end
+        dirtyAt = nil
+        pcall(function()
+            if type(encodeJson) ~= "function" then return end
+            local f = io.open(TOAST_FILE, "wb")
+            if f then f:write(encodeJson(T)); f:close() end
+        end)
+    end
+
+    local TYPES = {
+        info    = { color = {0.25, 0.55, 0.95}, icon = PCS_IC.info,  label = u8"\xc8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xff" },
+        success = { color = {0.22, 0.78, 0.40}, icon = PCS_IC.check, label = u8"\xd3\xf1\xef\xe5\xf5" },
+        warning = { color = {0.95, 0.66, 0.15}, icon = PCS_IC.warn,  label = u8"\xc2\xed\xe8\xec\xe0\xed\xe8\xe5" },
+        error   = { color = {0.92, 0.26, 0.26}, icon = PCS_IC.xmark, label = u8"\xce\xf8\xe8\xe1\xea\xe0" },
+        payday  = { color = {0.98, 0.80, 0.25}, icon = PCS_IC.coins, label = "PayDay" },
+    }
+
+    local function safe_call(fn, ...)
+        if type(fn) ~= "function" then return nil end
+        local ok, a, b = pcall(fn, ...)
+        if ok then return a, b end
+        return nil
+    end
+    local function pack_color(r, g, b, a)
+        return imgui.ColorConvertFloat4ToU32(imgui.ImVec4(r, g, b, a == nil and 1 or a))
+    end
+    local function clamp01(v) if v < 0 then return 0 elseif v > 1 then return 1 else return v end end
+    local function lerp_dt(cur, target, speed, dt)
+        local t = clamp01(1 - math.exp(-speed * math.max(dt, 0)))
+        return cur + (target - cur) * t
+    end
+
+    -- менеджер очереди плашек
+    local M = { active = {}, pending = {}, cfg = {}, scale = 1, seq = 0, lastText = nil, lastT = 0 }
+
+    local function build_cfg()
+        local d = tonumber(St.UI_SCALE) or 1
+        M.scale = d
+        M.cfg = {
+            width = T.width * d, padding_x = T.padding_x * d, padding_y = T.padding_y * d,
+            accent_width = T.accent_width * d, corner_radius = T.corner_radius * d,
+            spacing = T.spacing * d, margin_x = T.margin_x * d, margin_y = T.margin_y * d,
+            duration = T.duration, anim_speed = T.anim_speed,
+            max_visible = math.max(1, math.floor(T.max_visible)),
+            position = (T.pos_v or "bottom") .. "_" .. (T.pos_h or "right"),
+            bg_color = { T.bg_r, T.bg_g, T.bg_b, T.bg_a },
+            text_color = { T.text_r, T.text_g, T.text_b, T.text_a },
+            border_enabled = T.border_enabled,
+            border_color = { T.border_r, T.border_g, T.border_b, T.border_a },
+            border_size = T.border_size, font_scale = T.font_scale,
+            char_size = (T.char_size or 76) * d, char_w = 0, total_w = T.width * d,
+            typewriter = T.typewriter ~= false,
+            typewriter_speed = math.max(10, T.typewriter_speed or 60),
+            progress = T.show_progress ~= false,
+        }
+    end
+    build_cfg()
+
+    function pcs_apply_toast_settings() build_cfg() end
+
+    -- ── раскладка: ручной перенос строк (нужен для эффекта «печатается»),
+    -- высота считается заранее, поэтому плашка не «прыгает» после появления ──
+    local function text_w(s)
+        local v = safe_call(imgui.CalcTextSize, s)
+        if v and v.x then return v.x end
+        return #s * 7
+    end
+    local UTF8CH = "[%z\1-\127\194-\244][\128-\191]*"
+    local function utf8_chars(s)
+        local t = {}
+        for ch in s:gmatch(UTF8CH) do t[#t + 1] = ch end
+        return t
+    end
+    local function wrap_text(text, max_w)
+        local lines = {}
+        local function push(s) lines[#lines + 1] = s end
+        for para in (text .. "\n"):gmatch("(.-)\n") do
+            local cur = ""
+            for word in para:gmatch("%S+") do
+                local try = (cur == "") and word or (cur .. " " .. word)
+                if text_w(try) <= max_w then
+                    cur = try
+                elseif cur ~= "" then
+                    push(cur); cur = ""
+                    if text_w(word) <= max_w then cur = word end
+                end
+                if cur == "" and text_w(word) > max_w then
+                    local piece = ""
+                    for _, ch in ipairs(utf8_chars(word)) do
+                        if piece ~= "" and text_w(piece .. ch) > max_w then push(piece); piece = "" end
+                        piece = piece .. ch
+                    end
+                    cur = piece
+                end
+            end
+            push(cur)
+        end
+        while #lines > 1 and lines[#lines] == "" do lines[#lines] = nil end
+        local MAXL = 7
+        if #lines > MAXL then
+            for k = #lines, MAXL + 1, -1 do lines[k] = nil end
+            local chars = utf8_chars(lines[MAXL])
+            while #chars > 1 and text_w(table.concat(chars) .. "...") > max_w do chars[#chars] = nil end
+            lines[MAXL] = table.concat(chars) .. "..."
+        end
+        return lines
+    end
+    local function char_offsets(s)
+        local o, pos = {}, 0
+        for ch in s:gmatch(UTF8CH) do pos = pos + #ch; o[#o + 1] = pos end
+        return o
+    end
+
+    local function calc_height(n)
+        local cfg = M.cfg
+        local sc = M.scale
+        local fs = cfg.font_scale or 1.0
+        local key = table.concat({ cfg.width, cfg.char_w, fs, cfg.padding_x, cfg.padding_y,
+            cfg.accent_width, cfg.progress and 1 or 0 }, "|")
+        if n.lkey == key and n.height then return n.height end
+        n.lkey = key
+
+        local wrap_w = (cfg.width - cfg.padding_x * 2 - cfg.accent_width) / fs
+        n.lines = wrap_text(n.text, wrap_w)
+        n.offs, n.total = {}, 0
+        for i, l in ipairs(n.lines) do
+            n.offs[i] = char_offsets(l)
+            n.total = n.total + #n.offs[i]
+        end
+        local lsz = safe_call(imgui.CalcTextSize, "Ag")
+        n.lh = ((lsz and lsz.y) or 14) * fs
+        n.head_h = n.lh + 4 * sc
+        n.text_h = #n.lines * n.lh + (#n.lines - 1) * 2 * sc
+        n.bub_h = cfg.padding_y * 2 + n.head_h + 4 * sc + n.text_h + (cfg.progress and 8 * sc or 0)
+
+        local ch_h = 0
+        if cfg.char_w > 0 then
+            local okf, _, fh = pcall(PCS_companionFit, cfg.char_w - 6 * sc, cfg.char_w - 6 * sc)
+            if okf and fh then ch_h = fh end
+        end
+        n.height = 6 * sc + math.max(n.bub_h, ch_h) + 4 * sc
+        return n.height
+    end
+
+    local function dismiss(n)
+        if n.state ~= "disappearing" and n.state ~= "dead" then
+            n.state = "disappearing"; n.timer = 0
+        end
+    end
+
+    local function update_one(n, dt, target_y, off_y)
+        local cfg = M.cfg
+        n.age = (n.age or 0) + dt
+        n.target_y = target_y
+        if n.state == "appearing" then
+            if not n.spawned then n.y = off_y; n.spawned = true end
+            n.y = lerp_dt(n.y, target_y, cfg.anim_speed, dt)
+            n.alpha = lerp_dt(n.alpha, 1, cfg.anim_speed, dt)
+            if math.abs(n.y - target_y) < 0.75 and n.alpha > 0.97 then
+                n.state = "showing"; n.timer = 0
+            end
+        elseif n.state == "showing" then
+            n.y = lerp_dt(n.y, target_y, cfg.anim_speed, dt)
+            n.alpha = lerp_dt(n.alpha, 1, cfg.anim_speed, dt)
+            n.timer = n.timer + dt
+            if n.timer >= n.duration then dismiss(n) end
+        elseif n.state == "disappearing" then
+            n.y = lerp_dt(n.y, off_y, cfg.anim_speed, dt)
+            n.alpha = lerp_dt(n.alpha, 0, cfg.anim_speed, dt)
+            n.timer = n.timer + dt
+            if n.alpha < 0.02 or n.timer > 2.5 then n.state = "dead" end
+        end
+    end
+
+    -- pcs_notify(text_utf8, type, duration) — text уже в UTF-8
+    -- type: info | success | warning | error | payday
+    function pcs_notify(text, ntype, duration)
+        if T.enabled == false then return nil end
+        text = tostring(text or "")
+        if text == "" then return nil end
+        -- одинаковый текст подряд (спам одним и тем же) — не дублируем
+        local now = os.clock()
+        if M.lastText == text and now - M.lastT < 1.0 then return nil end
+        M.lastText, M.lastT = text, now
+
+        M.seq = M.seq + 1
+        PCS_TR("notify " .. tostring(ntype) .. ": " .. text:sub(1, 45))
+        local n = {
+            id = M.seq, text = text, ntype = TYPES[ntype] and ntype or "info",
+            duration = tonumber(duration) or M.cfg.duration,
+            state = "appearing", timer = 0, alpha = 0, y = 0, target_y = 0,
+            offset = 0, height = nil, spawned = false,
+        }
+        if #M.active < M.cfg.max_visible then
+            M.active[#M.active + 1] = n
+        else
+            M.pending[#M.pending + 1] = n
+            while #M.pending > 40 do table.remove(M.pending, 1) end
+        end
+        return n.id
+    end
+
+    function pcs_toast_test(kind)
+        local samples = {
+            info    = u8"\xcf\xf0\xe8\xec\xe5\xf0 \xe8\xed\xf4\xee\xf0\xec\xe0\xf6\xe8\xee\xed\xed\xee\xe3\xee \xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xff PC Stats.",
+            success = u8"\xce\xef\xe5\xf0\xe0\xf6\xe8\xff \xef\xf0\xee\xf8\xeb\xe0 \xf3\xf1\xef\xe5\xf8\xed\xee.",
+            warning = u8"\xc2\xed\xe8\xec\xe0\xed\xe8\xe5: \xef\xf0\xee\xe2\xe5\xf0\xfc\xf2\xe5 \xed\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8.",
+            error   = u8"\xcf\xf0\xe8\xec\xe5\xf0 \xee\xf8\xe8\xe1\xea\xe8 \x97 \xf7\xf2\xee-\xf2\xee \xef\xee\xf8\xeb\xee \xed\xe5 \xf2\xe0\xea.",
+            payday  = u8"PayDay: +1 250 000   +3 AZ",
+        }
+        M.lastText = nil
+        if kind == "all" then
+            for _, k in ipairs({ "info", "success", "warning", "error", "payday" }) do
+                pcs_notify(samples[k], k)
+                M.lastText = nil
+            end
+            return
+        end
+        if not samples[kind] then kind = "info" end
+        pcs_notify(samples[kind], kind)
+    end
+
+    local function layout_params(sw, sh)
+        local cfg = M.cfg
+        local pos = cfg.position or "bottom_right"
+        local x
+        if pos:find("right") then x = sw - cfg.margin_x - cfg.total_w
+        elseif pos:find("left") then x = cfg.margin_x
+        else x = (sw - cfg.total_w) / 2 end
+        if x + cfg.total_w > sw then x = sw - cfg.total_w end
+        if x < 0 then x = 0 end
+        local mgy = math.max(cfg.margin_y, 28 * M.scale)
+        if pos:find("^top") then return x, mgy, false end
+        return x, sh - mgy, true
+    end
+
+    local function update_all(dt)
+        local cfg = M.cfg
+        cfg.char_w = (T.char_enabled ~= false and PCS_COMPANION_TEX ~= nil and os.clock() >= (M.charFailUntil or 0)) and (cfg.char_size or 0) or 0
+        cfg.total_w = cfg.width + cfg.char_w
+        while #M.active < cfg.max_visible and #M.pending > 0 do
+            M.active[#M.active + 1] = table.remove(M.pending, 1)
+        end
+        if #M.active == 0 then return end
+        local io = imgui.GetIO()
+        local sw, sh = io.DisplaySize.x, io.DisplaySize.y
+        local ax, ay, grows_up = layout_params(sw, sh)
+        M.anchor_x = ax
+        local off_y = grows_up and (sh + 40) or -40
+        local acc = 0
+        for i = #M.active, 1, -1 do
+            local n = M.active[i]
+            calc_height(n)
+            n.offset = acc
+            acc = acc + n.height + cfg.spacing
+            local target_y = grows_up and (ay - n.height - n.offset) or (ay + n.offset)
+            update_one(n, dt, target_y, grows_up and off_y or (off_y - n.height))
+        end
+        for i = #M.active, 1, -1 do
+            if M.active[i].state == "dead" then table.remove(M.active, i) end
+        end
+    end
+
+    -- NoInputs: плашка не ловит мышь/клавиши и не мешает игре
+    local WF = imgui.WindowFlags
+    local TOAST_FLAGS = WF.NoTitleBar + WF.NoResize + WF.NoMove + WF.NoScrollbar
+        + WF.NoScrollWithMouse + WF.NoCollapse + WF.NoSavedSettings
+        + WF.NoFocusOnAppearing + WF.NoNav + WF.NoBackground
+    if WF.NoInputs then
+        TOAST_FLAGS = TOAST_FLAGS + WF.NoInputs
+    else
+        if WF.NoMouseInputs then TOAST_FLAGS = TOAST_FLAGS + WF.NoMouseInputs end
+    end
+    if WF.NoBringToFrontOnFocus then TOAST_FLAGS = TOAST_FLAGS + WF.NoBringToFrontOnFocus end
+
+    -- Плашка = персонаж-стикер (с белой каймой и тенью) + речевой «пузырь»
+    -- с хвостиком. Текст «печатается», пока персонаж «говорит» (подпрыгивает),
+    -- снизу — полоска оставшегося времени.
+    local function draw_toast(n)
+        local cfg = M.cfg
+        local def = TYPES[n.ntype]
+        local a = clamp01(n.alpha)
+        if a <= 0.01 or not n.lines then return end
+        local sc = M.scale
+        local fs = cfg.font_scale or 1.0
+        local V2 = imgui.ImVec2
+
+        imgui.SetNextWindowPos(V2(M.anchor_x, n.y), imgui.Cond.Always)
+        imgui.SetNextWindowSize(V2(cfg.total_w, n.height), imgui.Cond.Always)
+        imgui.SetNextWindowBgAlpha(0)
+        imgui.PushStyleColor(imgui.Col.Border, imgui.ImVec4(0, 0, 0, 0))
+
+        if not n.tr then n.tr = true; PCS_TR("toast draw begin id=" .. tostring(n.id)) end
+        local okBegin = imgui.Begin("##pcs_toast_" .. tostring(n.id), nil, TOAST_FLAGS)
+        local snapT = PCS_GUARD and PCS_GUARD.snap and PCS_GUARD.snap()
+        if okBegin then
+          local okBody, errBody = pcall(function()
+            safe_call(imgui.SetWindowFontScale, fs)
+            local dl = imgui.GetWindowDrawList()
+            local p = imgui.GetWindowPos()
+            local c = def.color
+            local bg = cfg.bg_color
+            local rnd = cfg.corner_radius
+            local padx, pady = cfg.padding_x, cfg.padding_y
+
+            local bx0 = p.x + cfg.char_w
+            local bx1 = bx0 + cfg.width
+            local by1 = p.y + n.height - 4 * sc
+            local by0 = by1 - n.bub_h
+            local bgU = pack_color(bg[1], bg[2], bg[3], bg[4] * a)
+
+            -- «пузырь»: тень, фон, лёгкий оттенок цвета типа, рамка
+            dl:AddRectFilled(V2(bx0 + 1 * sc, by0 + 3 * sc), V2(bx1 + 1 * sc, by1 + 3 * sc),
+                pack_color(0, 0, 0, 0.28 * a), rnd)
+            dl:AddRectFilled(V2(bx0, by0), V2(bx1, by1), bgU, rnd)
+            dl:AddRectFilled(V2(bx0, by0), V2(bx1, by1), pack_color(c[1], c[2], c[3], 0.07 * a), rnd)
+            if cfg.accent_width > 0 then
+                dl:AddRectFilled(V2(bx0 + 3, by0 + 5), V2(bx0 + 3 + cfg.accent_width, by1 - 5),
+                    pack_color(c[1], c[2], c[3], a), cfg.accent_width / 2)
+            end
+            local typeBorder = pack_color(c[1], c[2], c[3], 0.70 * a)
+            safe_call(dl.AddRect, dl, V2(bx0, by0), V2(bx1, by1), typeBorder, rnd, 0, 1.3)
+            if cfg.border_enabled and (cfg.border_size or 0) > 0 then
+                local bc = cfg.border_color
+                safe_call(dl.AddRect, dl, V2(bx0, by0), V2(bx1, by1),
+                    pack_color(bc[1], bc[2], bc[3], (bc[4] or 1) * a), rnd, 0, cfg.border_size)
+            end
+
+            -- хвостик «пузыря» в сторону персонажа
+            if cfg.char_w > 0 then
+                local ty = by0 + math.min(n.bub_h * 0.5, 26 * sc)
+                local tw, th = 9 * sc, 6 * sc
+                dl:AddRectFilled(V2(bx0 - 1, ty - th + 1), V2(bx0 + 1.5, ty + th - 1), bgU)
+                dl:AddTriangleFilled(V2(bx0 - 1, ty - th), V2(bx0 - 1, ty + th), V2(bx0 - tw, ty), bgU)
+                dl:AddLine(V2(bx0 - 1, ty - th), V2(bx0 - tw, ty), typeBorder, 1.3)
+                dl:AddLine(V2(bx0 - tw, ty), V2(bx0 - 1, ty + th), typeBorder, 1.3)
+            end
+
+            -- заголовок-«таблетка»: иконка + тип
+            local tx = bx0 + padx + cfg.accent_width
+            local label = def.icon .. "  " .. def.label
+            local lsz = safe_call(imgui.CalcTextSize, label)
+            local lw = ((lsz and lsz.x) or 60) * fs
+            local px0, py0 = tx - 6 * sc, by0 + pady
+            dl:AddRectFilled(V2(px0, py0), V2(px0 + lw + 12 * sc, py0 + n.head_h),
+                pack_color(c[1], c[2], c[3], 0.22 * a), n.head_h / 2)
+            imgui.SetCursorPos(V2(px0 - p.x + 6 * sc, py0 - p.y + (n.head_h - n.lh) / 2))
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(c[1], c[2], c[3], a))
+            pcall(imgui.TextUnformatted, label)
+            imgui.PopStyleColor()
+
+            -- текст: «печатается» посимвольно (UTF-8 безопасно)
+            local k = cfg.typewriter and math.floor((n.age or 0) * cfg.typewriter_speed) or 1e9
+            local speaking = k < (n.total or 0)
+            local ty0 = by0 + pady + n.head_h + 4 * sc
+            local tc = cfg.text_color
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(tc[1], tc[2], tc[3], tc[4] * a))
+            local rem = k
+            for i, line in ipairs(n.lines) do
+                if rem <= 0 then break end
+                local offs = n.offs[i] or {}
+                local cnt = #offs
+                local s = line
+                if rem < cnt then s = line:sub(1, offs[rem]) end
+                rem = rem - cnt
+                if s ~= "" then
+                    imgui.SetCursorPos(V2(tx - p.x, ty0 - p.y + (i - 1) * (n.lh + 2 * sc)))
+                    pcall(imgui.TextUnformatted, s)
+                end
+            end
+            imgui.PopStyleColor()
+
+            -- полоска оставшегося времени
+            if cfg.progress then
+                local frac = 0
+                if n.state == "showing" then frac = 1 - n.timer / math.max(n.duration, 0.1)
+                elseif n.state == "appearing" then frac = 1 end
+                frac = clamp01(frac)
+                local xa, xb = tx, bx1 - padx
+                local yy = by1 - 6 * sc
+                dl:AddRectFilled(V2(xa, yy), V2(xb, yy + 2.5 * sc), pack_color(1, 1, 1, 0.10 * a), 2)
+                if frac > 0.005 then
+                    dl:AddRectFilled(V2(xa, yy), V2(xa + (xb - xa) * frac, yy + 2.5 * sc),
+                        pack_color(c[1], c[2], c[3], 0.85 * a), 2)
+                end
+            end
+
+            -- персонаж-стикер: тень + белая кайма + сам персонаж; пока «говорит» — подпрыгивает
+            if cfg.char_w > 0 and PCS_COMPANION_TEX then
+                local okc = pcall(function()
+                    local box = cfg.char_w - 6 * sc
+                    local cw, chh = PCS_companionFit(box, box)
+                    local pop = 0.75 + 0.25 * a
+                    cw, chh = cw * pop, chh * pop
+                    local bob = 0
+                    if speaking or (n.age or 0) < 0.5 then
+                        bob = -math.abs(math.sin((n.age or 0) * 11)) * 3 * sc
+                    end
+                    local cx = p.x + cfg.char_w * 0.5
+                    local bot = by1 + bob
+                    local x0, y0, x1, y1 = cx - cw / 2, bot - chh, cx + cw / 2, bot
+                    local tex = PCS_COMPANION_TEX
+                    local uv0, uv1 = V2(0, 0), V2(1, 1)
+                    dl:AddImage(tex, V2(x0 + 1.5 * sc, y0 + 3 * sc), V2(x1 + 1.5 * sc, y1 + 3 * sc),
+                        uv0, uv1, pack_color(0, 0, 0, 0.30 * a))
+                    local off = 2.2 * sc
+                    local wcol = pack_color(1, 1, 1, 0.95 * a)
+                    for i = 0, 7 do
+                        local r = i / 8 * math.pi * 2
+                        local dx, dy = math.cos(r) * off, math.sin(r) * off
+                        dl:AddImage(tex, V2(x0 + dx, y0 + dy), V2(x1 + dx, y1 + dy), uv0, uv1, wcol)
+                    end
+                    dl:AddImage(tex, V2(x0, y0), V2(x1, y1), uv0, uv1, pack_color(1, 1, 1, a))
+                end)
+                -- ошибка отрисовки картинки: НЕ трогаем общую текстуру (подмена посреди кадра —
+                -- известная причина вылета), просто рисуем тосты без персонажа 15 секунд
+                if not okc then M.charFailUntil = os.clock() + 15; PCS_TR("toast: char draw failed") end
+            end
+          end)
+          if not okBody then
+              PCS_TR("toast body error: " .. tostring(errBody))
+              if not M.errPrinted then M.errPrinted = true; print("[PC Stats][toast] " .. tostring(errBody)) end
+          end
+          if snapT then PCS_GUARD.unwind(snapT, "toast") end
+        end
+        imgui.End()
+        imgui.PopStyleColor()
+    end
+
+    local frame = imgui.OnFrame(
+        function()
+            return (T.enabled ~= false and (#M.active > 0 or #M.pending > 0)) or dirtyAt ~= nil
+        end,
+        function(self)
+            -- курсор не показываем и мышь не забираем у игры
+            self.HideCursor = true
+            imgui.ShowCursor = false
+            PCS_toastFlush(false)
+            if T.enabled == false then
+                M.active, M.pending = {}, {}
+                return
+            end
+            if (tonumber(St.UI_SCALE) or 1) ~= M.scale then build_cfg() end
+            -- при старте игры меню ещё не открывали, а текстура уже готова —
+            -- активируем её тут (только когда боевой текстуры ещё нет, чтобы не
+            -- подменять её посреди кадра — см. комментарий у loadCompanionTexture)
+            if PCS_COMPANION_TEX == nil and type(PCS_applyPendingCompanionTex) == "function" then
+                pcall(PCS_applyPendingCompanionTex)
+            end
+            if PCS_COMPANION_TEX ~= M.texSeen then
+                M.texOld, M.texOldAt, M.texSeen = M.texSeen, os.clock(), PCS_COMPANION_TEX
+            end
+            if M.texOld and os.clock() - M.texOldAt > 3 then M.texOld = nil end
+            update_all(safe_call(function() return imgui.GetIO().DeltaTime end) or 0)
+            for _, n in ipairs(M.active) do draw_toast(n) end
+        end
+    )
+    if type(frame) == "table" then pcall(function() frame.HideCursor = true end) end
+
+    -- ============================================================
+    --  ЧАСЫ РЕАЛЬНОГО ВРЕМЕНИ + НАПОМИНАНИЕ О PAYDAY
+    --  PayDay на Arizona идёт каждые 30 минут (в :00 и :30). В :25 и :55
+    --  приходит всплывающее уведомление «через 5 минут PayDay».
+    --  Время берётся с часов компьютера (os.date).
+    -- ============================================================
+    local CLK = { lastKey = nil, lastCheck = 0, w = 150, h = 48 }
+
+    local function payday_text(t)
+        local hh, mm = t.hour, 30
+        if t.min >= 30 then hh, mm = (t.hour + 1) % 24, 0 end
+        return u8("\xd7\xe5\xf0\xe5\xe7\x20\x35\x20\xec\xe8\xed\xf3\xf2\x20\x50\x61\x79\x44\x61\x79\x20\x28" .. string.format("%02d:%02d", hh, mm) .. "\x29\x21\x20\xcd\xe5\x20\xe7\xe0\xe1\xf3\xe4\xfc\xf2\xe5\x21")
+    end
+
+    local function payday_check()
+        local now = os.clock()
+        if now - CLK.lastCheck < 0.5 then return end
+        CLK.lastCheck = now
+        if T.payday_remind == false then return end
+        local t = os.date("*t")
+        if t.min ~= 25 and t.min ~= 55 then return end
+        local key = t.yday .. "-" .. t.hour .. "-" .. t.min
+        if CLK.lastKey == key then return end
+        -- только когда игрок уже в игре (не на экране подключения)
+        local okG, gs = pcall(function() return sampGetGamestate() end)
+        if okG and gs ~= nil and gs ~= 3 then return end
+        CLK.lastKey = key
+        M.lastText = nil
+        pcs_notify(payday_text(t), "payday", 12)
+    end
+
+    function pcs_payday_test()
+        local t = os.date("*t")
+        t.min = 25
+        M.lastText = nil
+        pcs_notify(payday_text(t), "payday", 8)
+    end
+
+    local clockFrame = imgui.OnFrame(
+        function()
+            pcall(payday_check)
+            return T.clock_enabled ~= false
+        end,
+        function(self)
+            self.HideCursor = true
+            local sc = tonumber(St.UI_SCALE) or 1
+            local fs = (T.clock_scale or 1.0)
+            local V2 = imgui.ImVec2
+            local io = imgui.GetIO()
+            local sw, sh = io.DisplaySize.x, io.DisplaySize.y
+            local t = os.date("*t")
+            local toNext = (30 - (t.min % 30)) * 60 - t.sec
+            local timeStr = string.format("%02d:%02d:%02d", t.hour, t.min, t.sec)
+            local pdStr = string.format("PayDay  %02d:%02d", math.floor(toNext / 60), toNext % 60)
+            local soon = toNext <= 300
+            local col = soon and { 0.98, 0.66, 0.15 } or { 0.43, 0.71, 1.0 }
+            local pulse = soon and (0.75 + 0.25 * math.sin(os.clock() * 5)) or 1
+
+            local x = (sw - CLK.w) * clamp01(T.clock_x or 0.5)
+            local y = (sh - CLK.h) * clamp01(T.clock_y or 0)
+            if (T.clock_y or 0) <= 0.001 then y = 6 * sc end
+            imgui.SetNextWindowPos(V2(x, y), imgui.Cond.Always)
+            imgui.SetNextWindowSize(V2(CLK.w, CLK.h), imgui.Cond.Always)
+            imgui.SetNextWindowBgAlpha(0)
+            imgui.PushStyleColor(imgui.Col.Border, imgui.ImVec4(0, 0, 0, 0))
+            local okBeginC = imgui.Begin("##pcs_clock", nil, TOAST_FLAGS)
+            if okBeginC then
+              local okBodyC, errBodyC = pcall(function()
+                safe_call(imgui.SetWindowFontScale, fs)
+                local dl = imgui.GetWindowDrawList()
+                local p = imgui.GetWindowPos()
+                local a1 = safe_call(imgui.CalcTextSize, timeStr) or V2(70, 14)
+                local a2 = safe_call(imgui.CalcTextSize, pdStr) or V2(90, 14)
+                local padx, pady = 12 * sc, 6 * sc
+                local w = math.max(a1.x, a2.x) + padx * 2
+                local h = pady * 2 + a1.y + a2.y + 3 * sc + 5 * sc
+                CLK.w, CLK.h = w, h
+                local bg = { T.bg_r, T.bg_g, T.bg_b, T.bg_a }
+                dl:AddRectFilled(V2(p.x + 1, p.y + 2), V2(p.x + w + 1, p.y + h + 2), pack_color(0, 0, 0, 0.25), 9 * sc)
+                dl:AddRectFilled(p, V2(p.x + w, p.y + h), pack_color(bg[1], bg[2], bg[3], bg[4]), 9 * sc)
+                safe_call(dl.AddRect, dl, p, V2(p.x + w, p.y + h), pack_color(col[1], col[2], col[3], 0.65 * pulse), 9 * sc, 0, 1.2)
+                imgui.SetCursorPos(V2((w - a1.x) / 2, pady))
+                imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1, 1, 1, 1))
+                pcall(imgui.TextUnformatted, timeStr)
+                imgui.PopStyleColor()
+                imgui.SetCursorPos(V2((w - a2.x) / 2, pady + a1.y + 2 * sc))
+                imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(col[1], col[2], col[3], pulse))
+                pcall(imgui.TextUnformatted, pdStr)
+                imgui.PopStyleColor()
+                -- полоска до следующего PayDay
+                local frac = clamp01(1 - toNext / 1800)
+                local bx0, bx1, by = p.x + padx, p.x + w - padx, p.y + h - pady - 1 * sc
+                dl:AddRectFilled(V2(bx0, by), V2(bx1, by + 2.5 * sc), pack_color(1, 1, 1, 0.12), 2)
+                if frac > 0.005 then
+                    dl:AddRectFilled(V2(bx0, by), V2(bx0 + (bx1 - bx0) * frac, by + 2.5 * sc),
+                        pack_color(col[1], col[2], col[3], 0.9), 2)
+                end
+              end)
+              if not okBodyC then PCS_TR("clock body error: " .. tostring(errBodyC)) end
+            end
+            imgui.End()
+            imgui.PopStyleColor()
+        end
+    )
+    if type(clockFrame) == "table" then pcall(function() clockFrame.HideCursor = true end) end
+end
+
+-- pcs_ver.notify пишет в чат, а хук sampAddChatMessage дублирует плашкой
 function pcs_ver.notify(text, color)
     local plain = tostring(text or "")
     local msg = (color or "{66CCFF}") .. "[PC Stats] " .. plain
@@ -4091,6 +5377,11 @@ end
 --  Š�Š˛Š�Š¢Š˛ŠÆŠ¯Š�Š•
 -- ============================================================
  St.winOpen        = false
+ -- ФИКС: отдельный от winOpen флаг "окно физически ещё рисуется" —
+ -- нужен, чтобы плавное ЗАКРЫТИЕ меню (см. imgui.OnFrame ниже) успевало
+ -- доиграть анимацию затухания вместо мгновенного исчезновения в кадре,
+ -- когда winOpen становится false
+ St._winVisible    = false
  St.activeTab      = 1
  St.waitingStats   = false
 local captureStarted = false
@@ -4343,7 +5634,7 @@ local function parseStats(raw)
         accountNumber="",authDate="",accountState="",
         x3Payday="",x4Payday="",
         name="",gender="",health="",level="",respect="",
-        cashSas="",cashVcs="",euro="",btc="",azCoins="",
+        cashSas="",cashVcs="",euro="",btc="",azCoins="",asc="",
         phone="",bank="",moneyDay="",bankCard="",
         acc={},
         job="",org="",position="",status="",citizenship="",family="",
@@ -4405,6 +5696,13 @@ local function parseStats(raw)
                     or k:lower():find("aar+p")
                     or (k:find("Arizona",1,true) and not k:find("Coin",1,true))
                     or (k:lower():find("arizona",1,true) and not k:lower():find("coin",1,true)) then p.euro=v
+                -- Arizona Coin (ASC) — раньше строка "Arizona Coin (ASC): N"
+                -- вообще нигде не перехватывалась (не было ни одной ветки
+                -- под неё), поэтому количество ASC никогда не считывалось
+                -- из статы и всегда оставалось нулевым/ручным ──
+                elseif (k:find("Arizona",1,true) and k:find("Coin",1,true))
+                    or (k:lower():find("arizona",1,true) and k:lower():find("coin",1,true))
+                    or k:find("ASC",1,true) then p.asc=v
                 elseif k=="BTC" then p.btc=v
                 elseif k:find("AZ",1,true) and k:find("oin",1,true) then p.azCoins=v
                 elseif k=="\xcd\xee\xec\xe5\xf0 \xf2\xe5\xeb\xe5\xf4\xee\xed\xe0" then p.phone=v
@@ -4456,6 +5754,17 @@ local function parseStats(raw)
     -- разбилась по "ключ: значение" в цикле выше (другой разделитель,
     -- двойное двоеточие и т.п.), ищем "AARP" прямо по сырому тексту,
     -- без привязки к формату "ключ:значение" ──
+    -- ── такой же страховочный запасной поиск для Arizona Coin (ASC),
+    -- по тому же принципу, что и у AARP чуть выше ──
+    if p.asc=="" then
+        for line in (raw.."\n"):gmatch("([^\n]*)\n") do
+            local cl = trim(stripColor(line))
+            if cl ~= "" and (cl:lower():find("arizona") and cl:lower():find("coin") or cl:find("ASC",1,true)) then
+                local num = cl:match("([%d][%d%s.,]*)%s*$") or cl:match("([%d][%d%s.,]*)")
+                if num then p.asc = trim(num); break end
+            end
+        end
+    end
     if p.euro=="" then
         for line in (raw.."\n"):gmatch("([^\n]*)\n") do
             local cl = trim(stripColor(line))
@@ -5088,6 +6397,8 @@ local SECTION_DEFS = {
       tabs = {
         { tab=4, label = ICON_GEAR.." "..u8"\xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8" },
       } },
+    { label = PCS_IC.bell.." "..u8"\xcd\xe0\xef\xee\xec\xe8\xed.", icon=PCS_IC.bell, name=u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xff", r=1.0,g=0.80,b=0.25,
+      tabs = { { tab=8, label = PCS_IC.bell.." "..u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xff" } } },
     { label = ICON_INFO.." "..u8"\xce \xf1\xea\xf0.",                   icon=ICON_INFO, name=u8"\xce\x20\xf1\xea\xf0\xe8\xef\xf2\xe5",     r=0.75,g=0.45,b=1.0,
       tabs = { { tab=5 } } },
 }
@@ -5339,6 +6650,11 @@ local _rateActive = {}
 -- прикреплено к главному окну справа и двигается вместе с ним; кнопка
 -- "Открепить" позволяет носить его отдельно ──
  St._financeSettingsOpen     = false
+ St._chartPanelOpen          = false
+ St._chartPanelTab           = 1
+ St._chartPanelAnim          = 0.0
+ St._menuOpenAnim            = 0.0
+ St._tabAnim                 = 1.0
  St._financeSettingsDetached = false
 local _financeSettingsPos      = nil   -- {x=,y=} запоминается, только пока панель откреплена
  St._mainWinPos  = nil
@@ -5459,12 +6775,25 @@ end
 -- открывает телефон и сразу переключает его на приложение "Криптовалюта"
 -- по фиксированному ID (CRYPTO_APP_ID) — без блуждания по вкладкам меню
 local function openCryptoAppDirect()
+    -- ФИКС "[Ошибка] У вас открыт мобильный телефон!": перед open закрываем
+    -- возможные зависшие диалоги, иначе сервер пишет ошибку в чат.
+    local dialogActive = false
+    pcall(function()
+        if sampIsDialogActive and sampIsDialogActive() then dialogActive = true end
+    end)
+    if dialogActive then
+        for _ = 1, 3 do
+            pcall(sampCloseCurrentDialog, -1)
+            wait(120)
+        end
+        wait(200)
+    end
     local payload = "launchedApp|" .. tostring(CRYPTO_APP_ID)
     local appPacket = {220, 18, #payload, 0}
     for i = 1, #payload do table.insert(appPacket, payload:byte(i)) end
     for _ = 1, 4 do table.insert(appPacket, 0) end
     sendPhoneBytes({220, 0, 80, 64}) -- открыть телефон
-    wait(150)
+    wait(280)
     sendPhoneBytes(appPacket) -- открыть приложение "Криптовалюта"
 end
 
@@ -5675,6 +7004,9 @@ local function parsePhoneRatesText(text)
         -- который уже гарантированно работает ──
         local buyN = tonumber(buy)
         if buyN and buyN > 0 then cfg.rateVC = buyN; St.rateVCBuf[0] = math.floor(buyN + 0.5) end
+        pcall(function() if PCS_SITE and PCS_SITE.onRatesReady then PCS_SITE.onRatesReady() end end)
+        -- снимок в историю курса для графика "Курс VC$" (см. RH выше)
+        pcall(function() if RH and RH.add then RH.add(tonumber(cfg.rateVC), tonumber(cfg.rateVCSell)) end end)
     end
 
     if gotAny then saveCfg() end
@@ -5699,6 +7031,14 @@ local function fetchRatesViaCEF()
     if _cefFetching then return end
     if not isSampAvailable() then
         St._cefLastResult = "\xf1\xe0\xec\xef \xed\xe5 \xe4\xee\xf1\xf2\xf3\xef\xe5\xed"
+        return
+    end
+    -- ФИКС "[Ошибка] У вас открыт мобильный телефон!" (спам в чат): если
+    -- сервер только что реально прислал этот ответ (детектор ниже, см.
+    -- sampev.onServerMessage), какое-то время вообще не пытаемся сами
+    -- открывать телефон — иначе почти сразу получаем ту же ошибку снова,
+    -- и так по кругу. См. St._phoneCooldownUntil.
+    if St._phoneCooldownUntil and os.time() < St._phoneCooldownUntil then
         return
     end
     -- ФИКС "крашит игру": не трогаем телефон, если он сейчас занят другой
@@ -5843,17 +7183,12 @@ end
 -- "launchedApp|N" собираются прямо здесь (без отдельных top-level локалей —
 -- в файле и так почти упёрлись в лимит Lua на 200 локальных переменных)
 local function openTaxAppDirect()
-    -- ФИКС (по жалобе "при повторной оплате меню налогов само не
-    -- появляется, приходится открывать вручную"): если с прошлого раза
-    -- на экране остался незакрытый диалог/экран телефона (даже несмотря
-    -- на закрытие в конце onTaxPaymentSuccess — клиент иногда не успевает
-    -- доиграть анимацию, особенно если следующая оплата запускается
-    -- почти сразу), пакет "открыть телефон" может прийти на нестандартный
-    -- экран, а не на домашний — и поиск иконки "Налоги"/"Банк" ничего не
-    -- находит. Явно закрываем текущий диалог ПЕРЕД открытием телефона,
-    -- чтобы каждый раз начинать с гарантированно чистого состояния.
-    pcall(sampCloseCurrentDialog, -1)
-    sendPhoneBytes({220, 0, 80, 64}) -- открыть телефон (домашний экран)
+    -- ФИКС "[Ошибка] У вас открыт мобильный телефон!": нельзя слать пакет
+    -- "открыть телефон", пока телефон/диалог ещё реально открыт — сервер
+    -- отвечает ошибкой в чат. Сначала несколько раз закрываем диалог и
+    -- даём CEF телефона время схлопнуться, и только потом открываем.
+    -- При повторной попытке (resent) — если диалог уже активен, НЕ шлём
+    -- open снова, только launchedApp (см. _taxPhoneAlreadyOpen).
     lua_thread.create(function()
         local function sendLaunchApp(appId)
             local payload = "launchedApp|" .. tostring(appId)
@@ -5862,9 +7197,28 @@ local function openTaxAppDirect()
             for _ = 1, 4 do table.insert(pkt, 0) end
             sendPhoneBytes(pkt)
         end
-        wait(150)
+        local dialogActive = false
+        pcall(function()
+            if sampIsDialogActive and sampIsDialogActive() then dialogActive = true end
+        end)
+        if dialogActive or _taxPhoneAlreadyOpen then
+            -- телефон уже на экране — не открываем повторно
+            wait(100)
+            sendLaunchApp(24)
+            wait(180)
+            sendLaunchApp(5656)
+            return
+        end
+        for _ = 1, 3 do
+            pcall(sampCloseCurrentDialog, -1)
+            wait(120)
+        end
+        wait(200)
+        sendPhoneBytes({220, 0, 80, 64}) -- открыть телефон (домашний экран)
+        _taxPhoneAlreadyOpen = true
+        wait(280)
         sendLaunchApp(24)   -- раздел
-        wait(150)
+        wait(180)
         sendLaunchApp(5656) -- приложение "Налоги"
     end)
 end
@@ -5937,16 +7291,22 @@ function TX.loadLog()
     -- поле добавлено НЕОБЯЗАТЕЛЬНЫМ — старые строки в файле (без него)
     -- по-прежнему читаются нормально, просто считаются обычной оплатой
     for i = #allLines, 1, -1 do
-        local d, t, amt, auto, noTax = allLines[i]:match(
-            "^(%d%d%d%d%-%d%d%-%d%d)|(%d%d:%d%d)|(-?%d+)|([01])|([01])$")
+        local d, t, amt, auto, noTax, kind = allLines[i]:match(
+            "^(%d%d%d%d%-%d%d%-%d%d)|(%d%d:%d%d)|(-?%d+)|([01])|([01])|(%w+)$")
+        if not d then
+            d, t, amt, auto, noTax = allLines[i]:match(
+                "^(%d%d%d%d%-%d%d%-%d%d)|(%d%d:%d%d)|(-?%d+)|([01])|([01])$")
+        end
         if not d then
             d, t, amt, auto = allLines[i]:match(
                 "^(%d%d%d%d%-%d%d%-%d%d)|(%d%d:%d%d)|(-?%d+)|([01])$")
         end
         if d then
+            local k = kind or "tax"
+            if k ~= "family" and k ~= "org" then k = "tax" end
             table.insert(St.taxEntries, {
                 date = d, time = t, amount = tonumber(amt) or 0, auto = (auto == "1"),
-                noTax = (noTax == "1"),
+                noTax = (noTax == "1"), kind = k,
             })
             if #St.taxEntries >= TX.MAX_ENTRIES_MEM then break end
         end
@@ -5977,23 +7337,150 @@ function TX.pruneOld()
             for i = #St.taxEntries, 1, -1 do
                 local e = St.taxEntries[i]
                 out:write(e.date .. "|" .. e.time .. "|" .. e.amount .. "|" ..
-                    (e.auto and "1" or "0") .. "|" .. (e.noTax and "1" or "0") .. "\n")
+                    (e.auto and "1" or "0") .. "|" .. (e.noTax and "1" or "0") .. "|" .. tostring(e.kind or "tax") .. "\n")
             end
             out:close()
         end
     end)
 end
 
+-- ============================================================
+--  ИСТОРИЯ КУРСА VC$ (для вкладки "Графики" → "Курс VC$"): хранит
+--  снимки курса покупки/продажи во времени, чтобы график мог показывать
+--  реальные скачки курса, а не только текущее значение ──
+-- ============================================================
+RH = RH or {}
+RH.LOG_FILE        = CFG_DIR .. "/rate_history.txt"
+RH.MAX_ENTRIES_MEM = 500
+RH.MAX_LINES_FILE  = 800
+St.rateHistory     = St.rateHistory or {} -- {t=epoch, buy=, sell=}, новые сверху
+St.rateHistLoaded  = false
+
+function RH.load()
+    St.rateHistory = {}
+    local allLines = readLogTail(RH.LOG_FILE, RH.MAX_LINES_FILE, 24)
+    for i = #allLines, 1, -1 do
+        local t, buy, sell = allLines[i]:match("^(%d+)|([%d%.]+)|([%d%.]+)$")
+        if t then
+            table.insert(St.rateHistory, { t = tonumber(t), buy = tonumber(buy) or 0, sell = tonumber(sell) or 0 })
+            if #St.rateHistory >= RH.MAX_ENTRIES_MEM then break end
+        end
+    end
+    St.rateHistLoaded = true
+end
+
+-- добавляет новый снимок курса, но не чаще, чем раз в 3 минуты (иначе при
+-- частых автообновлениях график был бы забит почти одинаковыми точками) —
+-- сравниваем со ВРЕМЕНЕМ последней записи, а не с её значением, чтобы
+-- реальные скачки курса не терялись
+function RH.add(buy, sell)
+    if not St.rateHistLoaded then RH.load() end
+    buy  = tonumber(buy)  or 0
+    sell = tonumber(sell) or 0
+    if buy <= 0 and sell <= 0 then return end
+    local last = St.rateHistory[1]
+    if last and (os.time() - (tonumber(last.t) or 0)) < 180 then return end
+    table.insert(St.rateHistory, 1, { t = os.time(), buy = buy, sell = sell })
+    while #St.rateHistory > RH.MAX_ENTRIES_MEM do table.remove(St.rateHistory) end
+    pcall(function()
+        ensureCfgDir()
+        local f = io.open(RH.LOG_FILE, "a")
+        if f then
+            f:write(os.time() .. "|" .. buy .. "|" .. sell .. "\n")
+            f:close()
+        end
+    end)
+end
+
+-- ============================================================
+--  ИСТОРИЯ КУРСОВ ВСЕХ ВАЛЮТ (для панели "Курс валют" с галочками
+--  выбора валют, см. PCS_drawChartPanel): по тому же принципу, что и
+--  RH выше, но одним снимком сразу пишет все 5 курсов (AZ/BTC/EUR/
+--  VC$/ASC), чтобы на графике можно было включать/выключать линии
+--  отдельных валют или смотреть их все сразу.
+-- ============================================================
+CH = CH or {}
+CH.LOG_FILE        = CFG_DIR .. "/cur_rate_history.txt"
+CH.MAX_ENTRIES_MEM = 500
+CH.MAX_LINES_FILE  = 800
+St.curHistory    = St.curHistory or {} -- {t=, az=, btc=, eur=, vc=, asc=}, новые сверху
+St.curHistLoaded = false
+
+function CH.load()
+    St.curHistory = {}
+    local allLines = readLogTail(CH.LOG_FILE, CH.MAX_LINES_FILE, 24)
+    for i = #allLines, 1, -1 do
+        local t, az, btc, eur, vc, asc = allLines[i]:match(
+            "^(%d+)|([%d%.]+)|([%d%.]+)|([%d%.]+)|([%d%.]+)|([%d%.]+)$")
+        if t then
+            table.insert(St.curHistory, {
+                t = tonumber(t), az = tonumber(az) or 0, btc = tonumber(btc) or 0,
+                eur = tonumber(eur) or 0, vc = tonumber(vc) or 0, asc = tonumber(asc) or 0,
+            })
+            if #St.curHistory >= CH.MAX_ENTRIES_MEM then break end
+        end
+    end
+    St.curHistLoaded = true
+end
+
+-- снимок раз в 3 минуты (та же логика троттлинга, что и у RH.add) —
+-- вызывается каждый кадр, пока меню открыто (см. imgui.OnFrame), сам
+-- решает, пора писать новую точку или ещё рано
+function CH.add()
+    -- пишет одну запись и в память, и в файл на диске (локальная функция
+    -- ВНУТРИ CH.add, а не отдельным именем верхнего уровня — в файле и
+    -- так почти упёрлись в предел Lua/LuaJIT в 200 локальных переменных
+    -- главного чанка; ещё один top-level `local function` ломает
+    -- компиляцию всего скрипта целиком, см. заметку в памяти проекта)
+    local function writeEntry(e)
+        table.insert(St.curHistory, 1, e)
+        while #St.curHistory > CH.MAX_ENTRIES_MEM do table.remove(St.curHistory) end
+        pcall(function()
+            ensureCfgDir()
+            local f = io.open(CH.LOG_FILE, "a")
+            if f then
+                f:write(e.t .. "|" .. e.az .. "|" .. e.btc .. "|" .. e.eur .. "|" .. e.vc .. "|" .. e.asc .. "\n")
+                f:close()
+            end
+        end)
+    end
+
+    if not St.curHistLoaded then CH.load() end
+    local az  = tonumber(cfg.rateAZ)  or 0
+    local btc = tonumber(cfg.rateBTC) or 0
+    local eur = tonumber(cfg.rateEUR) or 0
+    local vc  = tonumber(cfg.rateVC)  or 0
+    local asc = tonumber(cfg.rateASC) or 0
+    if az <= 0 and btc <= 0 and eur <= 0 and vc <= 0 and asc <= 0 then return end
+    local last = St.curHistory[1]
+    if last and (os.time() - (tonumber(last.t) or 0)) < 180 then return end
+    -- ФИКС (по просьбе, "график не работает"): графику нужно минимум 2
+    -- точки, чтобы вообще нарисовать линию — а троттлинг в 3 минуты
+    -- означает, что вторая точка появилась бы только через 3 минуты
+    -- после первого запуска скрипта, и всё это время панель выглядела
+    -- бы пустой/сломанной. Поэтому при самой первой записи в истории
+    -- сразу пишем ДВЕ точки (текущую и "3 минуты назад" с тем же
+    -- значением) — график появляется сразу же, ровной линией, и дальше
+    -- уже наполняется реальными изменениями курса.
+    if #St.curHistory == 0 then
+        writeEntry({ t = os.time() - 180, az = az, btc = btc, eur = eur, vc = vc, asc = asc })
+    end
+    writeEntry({ t = os.time(), az = az, btc = btc, eur = eur, vc = vc, asc = asc })
+end
+
 -- добавляет одну запись об оплате налогов (или отметку "налогов не было",
 -- если isNoTax=true) в память и дописывает в файл на диске
-function TX.addEntry(isAuto, amount, isNoTax)
+function TX.addEntry(isAuto, amount, isNoTax, kind)
     if not St.taxLogLoaded then TX.loadLog() end
     amount = math.floor((amount or 0) + 0.5)
+    -- kind: "tax" (личные налоги), "family" (семейная квартира), "org" (организация)
+    kind = tostring(kind or "tax")
+    if kind ~= "family" and kind ~= "org" then kind = "tax" end
     local d = os.date("%Y-%m-%d")
     local t = os.date("%H:%M")
     table.insert(St.taxEntries, 1, {
         date = d, time = t, amount = amount, auto = isAuto and true or false,
-        noTax = isNoTax and true or false,
+        noTax = isNoTax and true or false, kind = kind,
     })
     while #St.taxEntries > TX.MAX_ENTRIES_MEM do table.remove(St.taxEntries) end
     pcall(function()
@@ -6001,7 +7488,7 @@ function TX.addEntry(isAuto, amount, isNoTax)
         local f = io.open(TX.LOG_FILE, "a")
         if f then
             f:write(d .. "|" .. t .. "|" .. amount .. "|" .. (isAuto and "1" or "0") ..
-                "|" .. (isNoTax and "1" or "0") .. "\n")
+                "|" .. (isNoTax and "1" or "0") .. "|" .. kind .. "\n")
             f:close()
         end
     end)
@@ -6058,7 +7545,7 @@ function TX.fixLastAmount(amount)
             for i = #St.taxEntries, 1, -1 do
                 local x = St.taxEntries[i]
                 out:write(x.date .. "|" .. x.time .. "|" .. x.amount .. "|" ..
-                    (x.auto and "1" or "0") .. "|" .. (x.noTax and "1" or "0") .. "\n")
+                    (x.auto and "1" or "0") .. "|" .. (x.noTax and "1" or "0") .. "|" .. tostring(x.kind or "tax") .. "\n")
             end
             out:close()
         end
@@ -6080,8 +7567,10 @@ local function closePhoneFully(maxAttempts, delayMs)
     end
     lua_thread.create(function()
         local ok, err = pcall(function()
+            PCS_TR("tax: closePhoneFully begin")
             wait(math.max(200, delayMs))
             for i = 1, maxAttempts do
+                PCS_TR("tax: closePhone attempt " .. i)
                 local active = false
                 pcall(function()
                     if sampIsDialogActive and sampIsDialogActive() then active = true end
@@ -6103,6 +7592,7 @@ local function closePhoneFully(maxAttempts, delayMs)
             end)
         end)
         if not ok then print("[PC Stats] closePhoneFully: " .. tostring(err)) end
+        PCS_TR("tax: closePhoneFully end ok=" .. tostring(ok))
         _phoneOpBusy = false
     end)
 end
@@ -6113,6 +7603,7 @@ local function onTaxPaymentSuccess(isAuto, amount)
     -- подтверждения, и таймаутом ожидания этого диалога)
     if _taxFinalizeDone then return end
     _taxFinalizeDone = true
+    PCS_TR("tax: onTaxPaymentSuccess begin amount=" .. tostring(amount))
     -- сумма: то, что передали; если 0 — то, что успело прийти из чата
     -- ("Вы оплатили все налоги на сумму: ...") пока шла оплата
     if not (amount and amount > 0) then
@@ -6153,6 +7644,7 @@ local function onTaxPaymentSuccess(isAuto, amount)
     end)
     _taxState = 0
     _taxExpectedDialogId = nil
+    _taxPhoneAlreadyOpen = false
     TX.addEntry(isAuto, (amount and amount > 0) and amount or 0)
     -- ФИКС "крашит игру, если сразу после оплаты налогов делать что-то с
     -- криптой": раньше _phoneOpBusy сбрасывался в false СРАЗУ здесь, а
@@ -6169,6 +7661,7 @@ local function onTaxPaymentSuccess(isAuto, amount)
     -- экране поверх интерфейса игрока — тот же приём, что и в фетче
     -- курса валют выше (sampCloseCurrentDialog(-1) с небольшой паузой,
     -- т.к. игра может ещё показывать экран-подтверждение оплаты) ──
+    PCS_TR("tax: onTaxPaymentSuccess end")
     closePhoneFully(3, (cfg and cfg.phoneCloseDelayMs) or 300)
 end
 
@@ -6188,6 +7681,17 @@ local function payTaxesNow(isAuto)
         and (os.time() - cfg.taxLastPayTime) < TAX_MIN_REPAY_SEC then
         -- налоги уже точно оплачивались меньше часа назад — тихо
         -- пропускаем, не открывая телефон и не трогая _taxState
+        return
+    end
+    -- ФИКС "[Ошибка] У вас открыт мобильный телефон!" (спам в чат): см.
+    -- тот же guard и подробный комментарий в fetchRatesViaCEF выше —
+    -- после реальной ошибки сервера ненадолго перестаём сами трогать
+    -- телефон, чтобы не зациклиться на той же ошибке.
+    if St._phoneCooldownUntil and os.time() < St._phoneCooldownUntil then
+        if not isAuto then
+            pcall(sampAddChatMessage, "{FF6666}[PC Stats] " ..
+                "\xf2\xe5\xeb\xe5\xf4\xee\xed\x20\xe5\xf9\xb8\x20\xe7\xe0\xed\xff\xf2\x2c\x20\xef\xee\xe4\xee\xe6\xe4\xe8\x20\xef\xe0\xf0\xf3\x20\xf1\xe5\xea\xf3\xed\xe4", -1)
+        end
         return
     end
     if _taxState ~= 0 then
@@ -6223,11 +7727,13 @@ local function payTaxesNow(isAuto)
         return
     end
     _taxIsAuto = isAuto
+    _taxPhoneAlreadyOpen = false
     _phoneOpBusy = true
     St._phoneOpBusySince = os.time()
     _taxState  = 1
     _taxNavAttempts = 0
     _taxFinalizeDone = false
+    PCS_TR("tax: payTaxesNow start auto=" .. tostring(isAuto))
     _taxPendingAmount = 0
     local okOpen = pcall(openTaxAppDirect)
     if not okOpen then
@@ -6253,12 +7759,14 @@ local function payTaxesNow(isAuto)
             -- раз, не дожидаясь полного провала ──
             if not resent and _taxState == 1 and waited >= math.floor(TAX_TIMEOUT_SEC * 1000 / 2) then
                 resent = true
+                _taxPhoneAlreadyOpen = true
                 pcall(openTaxAppDirect)
             end
         end
         if _taxState ~= 0 then
             _taxState = 0
             _taxExpectedDialogId = nil
+            _taxPhoneAlreadyOpen = false
             pcall(sampAddChatMessage, "{FF6666}[PC Stats] " ..
                 "\xed\xe0\xeb\xee\xe3\xee\xe2\xfb\xe9\x20\xec\xe5\xed\xfe\x20\xed\xe5\x20\xee\xf2\xea\xf0\xfb\xeb\xf1\xff\x20\xe2\xee\xe2\xf0\xe5\xec\xff", -1)
             pcall(pcs_notify, u8"\xed\xe0\xeb\xee\xe3\xee\xe2\xfb\xe9\x20\xec\xe5\xed\xfe\x20\xed\xe5\x20\xee\xf2\xea\xf0\xfb\xeb\xf1\xff\x20\xe2\xee\xe2\xf0\xe5\xec\xff", "error")
@@ -6624,6 +8132,9 @@ function PD.onLine(clean)
     -- формулировку сильнее, чем покрывают текущие альтернативы. Один раз
     -- в минуту показываем точный текст строки — чтобы можно было прислать
     -- его и уточнить нужные фразы, вместо гадания.
+    -- строки-разделители («=====», «-----») и пустые строки не содержат ни букв,
+    -- ни цифр — это не поля чека, отладочное сообщение по ним не нужно
+    if not clean:find("[%w\192-\255]") then return false end
     if not St._paydaySawSalary and not St._paydaySawDeposit then
         pdDebugUnmatched(clean)
     end
@@ -6768,6 +8279,7 @@ function applyWikiRatesForServer(serverName, silent)
         return false
     end
     if r.vc  then cfg.rateVC  = r.vc;  St.rateVCBuf[0]  = math.floor(r.vc  + 0.5) end
+    pcall(function() if PCS_SITE and PCS_SITE.onRatesReady then PCS_SITE.onRatesReady() end end)
     if r.btc then cfg.rateBTC = r.btc; St.rateBTCBuf[0] = math.floor(r.btc + 0.5) end
     if r.az  then cfg.rateAZ  = r.az;  St.rateAZBuf[0]  = math.floor(r.az  + 0.5) end
     if r.eur then cfg.rateEUR = r.eur; St.rateEURBuf[0] = math.floor(r.eur + 0.5) end
@@ -6985,6 +8497,859 @@ function Cal.draw(state, markedDates, onPickDate)
     if _spacingPushed then pcall(imgui.PopStyleVar) end
 end
 
+-- ── настройки всплывающих уведомлений (плашек): перенесены из Market Helper
+-- (вкладка "Вид" -> "Уведомления (плашки)"). Вызывается из drawSettingsInner ──
+function PCS_drawToastSettings()
+    local T, DEF = PCS_TOAST, PCS_TOAST_DEF
+    if type(T) ~= "table" then return end
+    local U = PCS_TOAST_UI
+    if not U then U = {}; PCS_TOAST_UI = U end
+    local function changed()
+        if PCS_toastSave then PCS_toastSave() end
+        if pcs_apply_toast_settings then pcs_apply_toast_settings() end
+    end
+
+    if drawToggleSwitch("##toastEnabledSw", T.enabled ~= false) then
+        T.enabled = not (T.enabled ~= false)
+        changed()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xcf\xee\xea\xe0\xe7\xfb\xe2\xe0\xf2\xfc \xe2\xf1\xef\xeb\xfb\xe2\xe0\xfe\xf9\xe8\xe5 \xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xff")
+    imgui.TextColored(thDim(), "  " .. u8"\xc4\xf3\xe1\xeb\xe8\xf0\xf3\xfe\xf2 \xe2\xf1\xe5 \xf1\xee\xee\xe1\xf9\xe5\xed\xe8\xff \xf1\xea\xf0\xe8\xef\xf2\xe0 \xe8\xe7 \xf7\xe0\xf2\xe0")
+    imgui.Spacing()
+
+    -- расположение на экране
+    imgui.TextColored(iv4(0.70, 0.82, 1.0, 1.0), u8"\xd0\xe0\xf1\xef\xee\xeb\xee\xe6\xe5\xed\xe8\xe5 \xed\xe0 \xfd\xea\xf0\xe0\xed\xe5:")
+    do
+        local r, g, b = getAcc()
+        local gap = S(4)
+        local bw = math.floor((imgui.GetContentRegionAvail().x - gap * 3) / 4)
+        local function posBtn(label, cur, apply)
+            local col = cur and { r, g, b } or { 0.45, 0.47, 0.55 }
+            if PCS_gdButton(label, bw, S(26), col, 6.0) then apply(); changed() end
+        end
+        posBtn(u8"\xd1\xeb\xe5\xe2\xe0##toastL", T.pos_h == "left", function() T.pos_h = "left" end)
+        imgui.SameLine(0, gap)
+        posBtn(u8"\xd1\xef\xf0\xe0\xe2\xe0##toastR", T.pos_h ~= "left", function() T.pos_h = "right" end)
+        imgui.SameLine(0, gap)
+        posBtn(u8"\xd1\xe2\xe5\xf0\xf5\xf3##toastT", T.pos_v == "top", function() T.pos_v = "top" end)
+        imgui.SameLine(0, gap)
+        posBtn(u8"\xd1\xed\xe8\xe7\xf3##toastB", T.pos_v ~= "top", function() T.pos_v = "bottom" end)
+    end
+    imgui.Spacing()
+
+    if PCS_gdSliderStyle then PCS_gdSliderStyle(true) end
+    local function slider(key, label, mn, mx, fmt, isInt)
+        local buf = U[key]
+        if not buf then buf = imgui.new.float(T[key] or DEF[key]); U[key] = buf end
+        buf[0] = T[key] or DEF[key]
+        imgui.TextColored(iv4(0.70, 0.82, 1.0, 1.0), label)
+        imgui.PushItemWidth(-1)
+        if imgui.SliderFloat("##toastsl_" .. key, buf, mn, mx, fmt) then
+            T[key] = isInt and math.floor(buf[0] + 0.5) or buf[0]
+            changed()
+        end
+        imgui.PopItemWidth()
+    end
+    slider("width",         u8"\xd8\xe8\xf0\xe8\xed\xe0 \xef\xeb\xe0\xf8\xea\xe8",            200, 520, "%.0f px", false)
+    slider("corner_radius", u8"\xd1\xea\xf0\xf3\xe3\xeb\xe5\xed\xe8\xe5 \xf3\xe3\xeb\xee\xe2",         0,   24,  "%.0f px", false)
+    slider("accent_width",  u8"\xd8\xe8\xf0\xe8\xed\xe0 \xf6\xe2\xe5\xf2\xed\xee\xe9 \xef\xee\xeb\xee\xf1\xfb",    0,   12,  "%.0f px", false)
+    slider("padding_x",     u8"\xce\xf2\xf1\xf2\xf3\xef \xef\xee \xe3\xee\xf0\xe8\xe7\xee\xed\xf2\xe0\xeb\xe8",    4,   40,  "%.0f px", false)
+    slider("padding_y",     u8"\xce\xf2\xf1\xf2\xf3\xef \xef\xee \xe2\xe5\xf0\xf2\xe8\xea\xe0\xeb\xe8",      4,   30,  "%.0f px", false)
+    slider("spacing",       u8"\xd0\xe0\xf1\xf1\xf2\xee\xff\xed\xe8\xe5 \xec\xe5\xe6\xe4\xf3 \xef\xeb\xe0\xf8\xea\xe0\xec\xe8", 0,  30,  "%.0f px", false)
+    slider("margin_x",      u8"\xce\xf2\xf1\xf2\xf3\xef \xee\xf2 \xea\xf0\xe0\xff (X)",       0,   200, "%.0f px", false)
+    slider("margin_y",      u8"\xce\xf2\xf1\xf2\xf3\xef \xee\xf2 \xea\xf0\xe0\xff (Y)",       0,   200, "%.0f px", false)
+    slider("duration",      u8"\xc2\xf0\xe5\xec\xff \xef\xee\xea\xe0\xe7\xe0",             1,   20,  "%.1f \xf1\xe5\xea", false)
+    slider("anim_speed",    u8"\xd1\xea\xee\xf0\xee\xf1\xf2\xfc \xe0\xed\xe8\xec\xe0\xf6\xe8\xe8",        2,   30,  "%.1f", false)
+    slider("max_visible",   u8"\xcf\xeb\xe0\xf8\xe5\xea \xee\xe4\xed\xee\xe2\xf0\xe5\xec\xe5\xed\xed\xee",      1,   10,  "%.0f", true)
+    slider("font_scale",    u8"\xd0\xe0\xe7\xec\xe5\xf0 \xf2\xe5\xea\xf1\xf2\xe0",            0.6, 2.0, "%.2f", false)
+    slider("bg_a",          u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc \xf4\xee\xed\xe0",        0.1, 1.0, "%.2f", false)
+    if PCS_gdSliderStyle then PCS_gdSliderStyle(false) end
+    imgui.Spacing()
+
+    -- цвета фона и текста
+    local function color3(key, label, kr, kg, kb)
+        local buf = U[key]
+        if not buf then buf = imgui.new("float[3]", { T[kr], T[kg], T[kb] }); U[key] = buf end
+        buf[0], buf[1], buf[2] = T[kr], T[kg], T[kb]
+        imgui.TextColored(iv4(0.70, 0.82, 1.0, 1.0), label)
+        imgui.PushItemWidth(-1)
+        if imgui.ColorEdit3("##toastcol_" .. key, buf) then
+            T[kr], T[kg], T[kb] = buf[0], buf[1], buf[2]
+            changed()
+        end
+        imgui.PopItemWidth()
+    end
+    color3("bgc",   u8"\xd6\xe2\xe5\xf2 \xf4\xee\xed\xe0",  "bg_r",   "bg_g",   "bg_b")
+    color3("textc", u8"\xd6\xe2\xe5\xf2 \xf2\xe5\xea\xf1\xf2\xe0", "text_r", "text_g", "text_b")
+    imgui.Spacing()
+
+    -- рамка плашки
+    -- персонаж-стикер в плашках
+    if drawToggleSwitch("##toastCharSw", T.char_enabled ~= false) then
+        T.char_enabled = not (T.char_enabled ~= false)
+        changed()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xcf\xe5\xf0\xf1\xee\xed\xe0\xe6\x2d\xf1\xf2\xe8\xea\xe5\xf0\x20\xab\xe3\xee\xe2\xee\xf0\xe8\xf2\xbb\x20\xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xe5")
+    if T.char_enabled ~= false then
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(true) end
+        slider("char_size", u8"\xd0\xe0\xe7\xec\xe5\xf0\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0", 40, 140, "%.0f px", false)
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(false) end
+    end
+    if drawToggleSwitch("##toastTypeSw", T.typewriter ~= false) then
+        T.typewriter = not (T.typewriter ~= false)
+        changed()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xd2\xe5\xea\xf1\xf2\x20\xab\xef\xe5\xf7\xe0\xf2\xe0\xe5\xf2\xf1\xff\xbb\x20\xea\xe0\xea\x20\xf0\xe5\xf7\xfc")
+    if T.typewriter ~= false then
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(true) end
+        slider("typewriter_speed", u8"\xd1\xea\xee\xf0\xee\xf1\xf2\xfc\x20\xef\xe5\xf7\xe0\xf2\xe8\x20\x28\xf1\xe8\xec\xe2\x2f\xf1\xe5\xea\x29", 15, 200, "%.0f", false)
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(false) end
+    end
+    if drawToggleSwitch("##toastProgSw", T.show_progress ~= false) then
+        T.show_progress = not (T.show_progress ~= false)
+        changed()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xcf\xee\xeb\xee\xf1\xea\xe0\x20\xee\xf1\xf2\xe0\xe2\xf8\xe5\xe3\xee\xf1\xff\x20\xe2\xf0\xe5\xec\xe5\xed\xe8")
+    imgui.Spacing()
+
+    -- часы и напоминание о PayDay
+    if drawToggleSwitch("##toastClockSw", T.clock_enabled ~= false) then
+        T.clock_enabled = not (T.clock_enabled ~= false)
+        changed()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xd7\xe0\xf1\xfb\x20\xf0\xe5\xe0\xeb\xfc\xed\xee\xe3\xee\x20\xe2\xf0\xe5\xec\xe5\xed\xe8\x20\xed\xe0\x20\xfd\xea\xf0\xe0\xed\xe5")
+    if T.clock_enabled ~= false then
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(true) end
+        slider("clock_x", u8"\xd7\xe0\xf1\xfb\x3a\x20\xef\xee\xeb\xee\xe6\xe5\xed\xe8\xe5\x20\xef\xee\x20\xe3\xee\xf0\xe8\xe7\xee\xed\xf2\xe0\xeb\xe8", 0, 1, "%.2f", false)
+        slider("clock_y", u8"\xd7\xe0\xf1\xfb\x3a\x20\xef\xee\xeb\xee\xe6\xe5\xed\xe8\xe5\x20\xef\xee\x20\xe2\xe5\xf0\xf2\xe8\xea\xe0\xeb\xe8", 0, 1, "%.2f", false)
+        slider("clock_scale", u8"\xd7\xe0\xf1\xfb\x3a\x20\xf0\xe0\xe7\xec\xe5\xf0", 0.6, 2.0, "%.2f", false)
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(false) end
+    end
+    if drawToggleSwitch("##toastPdRemSw", T.payday_remind ~= false) then
+        T.payday_remind = not (T.payday_remind ~= false)
+        changed()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xf2\xfc\x20\xee\x20\x50\x61\x79\x44\x61\x79\x20\xe7\xe0\x20\x35\x20\xec\xe8\xed\xf3\xf2\x20\x28\xe2\x20\x3a\x32\x35\x20\xe8\x20\x3a\x35\x35\x29")
+    if PCS_gdButton(u8"\xcf\xf0\xee\xe2\xe5\xf0\xe8\xf2\xfc\x20\xed\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5".."##toastPdTest", imgui.GetContentRegionAvail().x, S(26), { 0.98, 0.80, 0.25 }, 6.0) then
+        pcs_payday_test()
+    end
+    imgui.Spacing()
+
+    if drawToggleSwitch("##toastBorderSw", T.border_enabled == true) then
+        T.border_enabled = not (T.border_enabled == true)
+        changed()
+    end
+    imgui.SameLine(0, S(8))
+    imgui.TextColored(iv4(1, 1, 1, 1), u8"\xd0\xe0\xec\xea\xe0 \xef\xee \xea\xf0\xe0\xfe \xef\xeb\xe0\xf8\xea\xe8")
+    if T.border_enabled then
+        color3("borderc", u8"\xd6\xe2\xe5\xf2 \xf0\xe0\xec\xea\xe8", "border_r", "border_g", "border_b")
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(true) end
+        slider("border_a",    u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc \xf0\xe0\xec\xea\xe8", 0.05, 1.0, "%.2f", false)
+        slider("border_size", u8"\xd2\xee\xeb\xf9\xe8\xed\xe0 \xf0\xe0\xec\xea\xe8",      0.5,  4.0, "%.1f", false)
+        if PCS_gdSliderStyle then PCS_gdSliderStyle(false) end
+    end
+    imgui.Spacing()
+
+    -- тест плашек
+    imgui.TextColored(iv4(0.70, 0.82, 1.0, 1.0), u8"\xd2\xe5\xf1\xf2 \xef\xeb\xe0\xf8\xe5\xea:")
+    do
+        local gap = S(4)
+        local bw = math.floor((imgui.GetContentRegionAvail().x - gap * 4) / 5)
+        if PCS_gdButton(u8"\xc8\xed\xf4\xee##toastTi",   bw, S(26), { 0.25, 0.55, 0.95 }, 6.0) then pcs_toast_test("info") end
+        imgui.SameLine(0, gap)
+        if PCS_gdButton(u8"\xd3\xf1\xef\xe5\xf5##toastTs",  bw, S(26), { 0.22, 0.78, 0.40 }, 6.0) then pcs_toast_test("success") end
+        imgui.SameLine(0, gap)
+        if PCS_gdButton(u8"\xc2\xed\xe8\xec\xe0\xed\xe8\xe5##toastTw", bw, S(26), { 0.95, 0.66, 0.15 }, 6.0) then pcs_toast_test("warning") end
+        imgui.SameLine(0, gap)
+        if PCS_gdButton(u8"\xce\xf8\xe8\xe1\xea\xe0##toastTe", bw, S(26), { 0.92, 0.26, 0.26 }, 6.0) then pcs_toast_test("error") end
+        imgui.SameLine(0, gap)
+        if PCS_gdButton("PayDay##toastTp",   bw, S(26), { 0.98, 0.80, 0.25 }, 6.0) then pcs_toast_test("payday") end
+    end
+    imgui.Spacing()
+    if PCS_gdButton(u8"\xcf\xee\xea\xe0\xe7\xe0\xf2\xfc \xe2\xf1\xe5 \xf2\xe8\xef\xfb \xf1\xf0\xe0\xe7\xf3##toastTall", imgui.GetContentRegionAvail().x, S(26), { 0.43, 0.71, 1.0 }, 6.0) then
+        pcs_toast_test("all")
+    end
+    imgui.Spacing()
+    if PCS_gdButton(u8"\xd1\xe1\xf0\xee\xf1\xe8\xf2\xfc \xf1\xf2\xe8\xeb\xfc \xef\xeb\xe0\xf8\xe5\xea \xef\xee \xf3\xec\xee\xeb\xf7\xe0\xed\xe8\xfe##toastReset", imgui.GetContentRegionAvail().x, S(26), { 0.85, 0.25, 0.25 }, 6.0) then
+        for k, v in pairs(DEF) do T[k] = v end
+        PCS_TOAST_UI = nil
+        changed()
+    end
+end
+
+-- ── красивая кнопка-карточка для верхнего ряда вкладки "Финансы":
+-- скруглённая карточка со свечением, круглый значок с иконкой, заголовок
+-- и подпись; опционально — "стикер" (наклонная наклейка с иконкой) в углу ──
+
+-- ============================================================
+--  АНИМИРОВАННЫЕ СТИКЕРЫ ДЛЯ КНОПОК (рисуются векторно, как стикер-калькулятор)
+-- ============================================================
+function PCS_stickerAnim(hov, phase)
+    phase = tonumber(phase) or 0
+    if cfg and cfg.animAllOff == true then
+        return hov and -0.10 or -0.20, 0, 1.0
+    end
+    local t = os.clock()
+    if hov then
+        return -0.10 + math.sin(t * 9 + phase) * 0.16,
+               -math.abs(math.sin(t * 7 + phase)) * 2.5, 1.10
+    end
+    return -0.20 + math.sin(t * 1.6 + phase) * 0.05, math.sin(t * 2.1 + phase) * 0.8, 1.0
+end
+
+PCS_STICKER_COL = {
+    chart  = { 0.20, 0.62, 0.95 }, bell = { 1.00, 0.72, 0.16 }, shield = { 0.20, 0.72, 0.42 },
+    gear   = { 0.52, 0.56, 0.72 }, plus = { 0.30, 0.78, 0.45 },
+}
+
+function PCS_drawSticker(dl, kind, cx0, cy0, hs, ang)
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local ca, sa = math.cos(ang), math.sin(ang)
+    local u = hs / 13
+    local function R(lx, ly) return V2(cx0 + lx * u * ca - ly * u * sa, cy0 + lx * u * sa + ly * u * ca) end
+    local function quad(x0, y0, x1, y1, col) dl:AddQuadFilled(R(x0, y0), R(x1, y0), R(x1, y1), R(x0, y1), col) end
+    local function rquad(x0, y0, x1, y1, rr, col)
+        quad(x0 + rr, y0, x1 - rr, y1, col); quad(x0, y0 + rr, x1, y1 - rr, col)
+        dl:AddCircleFilled(R(x0 + rr, y0 + rr), rr * u, col, 10); dl:AddCircleFilled(R(x1 - rr, y0 + rr), rr * u, col, 10)
+        dl:AddCircleFilled(R(x0 + rr, y1 - rr), rr * u, col, 10); dl:AddCircleFilled(R(x1 - rr, y1 - rr), rr * u, col, 10)
+    end
+    local c = PCS_STICKER_COL[kind] or PCS_STICKER_COL.gear
+    local body  = U32(iv4(c[1], c[2], c[3], 1.0))
+    local white = U32(iv4(1, 1, 1, 0.97))
+    local th = math.max(1.3, u * 1.5)
+    -- тень, белая кайма, тело
+    local sx, sy = cx0, cy0
+    cx0, cy0 = sx + 1.6 * u, sy + 2.2 * u
+    rquad(-15, -15, 15, 15, 5, U32(iv4(0, 0, 0, 0.35)))
+    cx0, cy0 = sx, sy
+    rquad(-15, -15, 15, 15, 5, white)
+    rquad(-13, -13, 13, 13, 4, body)
+    quad(-10, -12, 10, -10.5, U32(iv4(1, 1, 1, 0.22)))
+    if kind == "chart" then
+        quad(-8, 3, -4, 9, white); quad(-2, -1, 2, 9, white); quad(4, -6, 8, 9, white)
+        dl:AddLine(R(-9, -3), R(-3, -7), white, th); dl:AddLine(R(-3, -7), R(2, -4), white, th)
+        dl:AddLine(R(2, -4), R(8, -10), white, th)
+    elseif kind == "bell" then
+        dl:AddCircleFilled(R(0, -3), 6 * u, white, 16)
+        dl:AddQuadFilled(R(-6, -3), R(6, -3), R(8, 5), R(-8, 5), white)
+        quad(-9, 5, 9, 7.5, white)
+        dl:AddCircleFilled(R(0, 10), 2.2 * u, white, 10)
+        dl:AddCircleFilled(R(0, -9.5), 1.6 * u, white, 8)
+    elseif kind == "shield" then
+        dl:AddQuadFilled(R(-7, -8), R(7, -8), R(7, 0), R(-7, 0), white)
+        dl:AddTriangleFilled(R(-7, 0), R(7, 0), R(0, 9), white)
+        dl:AddLine(R(-3, -1), R(-1, 2), body, th); dl:AddLine(R(-1, 2), R(4, -4), body, th)
+    elseif kind == "gear" then
+        for i = 0, 7 do
+            local a = i * math.pi / 4
+            dl:AddCircleFilled(R(math.cos(a) * 8, math.sin(a) * 8), 2.2 * u, white, 8)
+        end
+        dl:AddCircleFilled(R(0, 0), 6.5 * u, white, 20)
+        dl:AddCircleFilled(R(0, 0), 2.6 * u, body, 12)
+    elseif kind == "plus" then
+        quad(-2, -8, 2, 8, white); quad(-8, -2, 8, 2, white)
+    end
+end
+
+-- стикер поверх только что нарисованной обычной кнопки (справа), с анимацией
+function PCS_stickerOnLastItem(kind, phase)
+    local ok = pcall(function()
+        local dl = imgui.GetWindowDrawList()
+        local mn, mx = imgui.GetItemRectMin(), imgui.GetItemRectMax()
+        local hov = imgui.IsItemHovered()
+        local h = mx.y - mn.y
+        local hs = h * 0.30
+        local ang, dy, sc = PCS_stickerAnim(hov, phase)
+        PCS_drawSticker(dl, kind, mx.x - hs * 1.7, mn.y + h * 0.5 + dy, hs * sc, ang)
+    end)
+end
+
+-- ============================================================
+--  НАПОМИНАНИЯ (вкладка 8)
+-- ============================================================
+PCS_REM = PCS_REM or {}
+PCS_REM.list, PCS_REM.nextId, PCS_REM.loaded = PCS_REM.list or {}, PCS_REM.nextId or 1, PCS_REM.loaded or false
+PCS_REM.ui = PCS_REM.ui or { day = 0, rep = 1, showDone = false, msg = nil }
+PCS_REM.REP = {
+    { "\xce\xe4\xe8\xed \xf0\xe0\xe7", 0 }, { "\xca\xe0\xe6\xe4\xfb\xe9 \xf7\xe0\xf1", 3600 }, { "\xca\xe0\xe6\xe4\xfb\xe9 \xe4\xe5\xed\xfc", 86400 },
+    { "\xca\xe0\xe6\xe4\xf3\xfe \xed\xe5\xe4\xe5\xeb\xfe", 604800 }, { "\xd1\xe2\xee\xe9 \xe8\xed\xf2\xe5\xf0\xe2\xe0\xeb", -1 },
+}
+
+function PCS_REM.path() return CFG_DIR .. "/reminders.dat" end
+
+function PCS_REM.save()
+    local ok, err = pcall(function()
+        if type(createDirectory) == "function" then
+            pcall(createDirectory, "moonloader/config"); pcall(createDirectory, CFG_DIR)
+        end
+        local parts = {}
+        for _, r in ipairs(PCS_REM.list) do
+            parts[#parts + 1] = string.format("%d\t%d\t%d\t%d\t%d\t%s\n", r.id, r.at, r.rep or 0,
+                r.done and 1 or 0, r.doneAt or 0, (tostring(r.text):gsub("[\t\r\n]", " ")))
+        end
+        local f = io.open(PCS_REM.path(), "wb")
+        if not f then error("cannot open file") end
+        f:write(table.concat(parts)); f:close()
+    end)
+    if not ok then print("[PC Stats][remind] save fail: " .. tostring(err)) end
+end
+
+function PCS_REM.load()
+    if PCS_REM.loaded then return end
+    PCS_REM.loaded = true
+    PCS_REM.list = {}
+    local f = io.open(PCS_REM.path(), "rb")
+    if not f then return end
+    local body = f:read("*a") or ""
+    f:close()
+    for line in body:gmatch("[^\r\n]+") do
+        local id, at, rep, done, doneAt, text = line:match("^(%d+)\t(%d+)\t(%d+)\t(%d)\t(%d+)\t(.*)$")
+        if id then
+            id = tonumber(id)
+            PCS_REM.list[#PCS_REM.list + 1] = { id = id, at = tonumber(at), rep = tonumber(rep),
+                done = (done == "1"), doneAt = tonumber(doneAt), text = text }
+            if id >= PCS_REM.nextId then PCS_REM.nextId = id + 1 end
+        end
+    end
+end
+
+function PCS_REM.add(text, at, rep)
+    PCS_REM.load()
+    text = (tostring(text or ""):gsub("[\t\r\n]", " "))
+    text = text:match("^%s*(.-)%s*$") or ""
+    if text == "" then return nil end
+    if #text > 200 then text = text:sub(1, 200) end
+    local r = { id = PCS_REM.nextId, text = text, at = at, rep = rep or 0, done = false, doneAt = 0 }
+    PCS_REM.nextId = PCS_REM.nextId + 1
+    PCS_REM.list[#PCS_REM.list + 1] = r
+    PCS_REM.save()
+    return r
+end
+
+function PCS_REM.del(id)
+    for i, r in ipairs(PCS_REM.list) do
+        if r.id == id then table.remove(PCS_REM.list, i); break end
+    end
+    PCS_REM.save()
+end
+
+function PCS_REM.clearDone()
+    for i = #PCS_REM.list, 1, -1 do
+        if PCS_REM.list[i].done then table.remove(PCS_REM.list, i) end
+    end
+    PCS_REM.save()
+end
+
+function PCS_REM.fmtTime(t) return os.date("%d.%m %H:%M", t) end
+
+function PCS_REM.fmtLeft(sec)
+    if sec < 60 then return u8"\xec\xe5\xed\xfc\xf8\xe5 \xec\xe8\xed\xf3\xf2\xfb" end
+    local d, h, m = math.floor(sec / 86400), math.floor(sec % 86400 / 3600), math.floor(sec % 3600 / 60)
+    local p = {}
+    if d > 0 then p[#p + 1] = d .. u8" \xe4" end
+    if h > 0 then p[#p + 1] = h .. u8" \xf7" end
+    if m > 0 then p[#p + 1] = m .. u8" \xec\xe8\xed" end
+    return table.concat(p, " ")
+end
+
+function PCS_REM.repLabel(sec)
+    sec = sec or 0
+    if sec <= 0 then return u8"\xee\xe4\xe8\xed \xf0\xe0\xe7" end
+    if sec == 3600 then return u8"\xea\xe0\xe6\xe4\xfb\xe9 \xf7\xe0\xf1" end
+    if sec == 86400 then return u8"\xea\xe0\xe6\xe4\xfb\xe9 \xe4\xe5\xed\xfc" end
+    if sec == 604800 then return u8"\xea\xe0\xe6\xe4\xf3\xfe \xed\xe5\xe4\xe5\xeb\xfe" end
+    return u8"\xea\xe0\xe6\xe4\xfb\xe5" .. " " .. math.floor(sec / 60) .. u8" \xec\xe8\xed"
+end
+
+-- срабатывание: сообщение в чат SAMP + тост; одноразовое -> в "выполненные", повторяющееся -> следующее время
+function PCS_REM.fire(r, late)
+    local cpText = r.text
+    pcall(function() cpText = _u8_raw:decode(r.text) end)      -- UTF-8 -> CP1251 для чата SAMP
+    if #cpText > 110 then cpText = cpText:sub(1, 110) .. "..." end
+    local when = PCS_REM.fmtTime(r.at)
+    local chat
+    if late then
+        chat = "{FFAA00}[\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5] {FFFFFF}" .. cpText .. " {A0A0A0}(\xef\xf0\xee\xef\xf3\xf9\xe5\xed\xee, \xe1\xfb\xeb\xee " .. when .. ")"
+    else
+        chat = "{FFD84D}[\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5] {FFFFFF}" .. cpText
+    end
+    PCS_NO_TOAST_ONCE = true                                   -- чтобы чат-обёртка не дублировала тост
+    pcall(sampAddChatMessage, chat, -1)
+    PCS_NO_TOAST_ONCE = false
+    if St then St._toastSessionActive = true end
+    local head = late and (u8"\xcf\xf0\xee\xef\xf3\xf9\xe5\xed\xee \xed\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5 (" .. when .. "): ") or (u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5: ")
+    pcall(pcs_notify, head .. r.text, late and "warning" or "info", 12)
+    local now = os.time()
+    if (r.rep or 0) > 0 then
+        local n = math.floor((now - r.at) / r.rep) + 1
+        if n < 1 then n = 1 end
+        r.at = r.at + n * r.rep
+    else
+        r.done, r.doneAt = true, now
+    end
+    PCS_REM.save()
+end
+
+-- фоновый поток: ждёт спавн; при входе показывает пропущенные (пока игрока не было в игре)
+function PCS_REM.start()
+    if PCS_REM.started then return end
+    PCS_REM.started = true
+    lua_thread.create(function()
+        while not isPlayerActuallySpawned() do wait(1000) end
+        wait(4000)                                            -- чат и тосты уже готовы
+        while true do
+            pcall(function()
+                if isPlayerActuallySpawned() then
+                    local now = os.time()
+                    local due = {}
+                    for _, r in ipairs(PCS_REM.list) do
+                        if not r.done and r.at <= now then due[#due + 1] = r end
+                    end
+                    table.sort(due, function(a, b) return a.at < b.at end)
+                    for i, r in ipairs(due) do
+                        PCS_REM.fire(r, (now - r.at) > 90)
+                        if i < #due then wait(400) end
+                    end
+                end
+            end)
+            wait(1000)
+        end
+    end)
+end
+
+-- /remind <минуты> <текст>
+function PCS_REM.registerCmd()
+    pcall(sampRegisterChatCommand, "remind", function(arg)
+        arg = tostring(arg or "")
+        local n, txt = arg:match("^%s*(%d+)%s+(.+)$")
+        if not n then
+            pcall(sampAddChatMessage, "{66CCFF}[\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5] {FFFFFF}/remind <\xec\xe8\xed\xf3\xf2\xfb> <\xf2\xe5\xea\xf1\xf2>", -1)
+            return
+        end
+        local mins = math.min(tonumber(n), 60 * 24 * 30)
+        PCS_REM.load()
+        PCS_REM.add(u8(txt), os.time() + mins * 60, 0)
+        pcall(sampAddChatMessage, "{00FF88}[\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5] {FFFFFF}\xd7\xe5\xf0\xe5\xe7 " .. mins .. " \xec\xe8\xed: " .. txt, -1)
+    end)
+end
+
+-- ---------------- интерфейс ----------------
+function PCS_REM.buf()
+    local U = PCS_REM.ui
+    if not U.text then
+        U.text = imgui.new("char[201]")
+        U.h, U.m, U.cust = imgui.new("int[1]", 12), imgui.new("int[1]", 0), imgui.new("int[1]", 30)
+        PCS_REM.setRel(5)
+    end
+    return U
+end
+
+function PCS_REM.setRel(mins)
+    local U = PCS_REM.ui
+    local d = os.date("*t", os.time() + mins * 60)
+    local t0 = os.date("*t")
+    U.h[0], U.m[0] = d.hour, d.min
+    U.day = (d.yday ~= t0.yday or d.year ~= t0.year) and 1 or 0
+end
+
+function PCS_REM.calcAt()
+    local U = PCS_REM.ui
+    local h = math.max(0, math.min(23, U.h[0]))
+    local m = math.max(0, math.min(59, U.m[0]))
+    local t = os.date("*t")
+    t.hour, t.min, t.sec = h, m, 0
+    t.day = t.day + (U.day or 0)
+    local at = os.time(t)
+    local rolled = false
+    if at <= os.time() then at = at + 86400; rolled = true end
+    return at, rolled
+end
+
+function PCS_REM.cut(txt, maxw)
+    if imgui.CalcTextSize(txt).x <= maxw then return txt end
+    while #txt > 1 do
+        txt = txt:sub(1, #txt - 1)
+        local b = txt:byte(#txt)
+        if b < 0x80 or b >= 0xC0 then                         -- не режем посреди UTF-8 символа
+            if b >= 0xC0 then txt = txt:sub(1, #txt - 1) end
+            if imgui.CalcTextSize(txt .. "...").x <= maxw then break end
+        end
+    end
+    return txt .. "..."
+end
+
+function PCS_REM.drawCard(r, isDone)
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local dl = imgui.GetWindowDrawList()
+    local p = imgui.GetCursorScreenPos()
+    local w = imgui.GetContentRegionAvail().x
+    local h = S(58)
+    local a = isDone and 0.55 or 1.0
+    dl:AddRectFilled(p, V2(p.x + w, p.y + h), U32(iv4(0.16, 0.13, 0.05, 0.92 * a)), S(8))
+    dl:AddRect(p, V2(p.x + w, p.y + h), U32(iv4(1.0, 0.80, 0.25, 0.55 * a)), S(8), 0, 1.2)
+    dl:AddRectFilled(V2(p.x + 1, p.y + S(8)), V2(p.x + 4, p.y + h - S(8)), U32(iv4(1.0, 0.80, 0.25, a)), 2)
+    local maxw = w - S(180)
+    dl:AddText(V2(p.x + S(14), p.y + S(9)), U32(iv4(1, 1, 1, a)), PCS_REM.cut(r.text, maxw))
+    local info
+    if isDone then
+        info = u8"\xc2\xfb\xef\xee\xeb\xed\xe5\xed\xee " .. PCS_REM.fmtTime(r.doneAt or r.at)
+    else
+        info = PCS_REM.fmtTime(r.at) .. "  -  " .. u8"\xf7\xe5\xf0\xe5\xe7 " .. PCS_REM.fmtLeft(r.at - os.time())
+            .. "  -  " .. PCS_REM.repLabel(r.rep)
+    end
+    dl:AddText(V2(p.x + S(14), p.y + S(32)), U32(iv4(0.72, 0.78, 0.60, a)), PCS_REM.cut(info, maxw))
+    imgui.SetCursorScreenPos(V2(p.x + w - S(160), p.y + S(15)))
+    if not isDone then
+        if PCS_gdButton(u8"+10 \xec\xe8\xed##remSn" .. r.id, S(76), S(28), { 0.30, 0.60, 0.95 }, 6.0) then
+            r.at = math.max(r.at, os.time()) + 600
+            PCS_REM.save()
+        end
+        imgui.SameLine(0, S(6))
+    else
+        imgui.Dummy(V2(S(82), S(1))); imgui.SameLine(0, 0)
+    end
+    if PCS_gdButton(PCS_IC.trash .. "##remDel" .. r.id, S(66), S(28), { 0.92, 0.30, 0.30 }, 6.0) then
+        PCS_REM.del(r.id)
+    end
+    imgui.SetCursorScreenPos(V2(p.x, p.y + h + S(6)))
+    imgui.Dummy(V2(0, 0))
+end
+
+function PCS_REM.closeForm()
+    PCS_REM.ui.formOpen = false
+end
+
+-- кнопка справа сверху: "+ Добавить" (в режиме формы - "Закрыть"), со стикером-плюсом
+function PCS_REM.headBtn(w, h, isClose)
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local dl = imgui.GetWindowDrawList()
+    local p = imgui.GetCursorScreenPos()
+    local clicked = imgui.InvisibleButton("##remHeadBtn", V2(w, h))
+    local hov, held = imgui.IsItemHovered(), imgui.IsItemActive()
+    local r, g, b = 1.0, 0.78, 0.22
+    if isClose then r, g, b = 0.90, 0.32, 0.32 end
+    local k = held and 0.55 or (hov and 0.42 or 0.30)
+    if hov then
+        dl:AddRectFilled(V2(p.x - 2, p.y - 2), V2(p.x + w + 2, p.y + h + 2), U32(iv4(r, g, b, 0.16)), S(10))
+    end
+    dl:AddRectFilled(p, V2(p.x + w, p.y + h), U32(iv4(r * k, g * k, b * k, 1.0)), S(9))
+    dl:AddRect(p, V2(p.x + w, p.y + h), U32(iv4(r, g, b, hov and 0.95 or 0.6)), S(9), 0, 1.3)
+    local ang, dy, sc = PCS_stickerAnim(hov, 0.7)
+    local hs = h * 0.30 * sc
+    PCS_drawSticker(dl, isClose and "gear" or "plus", p.x + h * 0.5, p.y + h * 0.5 + dy, hs, ang)
+    local label = isClose and u8"\xc7\xe0\xea\xf0\xfb\xf2\xfc" or u8"\xc4\xee\xe1\xe0\xe2\xe8\xf2\xfc"
+    local ts = imgui.CalcTextSize(label)
+    dl:AddText(V2(p.x + h + (w - h - ts.x) * 0.5 - S(2), p.y + (h - ts.y) * 0.5), U32(iv4(1, 1, 1, 1)), label)
+    return clicked
+end
+
+function PCS_REM.drawHeader(nAct)
+    local U, V2 = PCS_REM.ui, imgui.ImVec2
+    local dl = imgui.GetWindowDrawList()
+    local p = imgui.GetCursorScreenPos()
+    local aw = imgui.GetContentRegionAvail().x
+    local hs = S(14)
+    local ang, dy, sc = PCS_stickerAnim(false, 1.3)
+    PCS_drawSticker(dl, "bell", p.x + hs + S(3), p.y + S(20) + dy, hs * sc, ang)
+    imgui.SetCursorScreenPos(V2(p.x + hs * 2 + S(14), p.y + S(4)))
+    imgui.TextColored(iv4(1.0, 0.90, 0.50, 1.0), U.formOpen and u8"\xcd\xee\xe2\xee\xe5 \xed\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5" or u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xff")
+    imgui.SetCursorScreenPos(V2(p.x + hs * 2 + S(14), p.y + S(23)))
+    if U.formOpen then
+        imgui.TextColored(thDim(), u8"\xc7\xe0\xef\xee\xeb\xed\xe8\xf2\xe5 \xe8 \xed\xe0\xe6\xec\xe8\xf2\xe5 \xab\xd1\xee\xe7\xe4\xe0\xf2\xfc\xbb")
+    else
+        imgui.TextColored(thDim(), u8"\xc0\xea\xf2\xe8\xe2\xed\xfb\xf5: " .. nAct)
+    end
+    local bw, bh = S(128), S(36)
+    imgui.SetCursorScreenPos(V2(p.x + aw - bw - S(4), p.y + S(3)))
+    if PCS_REM.headBtn(bw, bh, U.formOpen) then
+        U.formOpen = not U.formOpen
+        if U.formOpen then PCS_REM.setRel(5) end
+    end
+    imgui.SetCursorScreenPos(V2(p.x, p.y + S(46)))
+    imgui.Dummy(V2(0, 0))
+    imgui.Separator()
+    imgui.Spacing()
+end
+
+function PCS_REM.drawForm()
+    local U, V2 = PCS_REM.ui, imgui.ImVec2
+    imgui.TextColored(iv4(0.70, 0.82, 1.0, 1.0), u8"\xd2\xe5\xea\xf1\xf2 \xed\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xff")
+    imgui.PushItemWidth(-1)
+    imgui.InputText("##remText", U.text, 201)
+    imgui.PopItemWidth()
+    imgui.Spacing()
+
+    imgui.TextColored(iv4(0.70, 0.82, 1.0, 1.0), u8"\xc2\xf0\xe5\xec\xff \xf1\xf0\xe0\xe1\xe0\xf2\xfb\xe2\xe0\xed\xe8\xff")
+    imgui.PushItemWidth(S(110))
+    if imgui.InputInt("##remH", U.h, 1, 1) then U.h[0] = math.max(0, math.min(23, U.h[0])) end
+    imgui.SameLine(0, S(6)); imgui.Text(":"); imgui.SameLine(0, S(6))
+    if imgui.InputInt("##remM", U.m, 1, 5) then U.m[0] = math.max(0, math.min(59, U.m[0])) end
+    imgui.PopItemWidth()
+    local aw = imgui.GetContentRegionAvail().x
+    local gap = S(4)
+    local bw = math.floor((aw - gap * 3) / 4)
+    for i, q in ipairs({ { "+5 \xec\xe8\xed", 5 }, { "+15 \xec\xe8\xed", 15 }, { "+30 \xec\xe8\xed", 30 }, { "+1 \xf7", 60 } }) do
+        if i > 1 then imgui.SameLine(0, gap) end
+        if PCS_gdButton(u8(q[1]) .. "##remQ" .. i, bw, S(26), { 0.45, 0.65, 0.95 }, 6.0) then PCS_REM.setRel(q[2]) end
+    end
+    local dw = math.floor((aw - gap * 2) / 3)
+    for i, nm in ipairs({ "\xd1\xe5\xe3\xee\xe4\xed\xff", "\xc7\xe0\xe2\xf2\xf0\xe0", "\xcf\xee\xf1\xeb\xe5\xe7\xe0\xe2\xf2\xf0\xe0" }) do
+        if i > 1 then imgui.SameLine(0, gap) end
+        local on = (U.day == i - 1)
+        if PCS_gdButton(u8(nm) .. "##remD" .. i, dw, S(26), on and { 1.0, 0.80, 0.25 } or { 0.50, 0.55, 0.65 }, 6.0) then
+            U.day = i - 1
+        end
+    end
+    imgui.Spacing()
+
+    imgui.TextColored(iv4(0.70, 0.82, 1.0, 1.0), u8"\xcf\xee\xe2\xf2\xee\xf0")
+    local n = #PCS_REM.REP
+    local rw = math.floor((aw - gap * (n - 1)) / n)
+    for i, rp in ipairs(PCS_REM.REP) do
+        if i > 1 then imgui.SameLine(0, gap) end
+        local on = (U.rep == i)
+        if PCS_gdButton(u8(rp[1]) .. "##remR" .. i, rw, S(26), on and { 1.0, 0.80, 0.25 } or { 0.50, 0.55, 0.65 }, 6.0) then
+            U.rep = i
+        end
+    end
+    local repSec = PCS_REM.REP[U.rep][2]
+    if repSec == -1 then
+        imgui.PushItemWidth(S(140))
+        if imgui.InputInt("##remCust", U.cust, 5, 30) then U.cust[0] = math.max(1, math.min(10080, U.cust[0])) end
+        imgui.PopItemWidth()
+        imgui.SameLine(0, S(6))
+        imgui.TextColored(thDim(), u8"\xec\xe8\xed\xf3\xf2 \xec\xe5\xe6\xe4\xf3 \xef\xee\xe2\xf2\xee\xf0\xe0\xec\xe8")
+        repSec = math.max(1, U.cust[0]) * 60
+    end
+    imgui.Spacing()
+
+    local at, rolled = PCS_REM.calcAt()
+    local preview = u8"\xd1\xf0\xe0\xe1\xee\xf2\xe0\xe5\xf2: " .. PCS_REM.fmtTime(at) .. "  (" .. u8"\xf7\xe5\xf0\xe5\xe7 " .. PCS_REM.fmtLeft(at - os.time()) .. ")"
+    if rolled then preview = preview .. u8"  - \xe2\xf0\xe5\xec\xff \xf3\xe6\xe5 \xef\xf0\xee\xf8\xeb\xee, \xef\xe5\xf0\xe5\xed\xe5\xf1\xe5\xed\xee \xed\xe0 \xe7\xe0\xe2\xf2\xf0\xe0" end
+    imgui.TextColored(iv4(0.55, 0.90, 0.60, 1.0), preview)
+    imgui.Spacing()
+
+    local half = math.floor((imgui.GetContentRegionAvail().x - S(6)) / 2)
+    if PCS_gdButton(PCS_IC.bell .. u8"  \xd1\xee\xe7\xe4\xe0\xf2\xfc##remAdd", half, S(38), { 1.0, 0.78, 0.22 }, 10.0) then
+        local txt = ffi.string(U.text)
+        if txt:gsub("%s", "") == "" then
+            pcall(pcs_notify, u8"\xc2\xe2\xe5\xe4\xe8\xf2\xe5 \xf2\xe5\xea\xf1\xf2 \xed\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xff", "warning", 4)
+        else
+            PCS_REM.add(txt, at, math.max(0, repSec))
+            ffi.fill(U.text, 201, 0)
+            pcall(pcs_notify, u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe5 \xe4\xee\xe1\xe0\xe2\xeb\xe5\xed\xee: " .. PCS_REM.fmtTime(at), "success", 4)
+            U.formOpen = false
+        end
+    end
+    imgui.SameLine(0, S(6))
+    if PCS_gdButton(u8"\xce\xf2\xec\xe5\xed\xe0##remCancel", half, S(38), { 0.50, 0.55, 0.65 }, 10.0) then
+        U.formOpen = false
+    end
+end
+
+function PCS_REM.drawEmpty()
+    local V2 = imgui.ImVec2
+    local dl = imgui.GetWindowDrawList()
+    local p = imgui.GetCursorScreenPos()
+    local aw = imgui.GetContentRegionAvail().x
+    local ang, dy, sc = PCS_stickerAnim(false, 2.1)
+    PCS_drawSticker(dl, "bell", p.x + aw * 0.5, p.y + S(60) + dy, S(26) * sc, ang)
+    local t1 = u8"\xcd\xe0\xef\xee\xec\xe8\xed\xe0\xed\xe8\xe9 \xef\xee\xea\xe0 \xed\xe5\xf2"
+    local t2 = u8"\xcd\xe0\xe6\xec\xe8\xf2\xe5 \xab\xc4\xee\xe1\xe0\xe2\xe8\xf2\xfc\xbb \xf1\xef\xf0\xe0\xe2\xe0 \xe2\xe2\xe5\xf0\xf5\xf3"
+    local s1, s2 = imgui.CalcTextSize(t1), imgui.CalcTextSize(t2)
+    imgui.SetCursorScreenPos(V2(p.x + (aw - s1.x) * 0.5, p.y + S(108)))
+    imgui.TextColored(iv4(1.0, 0.90, 0.50, 1.0), t1)
+    imgui.SetCursorScreenPos(V2(p.x + (aw - s2.x) * 0.5, p.y + S(130)))
+    imgui.TextColored(thDim(), t2)
+    imgui.SetCursorScreenPos(V2(p.x, p.y + S(160)))
+    imgui.Dummy(V2(0, 0))
+end
+
+function PCS_REM.drawBody()
+    local U = PCS_REM.buf()
+    local act, done = {}, {}
+    for _, r in ipairs(PCS_REM.list) do
+        if r.done then done[#done + 1] = r else act[#act + 1] = r end
+    end
+    table.sort(act, function(a, b) return a.at < b.at end)
+    table.sort(done, function(a, b) return (a.doneAt or 0) > (b.doneAt or 0) end)
+
+    PCS_REM.drawHeader(#act)
+
+    if U.formOpen then
+        PCS_REM.drawForm()
+        return
+    end
+
+    if #act == 0 and #done == 0 then
+        PCS_REM.drawEmpty()
+        return
+    end
+    for _, r in ipairs(act) do PCS_REM.drawCard(r, false) end
+    if #done > 0 then
+        imgui.Spacing()
+        if PCS_gdButton(u8"\xc2\xfb\xef\xee\xeb\xed\xe5\xed\xed\xfb\xe5 (" .. #done .. ")##remDoneToggle", imgui.GetContentRegionAvail().x, S(26), { 0.50, 0.55, 0.65 }, 6.0) then
+            U.showDone = not U.showDone
+        end
+        if U.showDone then
+            imgui.Spacing()
+            for _, r in ipairs(done) do PCS_REM.drawCard(r, true) end
+        end
+    end
+    imgui.Dummy(imgui.ImVec2(0, S(6)))
+end
+
+function PCS_REM.draw(contentH)
+    PCS_REM.load()
+    imgui.BeginChild("##remTab", imgui.ImVec2(0, contentH), false)
+    local ok, err = pcall(PCS_REM.drawBody)
+    if not ok then imgui.TextColored(iv4(1, 0.4, 0.4, 1), "remind ui: " .. tostring(err)) end
+    imgui.EndChild()
+end
+
+function PCS_fancyToolBtn(id, icon, title, sub, w, h, col, active, stickerIcon, stickerChar)
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local dl = imgui.GetWindowDrawList()
+    local p = imgui.GetCursorScreenPos()
+    local th = imgui.GetTextLineHeight()
+    h = math.max(h, th * 2 + S(14))
+    local clicked = imgui.InvisibleButton(id, V2(w, h))
+    local hov  = imgui.IsItemHovered()
+    local held = imgui.IsItemActive()
+    local r, g, b = col[1], col[2], col[3]
+    local rnd = S(10)
+    local k = active and 0.34 or (held and 0.30 or (hov and 0.26 or 0.18))
+
+    if hov or active then
+        dl:AddRectFilled(V2(p.x - 2, p.y - 2), V2(p.x + w + 2, p.y + h + 2), U32(iv4(r, g, b, 0.16)), rnd + 2)
+    end
+    dl:AddRectFilled(p, V2(p.x + w, p.y + h), U32(iv4(r * k * 0.7, g * k * 0.7, b * k * 0.7, 0.98)), rnd)
+    dl:AddLine(V2(p.x + rnd, p.y + 1.5), V2(p.x + w - rnd, p.y + 1.5), U32(iv4(1, 1, 1, 0.12)), 1.0)
+    dl:AddRect(p, V2(p.x + w, p.y + h), U32(iv4(r, g, b, (active or hov) and 0.95 or 0.60)), rnd, 0, 1.4)
+    if active then
+        dl:AddRectFilled(V2(p.x + rnd, p.y + h - 4), V2(p.x + w - rnd, p.y + h - 2), U32(iv4(r, g, b, 1.0)), 1)
+    end
+
+    -- стикер-калькулятор вместо значка: наклонённая наклейка с белой каймой и тенью,
+    -- экранчик и кнопки 3x3 (рисуется векторно, картинки не нужны)
+    local function drawCalcSticker(cx0, cy0, hw, hh, ang)
+        local ca, sa = math.cos(ang), math.sin(ang)
+        local cx, cy = cx0, cy0
+        local function R(lx, ly) return V2(cx + lx * ca - ly * sa, cy + lx * sa + ly * ca) end
+        local function quad(x0, y0, x1, y1, col)
+            dl:AddQuadFilled(R(x0, y0), R(x1, y0), R(x1, y1), R(x0, y1), col)
+        end
+        local function rquad(x0, y0, x1, y1, rr, col)
+            quad(x0 + rr, y0, x1 - rr, y1, col)
+            quad(x0, y0 + rr, x1, y1 - rr, col)
+            dl:AddCircleFilled(R(x0 + rr, y0 + rr), rr, col, 10)
+            dl:AddCircleFilled(R(x1 - rr, y0 + rr), rr, col, 10)
+            dl:AddCircleFilled(R(x0 + rr, y1 - rr), rr, col, 10)
+            dl:AddCircleFilled(R(x1 - rr, y1 - rr), rr, col, 10)
+        end
+        local u = hw / 13
+        local b = 2 * u
+        cx, cy = cx0 + 1.6 * u, cy0 + 2.2 * u
+        rquad(-hw - b, -hh - b, hw + b, hh + b, 6 * u, U32(iv4(0, 0, 0, 0.35)))
+        cx, cy = cx0, cy0
+        rquad(-hw - b, -hh - b, hw + b, hh + b, 6 * u, U32(iv4(1, 1, 1, 0.96)))
+        rquad(-hw, -hh, hw, hh, 4.5 * u, U32(iv4(0.36, 0.30, 0.78, 1.0)))
+        quad(-hw + 3 * u, -hh + 1 * u, hw - 3 * u, -hh + 2 * u, U32(iv4(1, 1, 1, 0.22)))
+        rquad(-hw + 3 * u, -hh + 3 * u, hw - 3 * u, -hh + 11.5 * u, 2 * u, U32(iv4(0.74, 0.96, 0.86, 1.0)))
+        quad(hw - 12 * u, -hh + 6 * u, hw - 5 * u, -hh + 8.2 * u, U32(iv4(0.13, 0.33, 0.27, 1.0)))
+        quad(hw - 15.5 * u, -hh + 6 * u, hw - 13 * u, -hh + 8.2 * u, U32(iv4(0.13, 0.33, 0.27, 0.55)))
+        local gx0, gx1 = -hw + 3 * u, hw - 3 * u
+        local gy0, gy1 = -hh + 14 * u, hh - 3 * u
+        local gap = 1.6 * u
+        local cw = (gx1 - gx0 - gap * 2) / 3
+        local chh = (gy1 - gy0 - gap * 2) / 3
+        for row = 0, 2 do
+            for col = 0, 2 do
+                local x0 = gx0 + col * (cw + gap)
+                local y0 = gy0 + row * (chh + gap)
+                local colr = (col == 2) and U32(iv4(1.0, 0.68, 0.20, 1.0)) or U32(iv4(0.90, 0.90, 1.0, 1.0))
+                quad(x0, y0, x0 + cw, y0 + chh, colr)
+            end
+        end
+    end
+
+    -- круглый значок с иконкой
+    local cx, cy = p.x + h * 0.5, p.y + h * 0.5
+    if stickerChar then
+        local angA, dyA, scA = PCS_stickerAnim(hov, w)
+        if stickerChar == true then
+            drawCalcSticker(cx, cy + 1 + dyA, h * 0.27 * scA, h * 0.345 * scA, angA)
+        else
+            PCS_drawSticker(dl, tostring(stickerChar), cx, cy + 1 + dyA, h * 0.30 * scA, angA)
+        end
+    else
+    local rad = h * 0.30
+    dl:AddCircleFilled(V2(cx, cy), rad + 2, U32(iv4(r, g, b, 0.18)), 28)
+    dl:AddCircleFilled(V2(cx, cy), rad, U32(iv4(r * 0.95, g * 0.95, b * 0.95, 1.0)), 28)
+    dl:AddCircle(V2(cx, cy), rad, U32(iv4(1, 1, 1, 0.30)), 28, 1.2)
+    local isz = imgui.CalcTextSize(icon)
+    dl:AddText(V2(cx - isz.x * 0.5, cy - isz.y * 0.5), U32(iv4(0.05, 0.05, 0.08, 1.0)), icon)
+    end
+
+    -- заголовок (жирным) + подпись
+    local tx = p.x + h + S(2)
+    local ty = p.y + h * 0.5 - th - 1
+    local pushed = false
+    if PCS_BOLD_FONT then pushed = pcall(imgui.PushFont, PCS_BOLD_FONT) end
+    dl:AddText(V2(tx, ty), U32(iv4(1, 1, 1, 1)), title)
+    if pushed then pcall(imgui.PopFont) end
+    dl:AddText(V2(tx, p.y + h * 0.5 + 1), U32(iv4(r * 0.55 + 0.40, g * 0.55 + 0.40, b * 0.55 + 0.40, 0.95)), sub)
+
+    -- стикер: слегка наклонённая наклейка с белой каймой и тенью
+    local drewChar = false
+    if stickerIcon and not drewChar and w > S(170) then
+        local sx, sy = p.x + w - S(22), p.y + S(15)
+        local half = S(11)
+        local ang = -0.21
+        local ca, sa = math.cos(ang), math.sin(ang)
+        local function quad(off, hs, colr)
+            local pts = {}
+            for i, c in ipairs({ { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } }) do
+                local x, y = c[1] * hs, c[2] * hs
+                pts[i] = V2(sx + off + x * ca - y * sa, sy + off + x * sa + y * ca)
+            end
+            dl:AddQuadFilled(pts[1], pts[2], pts[3], pts[4], colr)
+        end
+        quad(S(2), half + 1, U32(iv4(0, 0, 0, 0.35)))          -- тень
+        quad(0, half + 1, U32(iv4(1, 1, 1, 0.95)))             -- белая кайма
+        quad(0, half - 1, U32(iv4(1.0, 0.78, 0.22, 1.0)))      -- сама наклейка
+        local ssz = imgui.CalcTextSize(stickerIcon)
+        dl:AddText(V2(sx - ssz.x * 0.5, sy - ssz.y * 0.5), U32(iv4(0.25, 0.14, 0.02, 1.0)), stickerIcon)
+    end
+    return clicked
+end
+
+-- ── верхний ряд вкладки "Финансы", 2-я строка: "Курс валют" (график) и
+-- "Калькулятор" — перенесены сюда к кнопкам "Настройки" и "Охранник" ──
+function PCS_drawFinanceToolRow(r, g, b, halfW)
+    imgui.Dummy(imgui.ImVec2(0, S(4)))
+    local gap = S(6)
+    if PCS_fancyToolBtn("##openChartPanel", PCS_IC.chart, u8"\xca\xf3\xf0\xf1 \xe2\xe0\xeb\xfe\xf2", u8"\xc3\xf0\xe0\xf4\xe8\xea \xea\xf3\xf0\xf1\xee\xe2",
+            halfW, S(46), { r, g, b }, St._chartPanelOpen, nil, "chart") then
+        St._chartPanelOpen = not St._chartPanelOpen
+        if St._chartPanelOpen then St._calcPanelOpen = false end
+    end
+    imgui.SameLine(0, gap)
+    if PCS_fancyToolBtn("##openCalcPanel", PCS_IC.calc, u8"\xca\xe0\xeb\xfc\xea\xf3\xeb\xff\xf2\xee\xf0", u8"\xca\xee\xed\xe2\xe5\xf0\xf2\xe5\xf0 \xe2\xe0\xeb\xfe\xf2",
+            halfW, S(46), { 0.62, 0.52, 1.0 }, St._calcPanelOpen, nil, true) then
+        St._calcPanelOpen = not St._calcPanelOpen
+        if St._calcPanelOpen then St._chartPanelOpen = false end
+    end
+    imgui.Dummy(imgui.ImVec2(0, S(6)))
+end
+
+
 -- ── всплывающее окно "Настройки" вкладки "Финансы": вынесено в отдельную
 -- функцию, чтобы не раздувать список апвэлью drawTotal (лимит Lua — 60) ──
 function drawFinanceSettingsBlock(r, g, b)
@@ -7008,6 +9373,7 @@ function drawFinanceSettingsBlock(r, g, b)
     if imgui.Button(PCS_IC.gear .. u8"  \xcd\xe0\xf1\xf2\xf0\xee\xe9\xea\xe8##financeSettingsBtn", imgui.ImVec2(_halfW, S(36))) then
         St._financeSettingsOpen = not St._financeSettingsOpen
     end
+    PCS_stickerOnLastItem("gear", 0.4)
     prettyBtnPop(_pb) end
     imgui.PopStyleColor(3)
 
@@ -7021,8 +9387,12 @@ function drawFinanceSettingsBlock(r, g, b)
     if imgui.Button(PCS_IC.shield .. u8"  \xce\xf5\xf0\xe0\xed\xed\xe8\xea##financeGuardBtn", imgui.ImVec2(_halfW, S(36))) then
         PCS_openGuardTab()
     end
+    PCS_stickerOnLastItem("shield", 1.1)
     prettyBtnPop(_pbg) end
     imgui.PopStyleColor(3)
+
+    -- 2-я строка: "Курс валют" и "Калькулятор" (перенесены сюда сверху)
+    PCS_drawFinanceToolRow(r, g, b, _halfW)
 end
 
 -- ── содержимое панели "Настройки" вкладки "Финансы" — вынесено отдельно
@@ -7622,7 +9992,14 @@ function computeGrandTotal(s)
     local btc = toNum(s.btc)
     local eur = toNum(s.euro)
     local vc  = toNum(s.cashVcs)
-    local asc = tonumber(cfg.ascAmount) or 0
+    -- ФИКС: раньше количество ASC бралось из cfg.ascAmount — поля, для
+    -- которого нигде в файле не было поля ввода и которое parseStats()
+    -- никогда не заполнял, поэтому ASC всегда считался как 0. Теперь
+    -- берём реально распознанное значение из статы (см. parseStats/p.asc),
+    -- а cfg.ascAmount оставляем как резервный ручной фолбэк на случай,
+    -- если сервер вдруг не прислал строку по ASC вообще.
+    local asc = toNum(s.asc)
+    if asc <= 0 then asc = tonumber(cfg.ascAmount) or 0 end
 
     local azSA  = az  * cfg.rateAZ
     local btcSA = btc * cfg.rateBTC
@@ -7686,6 +10063,73 @@ function PCS_drawRatesCard()
         end
     end
     imgui.Dummy(V2(0, S(4)))
+
+    -- ── стикеры Покупка / Продажа VC$ (перенесено из правой панели настроек) ──
+    do
+        local buyV  = tonumber(cfg.rateVC) or 0
+        local sellV = tonumber(cfg.rateVCSell) or 0
+        local phoneBuy  = St._phoneBuy
+        local phoneSell = St._phoneSell
+        if phoneBuy then buyV = tonumber(phoneBuy) or buyV end
+        if phoneSell then sellV = tonumber(phoneSell) or sellV end
+        local aw = imgui.GetContentRegionAvail().x
+        local gap = S(8)
+        local hw = (aw - gap) * 0.5
+        local hh = S(52)
+        local dl = imgui.GetWindowDrawList()
+        -- для стрелки роста/падения — сравниваем со значением из истории
+        -- курса (см. модуль RH), а не только с текущим кадром
+        if not St.rateHistLoaded then pcall(function() RH.load() end) end
+        local prevBuy, prevSell
+        do
+            local hist = St.rateHistory or {}
+            for i = 1, #hist do
+                local e = hist[i]
+                if e then
+                    if not prevBuy  and tonumber(e.buy)  and e.buy  > 0 then prevBuy  = e.buy  end
+                    if not prevSell and tonumber(e.sell) and e.sell > 0 then prevSell = e.sell end
+                end
+                if prevBuy and prevSell then break end
+            end
+        end
+        local function sticker(x, y, w, h, title, value, prevVal, col)
+            -- мягкий вертикальный градиент вместо плоской заливки + внешнее
+            -- еле заметное свечение под цвет карточки — "красивее" стикер
+            local glow = 3
+            dl:AddRectFilled(V2(x-glow, y-glow), V2(x+w+glow, y+h+glow), U32(iv4(col[1], col[2], col[3], 0.10)), 11)
+            dl:AddRectFilledMultiColor(V2(x, y), V2(x+w, y+h),
+                U32(iv4(col[1]*0.26, col[2]*0.26, col[3]*0.26, 0.97)),
+                U32(iv4(col[1]*0.26, col[2]*0.26, col[3]*0.26, 0.97)),
+                U32(iv4(col[1]*0.12, col[2]*0.12, col[3]*0.12, 0.97)),
+                U32(iv4(col[1]*0.12, col[2]*0.12, col[3]*0.12, 0.97)))
+            dl:AddRect(V2(x, y), V2(x+w, y+h), U32(iv4(col[1], col[2], col[3], 0.65)), 10, 0, 1.4)
+            dl:AddRectFilled(V2(x, y+3), V2(x+3, y+h-3), U32(iv4(col[1], col[2], col[3], 0.95)), 2)
+            imgui.SetCursorScreenPos(V2(x + S(12), y + S(6)))
+            imgui.TextColored(iv4(col[1], col[2], col[3], 1.0), title)
+            local vs = (value and value > 0) and ("$" .. fmtMoney(string.format("%.0f", value))) or "--"
+            imgui.SetCursorScreenPos(V2(x + S(12), y + S(25)))
+            imgui.TextColored(iv4(0.98, 0.98, 1.0, 1.0), vs)
+            -- стрелка изменения курса относительно предыдущего снимка истории
+            if value and value > 0 and prevVal and prevVal > 0 and math.abs(value - prevVal) > 0.001 then
+                local up = value > prevVal
+                local pct = (value - prevVal) / prevVal * 100
+                local arrow = up and "^ " or "v "
+                local acol = up and iv4(0.35, 0.90, 0.45, 1.0) or iv4(0.95, 0.35, 0.35, 1.0)
+                imgui.SetCursorScreenPos(V2(x + w - S(56), y + S(6)))
+                imgui.TextColored(acol, arrow .. string.format("%.1f%%", math.abs(pct)))
+            end
+        end
+        local p0 = imgui.GetCursorScreenPos()
+        sticker(p0.x, p0.y, hw, hh, u8"\xcf\xee\xea\xf3\xef\xea\xe0 VC$", buyV, prevBuy, {0.30, 0.90, 0.50})
+        sticker(p0.x + hw + gap, p0.y, hw, hh, u8"\xcf\xf0\xee\xe4\xe0\xe6\xe0 VC$", sellV, prevSell, {0.95, 0.72, 0.25})
+        imgui.SetCursorScreenPos(V2(p0.x, p0.y + hh + S(6)))
+        imgui.Dummy(V2(aw, S(2)))
+        if St._phoneRatesTime then
+            imgui.TextColored(thDim(), "  " .. u8"\xce\xe1\xed\xee\xe2\xeb\xe5\xed\xee" .. ": " .. tostring(St._phoneRatesTime))
+        end
+    end
+
+    -- кнопки "Курс валют" и "Калькулятор" перенесены наверх вкладки (PCS_drawFinanceToolRow)
 
     if not unlocked then
         local dl = imgui.GetWindowDrawList()
@@ -7957,6 +10401,858 @@ function drawTotalInner(s, h)
     imgui.Dummy(imgui.ImVec2(0, S(40)))
 end
 
+
+-- ── общий "красивый" график для панели "Графики" (используется и
+-- вкладкой Salary DP, и вкладкой "Курс VC$"): фон+рамка, тонкие
+-- направляющие линии, мягкая заливка под кривой (через AddTriangleFilled
+-- — единственный треугольный примитив, УЖЕ проверенный в этом файле
+-- в другом месте, поэтому без риска для непроверенных функций
+-- отрисовки), сама линия и подсветка последней (самой свежей) точки.
+-- Каждый элемент series: { pts = {число,...}, col = {r,g,b} }; 0 в pts
+-- означает "нет данных в этой точке" и пропускается (разрыв линии).
+-- ФИКС/УЛУЧШЕНИЕ (по просьбе "сделай график красивее"): та же сигнатура
+-- и тот же контракт по курсору/раскладке (единственный imgui.TextColored
+-- в самом конце, как и раньше — caller ничего не меняет), но сама отрисовка
+-- заметно наряднее: сглаженная кривая (Catmull-Rom вместо ломаной),
+-- мягкое "свечение" под линией, вертикальные направляющие в дополнение
+-- к горизонтальным, лёгкая пульсация последней точки и всплывающая
+-- подсказка со значением под курсором мыши. Всё новое рисуется ТОЛЬКО
+-- через draw list / BeginTooltip, поэтому раскладка (курсор ImGui) не
+-- затрагивается ни в одном месте — это безопасно даже внутри уже
+-- проверенного вызова из PCS_drawChartPanel.
+function PCS_catmullRom(p0, p1, p2, p3, t)
+    local t2, t3 = t * t, t * t * t
+    local x = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t +
+        (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+        (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+    local y = 0.5 * ((2 * p1[2]) + (-p0[2] + p2[2]) * t +
+        (2 * p0[2] - 5 * p1[2] + 4 * p2[2] - p3[2]) * t2 +
+        (-p0[2] + 3 * p1[2] - 3 * p2[2] + p3[2]) * t3)
+    return x, y
+end
+
+-- ФИКС (по просьбе, "график не работает"): раньше gmin/gmax всегда
+-- считались ОДНИ на все переданные серии разом. Для двух серий одной
+-- валюты (VC$ покупка/продажа) это нормально — они в одних единицах и
+-- близких величинах. Но для панели "Курс валют", где на одном графике
+-- могут быть одновременно AZ-Coins (~десятки тысяч), BTC, EUR, VC$
+-- (единицы/десятки) и ASC — при общей шкале почти все валюты, кроме
+-- самой "крупной", превращались в плоскую линию у самого низа графика
+-- и выглядели как "не работает". Добавлен необязательный 8-й параметр
+-- perSeries: true — каждая серия теперь нормализуется по СВОЕЙ
+-- собственной мин/макс, а не по общей шкале. По умолчанию (nil/false)
+-- поведение прежнее (общая шкала) — старые вызовы (Капитал/PayDay/
+-- VC$ покупка-продажа) не затронуты.
+function PCS_drawSpikeGraph(dl, V2, U32, p, aw, gh, series, perSeries)
+    local gmin, gmax
+    if not perSeries then
+        for _, s in ipairs(series) do
+            for _, v in ipairs(s.pts or {}) do
+                if v and v > 0 then
+                    if not gmin or v < gmin then gmin = v end
+                    if not gmax or v > gmax then gmax = v end
+                end
+            end
+        end
+        gmin = gmin or 0
+        gmax = gmax or 1
+        if gmax <= gmin then gmax = gmin + 1 end
+    end
+
+    dl:AddRectFilled(V2(p.x, p.y), V2(p.x + aw, p.y + gh), U32(iv4(0.06, 0.07, 0.10, 1)), 10)
+    -- лёгкая подсветка сверху "стеклом" — просто более тёмный-к-чуть
+    -- светлому переход по высоте, без риска (обычный AddRectFilled)
+    pcall(function()
+        dl:AddRectFilled(V2(p.x + 1, p.y + 1), V2(p.x + aw - 1, p.y + gh * 0.42), U32(iv4(1, 1, 1, 0.035)), 10)
+    end)
+    dl:AddRect(V2(p.x, p.y), V2(p.x + aw, p.y + gh), U32(iv4(1, 1, 1, 0.14)), 10, 0, 1.2)
+
+    -- направляющие: горизонтальные (как раньше) + вертикальные, чтобы
+    -- получилась настоящая координатная сетка, а не только полоски
+    for _, frac in ipairs({ 0.25, 0.5, 0.75 }) do
+        local gy = p.y + gh * frac
+        dl:AddLine(V2(p.x + 4, gy), V2(p.x + aw - 4, gy), U32(iv4(1, 1, 1, 0.06)), 1.0)
+    end
+    for _, frac in ipairs({ 0.25, 0.5, 0.75 }) do
+        local gx = p.x + aw * frac
+        dl:AddLine(V2(gx, p.y + 4), V2(gx, p.y + gh - 4), U32(iv4(1, 1, 1, 0.035)), 1.0)
+    end
+
+    local bottomY = p.y + gh - 2
+
+    -- определяем наведение мышью один раз для всех серий (нужно для
+    -- подсветки точки + тултипа под курсором)
+    local hovering, mx = false, 0
+    pcall(function()
+        local io2 = imgui.GetIO()
+        mx = io2.MousePos.x
+        hovering = imgui.IsMouseHoveringRect(V2(p.x, p.y), V2(p.x + aw, p.y + gh), true)
+    end)
+    local nPtsRef = 0
+    for _, s in ipairs(series) do nPtsRef = math.max(nPtsRef, #(s.pts or {})) end
+    local hoverIdx = nil
+    if hovering and nPtsRef > 1 then
+        local step0 = aw / math.max(1, nPtsRef - 1)
+        hoverIdx = math.max(1, math.min(nPtsRef, math.floor((mx - p.x) / step0 + 0.5) + 1))
+    end
+    local hoverDots = {}
+
+    for _, s in ipairs(series) do
+        local pts = s.pts or {}
+        local col = s.col or { 0.5, 0.8, 1.0 }
+        local cU    = U32(iv4(col[1], col[2], col[3], 1))
+        local glowU = U32(iv4(col[1], col[2], col[3], 0.25))
+        local fU    = U32(iv4(col[1], col[2], col[3], 0.16))
+        local step = aw / math.max(1, #pts - 1)
+
+        -- при perSeries считаем мин/макс отдельно для этой конкретной
+        -- серии (см. комментарий у объявления функции выше)
+        local smin, smax = gmin, gmax
+        if perSeries then
+            for _, v in ipairs(pts) do
+                if v and v > 0 then
+                    if not smin or v < smin then smin = v end
+                    if not smax or v > smax then smax = v end
+                end
+            end
+            smin = smin or 0
+            smax = smax or 1
+            if smax <= smin then smax = smin + 1 end
+        end
+
+        -- разбиваем на непрерывные "отрезки" валидных точек (0/nil —
+        -- разрыв данных, как и раньше), каждый сглаживаем отдельно
+        local runs, cur = {}, {}
+        for i, v in ipairs(pts) do
+            if v and v > 0 then
+                local nx = p.x + (i - 1) * step
+                local ny = p.y + gh - ((v - smin) / (smax - smin)) * (gh - 10) - 5
+                cur[#cur + 1] = { nx, ny, i, v }
+            else
+                if #cur >= 1 then runs[#runs + 1] = cur end
+                cur = {}
+            end
+        end
+        if #cur >= 1 then runs[#runs + 1] = cur end
+
+        local lastx, lasty = nil, nil
+        for _, run in ipairs(runs) do
+            if #run == 1 then
+                lastx, lasty = run[1][1], run[1][2]
+            else
+                -- сглаженный путь (Catmull-Rom) через все точки отрезка —
+                -- вместо ломаной "спайк"-линии получается гладкая кривая
+                local path = {}
+                local SUBDIV = 8
+                for i = 1, #run - 1 do
+                    local q0 = run[math.max(1, i - 1)]
+                    local q1 = run[i]
+                    local q2 = run[i + 1]
+                    local q3 = run[math.min(#run, i + 2)]
+                    for si = 0, SUBDIV - 1 do
+                        local x, y = PCS_catmullRom(q0, q1, q2, q3, si / SUBDIV)
+                        path[#path + 1] = { x, y }
+                    end
+                end
+                path[#path + 1] = { run[#run][1], run[#run][2] }
+
+                for i = 1, #path - 1 do
+                    local a1, a2 = path[i], path[i + 1]
+                    pcall(function()
+                        dl:AddTriangleFilled(V2(a1[1], a1[2]), V2(a2[1], a2[2]), V2(a2[1], bottomY), fU)
+                        dl:AddTriangleFilled(V2(a1[1], a1[2]), V2(a2[1], bottomY), V2(a1[1], bottomY), fU)
+                    end)
+                end
+                -- мягкое "свечение" под линией (толще, прозрачнее), а
+                -- поверх — чёткая основная линия
+                for i = 1, #path - 1 do
+                    local a1, a2 = path[i], path[i + 1]
+                    dl:AddLine(V2(a1[1], a1[2]), V2(a2[1], a2[2]), glowU, 5.0)
+                end
+                for i = 1, #path - 1 do
+                    local a1, a2 = path[i], path[i + 1]
+                    dl:AddLine(V2(a1[1], a1[2]), V2(a2[1], a2[2]), cU, 2.2)
+                end
+
+                lastx, lasty = run[#run][1], run[#run][2]
+            end
+
+            if hoverIdx then
+                for _, ptn in ipairs(run) do
+                    if ptn[3] == hoverIdx then
+                        hoverDots[#hoverDots + 1] = { x = ptn[1], y = ptn[2], v = ptn[4], col = col }
+                    end
+                end
+            end
+        end
+        if lastx then
+            local pulse = 0.5 + 0.5 * math.sin((os.clock() or 0) * 3.0)
+            dl:AddCircleFilled(V2(lastx, lasty), 8.0 + pulse * 2.0, U32(iv4(col[1], col[2], col[3], 0.16)))
+            dl:AddCircleFilled(V2(lastx, lasty), 6.0, U32(iv4(col[1], col[2], col[3], 0.35)))
+            dl:AddCircleFilled(V2(lastx, lasty), 3.4, cU)
+        end
+    end
+
+    -- направляющая под курсором + подсветка точки(ек) + тултип со
+    -- значением (тот же проверенный BeginTooltip/EndTooltip, что и
+    -- везде в файле — раскладку главного окна не трогает)
+    if hovering and #hoverDots > 0 then
+        local gx = hoverDots[1].x
+        dl:AddLine(V2(gx, p.y + 2), V2(gx, p.y + gh - 2), U32(iv4(1, 1, 1, 0.18)), 1.0)
+        for _, hd in ipairs(hoverDots) do
+            dl:AddCircleFilled(V2(hd.x, hd.y), 5.0, U32(iv4(1, 1, 1, 0.9)))
+            dl:AddCircleFilled(V2(hd.x, hd.y), 3.2, U32(iv4(hd.col[1], hd.col[2], hd.col[3], 1)))
+        end
+        pcall(function()
+            imgui.BeginTooltip()
+            for _, hd in ipairs(hoverDots) do
+                imgui.TextColored(iv4(hd.col[1], hd.col[2], hd.col[3], 1), fmtMoney(string.format("%.0f", hd.v)))
+            end
+            imgui.EndTooltip()
+        end)
+    end
+
+    -- при perSeries общей "Мин/Макс" строки не показываем — у каждой
+    -- валюты своя шкала, единая пара чисел была бы бессмысленной (её
+    -- заменяет диапазон в подписи легенды, см. PCS_drawChartPanel)
+    if not perSeries then
+        imgui.TextColored(thGold(), u8"\xcc\xe8\xed: " .. fmtMoney(string.format("%.0f", gmin)) .. u8"   \xcc\xe0\xea\xf1: " .. fmtMoney(string.format("%.0f", gmax)))
+    end
+end
+
+function PCS_drawChartPanel()
+    if not imgui then return end
+    -- ФИКС (по просьбе, крашилось: "открыта панель графиков + сработала
+    -- автооплата налогов"): пока телефон реально занят другой операцией
+    -- (открытие/чтение/оплата через CEF, см. _phoneOpBusy), не рисуем
+    -- тяжёлую часть панели графиков одновременно с этим — просто плавно
+    -- прячем её на время операции, чтобы не грузить CEF и ImGui разом.
+    -- Панель сама вернётся, как только телефон освободится.
+    -- ФИКС (повторный краш): здесь ошибочно проверялось St._phoneOpBusy —
+    -- поля, которое никто и никогда не устанавливает (реальный замок —
+    -- глобальная переменная _phoneOpBusy, см. её присвоения по всему
+    -- файлу). St._phoneOpBusy всегда nil/false, поэтому это условие
+    -- НИКОГДА не срабатывало, и тяжёлая перерисовка панели графиков
+    -- продолжала идти одновременно с CEF-операцией телефона (открытие/
+    -- оплата налогов) — именно это и роняло скрипт и игру, когда меню
+    -- было открыто с открытой панелью графиков в момент автооплаты.
+    if _phoneOpBusy then
+        St._chartPanelAnim = 0
+        return
+    end
+    local target = (St._chartPanelOpen and St.winOpen) and 1.0 or 0.0
+    local tnow = os.clock()
+    if not St._chartPanelLastT then St._chartPanelLastT = tnow end
+    local dt = tnow - St._chartPanelLastT
+    St._chartPanelLastT = tnow
+    if dt < 0 or dt > 0.5 then dt = 0 end
+    local speed = 7.0
+    if cfg and cfg.smoothMenuAnim == false then
+        St._chartPanelAnim = target
+    else
+        if (St._chartPanelAnim or 0) < target then
+            St._chartPanelAnim = math.min(target, (St._chartPanelAnim or 0) + dt * speed)
+        elseif (St._chartPanelAnim or 0) > target then
+            St._chartPanelAnim = math.max(target, (St._chartPanelAnim or 0) - dt * speed)
+        end
+    end
+    if (St._chartPanelAnim or 0) < 0.01 then return end
+
+    local io = imgui.GetIO()
+    local sw, sh = io.DisplaySize.x, io.DisplaySize.y
+    local panelW = math.min(S(420), sw * 0.42)
+    local x = -panelW + panelW * St._chartPanelAnim
+    local y = sh * 0.08
+    local h = sh * 0.84
+    local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse
+    imgui.SetNextWindowPos(imgui.ImVec2(x, y), imgui.Cond.Always)
+    imgui.SetNextWindowSize(imgui.ImVec2(panelW, h), imgui.Cond.Always)
+    imgui.SetNextWindowBgAlpha(0.94)
+    if not imgui.Begin("###pcsChartPanel", nil, flags) then
+        imgui.End()
+        return
+    end
+    local r,g,b = getAcc()
+    imgui.TextColored(iv4(r,g,b,1), (PCS_IC.chart or "") .. "  " .. u8"\xca\xf3\xf0\xf1 \xe2\xe0\xeb\xfe\xf2")
+    imgui.SameLine()
+    local right = imgui.GetContentRegionAvail().x
+    imgui.SetCursorPosX(imgui.GetCursorPosX() + math.max(0, right - S(80)))
+    if imgui.SmallButton("X##chartClose") then St._chartPanelOpen = false end
+    imgui.Separator()
+    imgui.Dummy(imgui.ImVec2(0, S(4)))
+
+    local dl = imgui.GetWindowDrawList()
+    local V2, U32 = imgui.ImVec2, imgui.ColorConvertFloat4ToU32
+    local aw = imgui.GetContentRegionAvail().x
+    local ah = imgui.GetContentRegionAvail().y - S(10)
+
+    -- ── по просьбе: галочки-чипы валют (иконка+название), цветом отмечена
+    -- включённая валюта — можно оставить только одну или сразу все ──
+    imgui.TextColored(thDim(), u8"\xca\xe0\xea\xe8\xe5 \xe2\xe0\xeb\xfe\xf2\xfb \xef\xee\xea\xe0\xe7\xfb\xe2\xe0\xf2\xfc:")
+    imgui.Dummy(imgui.ImVec2(0, S(3)))
+    local perRow = 3
+    local chipGap = S(6)
+    local chipH   = S(30)
+    local chipW   = (aw - chipGap * (perRow - 1)) / perRow
+    for i, c in ipairs(PCS_CUR) do
+        local cfgKey = "chartShow" .. c.id:upper()
+        local shown = cfg[cfgKey]
+        if shown == nil then shown = true end
+        if (i - 1) % perRow ~= 0 then imgui.SameLine(0, chipGap) end
+        local col = c.col or { 0.7, 0.7, 0.7 }
+        if shown then
+            imgui.PushStyleColor(imgui.Col.Button,        iv4(col[1], col[2], col[3], 0.80))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered,  iv4(col[1], col[2], col[3], 0.95))
+            imgui.PushStyleColor(imgui.Col.ButtonActive,   iv4(col[1]*0.85, col[2]*0.85, col[3]*0.85, 1.0))
+        else
+            imgui.PushStyleColor(imgui.Col.Button,        iv4(1, 1, 1, 0.05))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered,  iv4(1, 1, 1, 0.10))
+            imgui.PushStyleColor(imgui.Col.ButtonActive,   iv4(1, 1, 1, 0.16))
+        end
+        local mark  = shown and (PCS_IC.check or "+") or (PCS_IC.xcircle or "-")
+        local label = mark .. " " .. (PCS_IC[c.ic] or "") .. " " .. (c.name or CUR_AARP_SHORT)
+        local _pbChip = prettyBtnPush(8.0)
+        if imgui.Button(label .. "##curChip_" .. c.id, imgui.ImVec2(chipW, chipH)) then
+            cfg[cfgKey] = not shown
+            saveCfg()
+        end
+        prettyBtnPop(_pbChip)
+        imgui.PopStyleColor(3)
+    end
+    imgui.Dummy(imgui.ImVec2(0, S(8)))
+    imgui.Separator()
+    imgui.Dummy(imgui.ImVec2(0, S(6)))
+
+    -- ── по просьбе: отдельный график НА КАЖДУЮ валюту (а не одна общая
+    -- панель со всеми линиями сразу) — сначала BTC (см. порядок PCS_CUR),
+    -- затем остальные включённые галочками валюты, одна под другой, и
+    -- под каждым графиком — время последнего обновления его данных
+    -- (см. модуль CH выше — снимок всех курсов раз в 3 минуты) ──
+    if not St.curHistLoaded then pcall(function() CH.load() end) end
+    local entries = St.curHistory or {}
+    local lastUpdT = entries[1] and tonumber(entries[1].t)
+    local lastUpdStr = lastUpdT and os.date("%H:%M:%S", lastUpdT)
+        or u8"\xed\xe5\xf2\x20\xe4\xe0\xed\xed\xfb\xf5"
+
+    local shownCur = {}
+    for _, c in ipairs(PCS_CUR) do
+        local shown = cfg["chartShow" .. c.id:upper()]
+        if shown == nil then shown = true end
+        if shown then shownCur[#shownCur + 1] = c end
+    end
+
+    if #shownCur == 0 then
+        imgui.TextColored(thDim(), u8"\xc2\xfb\xe1\xe5\xf0\xe8\xf2\xe5 \xf5\xee\xf2\xff \xe1\xfb \xee\xe4\xed\xf3 \xe2\xe0\xeb\xfe\xf2\xf3 \xe2\xfb\xf8\xe5, \xf7\xf2\xee\xe1\xfb \xe8\xe7\xee\xe1\xf0\xe0\xe7\xe8\xf2\xfc \xe3\xf0\xe0\xf4\xe8\xea")
+    else
+        -- одна прокручиваемая область под все графики сразу, чтобы при
+        -- нескольких включённых валютах не упереться в высоту панели
+        imgui.BeginChild("##pcsChartStack", imgui.ImVec2(aw, ah), false)
+        for idx, c in ipairs(shownCur) do
+            local pts = {}
+            for i = #entries, 1, -1 do
+                local e = entries[i]
+                if e then pts[#pts + 1] = tonumber(e[c.id]) or 0 end
+                if #pts >= 60 then break end
+            end
+            local smin, smax
+            for _, v in ipairs(pts) do
+                if v and v > 0 then
+                    if not smin or v < smin then smin = v end
+                    if not smax or v > smax then smax = v end
+                end
+            end
+            local rangeTxt = ""
+            if smin and smax then
+                rangeTxt = " (" .. fmtMoney(string.format("%.0f", smin)) .. " - " .. fmtMoney(string.format("%.0f", smax)) .. ")"
+            end
+            imgui.TextColored(iv4(c.col[1], c.col[2], c.col[3], 1),
+                (PCS_IC[c.ic] or "") .. " " .. (c.name or CUR_AARP_SHORT) .. rangeTxt)
+            imgui.SameLine()
+            local rightU = imgui.GetContentRegionAvail().x
+            imgui.SetCursorPosX(imgui.GetCursorPosX() + math.max(0, rightU - S(150)))
+            imgui.TextColored(thDim(), u8"\xee\xe1\xed\xee\xe2\xeb\xe5\xed\xee\x3a\x20" .. lastUpdStr)
+
+            if #pts < 2 then
+                imgui.TextColored(thDim(), u8"\xcf\xee\xea\xe0\x20\xed\xe5\xe4\xee\xf1\xf2\xe0\xf2\xee\xf7\xed\xee\x20\xe4\xe0\xed\xed\xfb\xf5\x20\xef\xee\x20\xea\xf3\xf0\xf1\xf3")
+            else
+                local p = imgui.GetCursorScreenPos()
+                local gh = math.max(S(90), math.min(S(160), (ah - S(40)) / #shownCur))
+                PCS_drawSpikeGraph(dl, V2, U32, p, aw, gh, { { pts = pts, col = c.col, name = c.name } }, true)
+                imgui.Dummy(imgui.ImVec2(aw, gh + S(6)))
+            end
+            if idx < #shownCur then
+                imgui.Dummy(imgui.ImVec2(0, S(4)))
+                imgui.Separator()
+                imgui.Dummy(imgui.ImVec2(0, S(6)))
+            end
+        end
+        imgui.EndChild()
+    end
+    imgui.End()
+end
+
+-- ============================================================
+--  КАЛЬКУЛЯТОР (по просьбе): вкладка "Финансы" -> кнопка "Калькулятор".
+--  1) обычный калькулятор: в поле можно писать пример (300*2+50, (5kk-200k)/3);
+--     k = тысяча, kk = миллион, kkk = миллиард (русские "к" тоже понимаются)
+--  2) конвертер по курсам из настроек финансов (cfg.rateAZ/BTC/EUR/VC/ASC —
+--     это цена 1 единицы валюты в виртах): выбираешь, что у тебя есть, и
+--     показывает, сколько это в виртах и в остальных валютах (в одной
+--     выбранной или во всех сразу).
+--  Все функции глобальные (function X, без local) — у файла лимит 200 local.
+-- ============================================================
+
+-- безопасный разбор выражения (без load): + - * / скобки, унарный минус, k/kk/kkk
+function PCS_calcEval(str)
+    if type(str) ~= "string" then return nil end
+    str = str:gsub("\208\186", "k"):gsub("\208\154", "k"):gsub(",", "."):gsub("%s+", "")
+    str = str:lower()
+    if str == "" or #str > 200 then return nil end
+    local pos = 1
+    local expr
+    local function peek() return str:sub(pos, pos) end
+    local function number()
+        local s, e = str:find("^%d*%.?%d*", pos)
+        if not s then return nil end
+        local txt = str:sub(s, e)
+        if txt == "" or txt == "." then return nil end
+        local v = tonumber(txt)
+        if not v then return nil end
+        pos = e + 1
+        local ks = str:match("^k+", pos)
+        if ks then
+            if #ks > 3 then return nil end
+            v = v * (1000 ^ #ks)
+            pos = pos + #ks
+        end
+        return v
+    end
+    local function primary()
+        if peek() == "(" then
+            pos = pos + 1
+            local v = expr()
+            if v == nil or peek() ~= ")" then return nil end
+            pos = pos + 1
+            return v
+        end
+        return number()
+    end
+    local function factor()
+        local c = peek()
+        if c == "-" then
+            pos = pos + 1
+            local v = factor()
+            if v == nil then return nil end
+            return -v
+        elseif c == "+" then
+            pos = pos + 1
+            return factor()
+        end
+        return primary()
+    end
+    local function term()
+        local v = factor()
+        if v == nil then return nil end
+        while true do
+            local c = peek()
+            if c == "*" then
+                pos = pos + 1
+                local w = factor()
+                if w == nil then return nil end
+                v = v * w
+            elseif c == "/" then
+                pos = pos + 1
+                local w = factor()
+                if w == nil or w == 0 then return nil end
+                v = v / w
+            else
+                break
+            end
+        end
+        return v
+    end
+    expr = function()
+        local v = term()
+        if v == nil then return nil end
+        while true do
+            local c = peek()
+            if c == "+" then
+                pos = pos + 1
+                local w = term()
+                if w == nil then return nil end
+                v = v + w
+            elseif c == "-" then
+                pos = pos + 1
+                local w = term()
+                if w == nil then return nil end
+                v = v - w
+            else
+                break
+            end
+        end
+        return v
+    end
+    local v = expr()
+    if v == nil or pos <= #str then return nil end
+    if v ~= v or v == math.huge or v == -math.huge then return nil end
+    return v
+end
+
+-- число как простая строка (для поля ввода и буфера обмена): без пробелов, без хвостовых нулей
+function PCS_calcRaw(v)
+    if v == nil then return "" end
+    local s
+    if math.abs(v) >= 1e15 then
+        s = string.format("%.0f", v)
+    else
+        s = string.format("%.8f", v)
+        s = s:gsub("0+$", "")
+        s = s:gsub("%.$", "")
+    end
+    if s == "" or s == "-" or s == "-0" then s = "0" end
+    return s
+end
+
+-- число для показа: 1 234 567 / 12.5 / 0.00012345
+function PCS_calcFmt(v)
+    if v == nil then return "-" end
+    local neg = v < 0
+    local a = math.abs(v)
+    local s
+    if a == 0 then s = "0"
+    elseif a >= 1e15 then s = string.format("%.3e", a)
+    elseif a >= 1000 then s = string.format("%.0f", a)
+    elseif a >= 1 then s = string.format("%.4f", a)
+    else s = string.format("%.8f", a) end
+    if not s:find("e", 1, true) and s:find(".", 1, true) then
+        s = s:gsub("0+$", "")
+        s = s:gsub("%.$", "")
+    end
+    if s == "" then s = "0" end
+    local ip, fp = s:match("^(%d+)(.*)$")
+    if ip then
+        local grouped = ip:reverse():gsub("(%d%d%d)", "%1 "):reverse():gsub("^ ", "")
+        s = grouped .. fp
+    end
+    if neg and s ~= "0" then s = "-" .. s end
+    return s
+end
+
+-- содержимое панели: каждый блок идёт под PCS_GUARD.call (стек ImGui всегда
+-- выравнивается, даже если внутри блока случилась ошибка), клики только
+-- запоминаются в St._calcAct и применяются ПОСЛЕ отрисовки кадра
+function PCS_calcNum(v)
+    v = tonumber(v)
+    if v == nil or v ~= v or v == math.huge or v == -math.huge then return nil end
+    return v
+end
+
+function PCS_calcW(x)
+    x = tonumber(x) or 1
+    if x ~= x or x < 1 then return 1 end
+    if x > 4000 then return 4000 end
+    return x
+end
+
+-- кнопка с гарантированным Pop цветов/стиля, возвращает true только при клике
+function PCS_calcBtn(label, w, h, br, bg2, bb, alpha)
+    local clicked = false
+    local ok = pcall(function()
+        imgui.PushStyleColor(imgui.Col.Button,        iv4(br * alpha, bg2 * alpha, bb * alpha, 1.0))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, iv4(br * 0.75, bg2 * 0.75, bb * 0.75, 1.0))
+        imgui.PushStyleColor(imgui.Col.ButtonActive,  iv4(br, bg2, bb, 1.0))
+    end)
+    if ok then
+        local okB, res = pcall(imgui.Button, label, imgui.ImVec2(PCS_calcW(w), h))
+        if okB and res then clicked = true end
+        pcall(imgui.PopStyleColor, 3)
+    end
+    return clicked
+end
+
+-- применяет отложенное действие (вызывается после imgui.End)
+function PCS_calcApply()
+    local a = St._calcAct
+    St._calcAct = nil
+    if not a then return end
+    if a.k == "from" then
+        St.calcFrom = a.id
+    elseif a.k == "to" then
+        if a.id == "all" then
+            St.calcToAll = true
+            St.calcTo = {}
+        else
+            if St.calcToAll then
+                St.calcToAll = false
+                St.calcTo = {}
+            end
+            if St.calcTo[a.id] then St.calcTo[a.id] = nil else St.calcTo[a.id] = true end
+            local any = false
+            for _ in pairs(St.calcTo) do any = true; break end
+            if not any then St.calcToAll = true end
+        end
+    elseif a.k == "pad" then
+        local s = ""
+        if PCS_CALC_BUF then s = ffi.string(PCS_CALC_BUF) end
+        local key = a.id
+        if key == "C" then
+            s = ""
+        elseif key == "<" then
+            local n = #s
+            while n > 0 and s:byte(n) >= 0x80 and s:byte(n) < 0xC0 do n = n - 1 end
+            s = s:sub(1, math.max(0, n - 1))
+        elseif key == "=" then
+            local v = PCS_calcNum(PCS_calcEval(s))
+            if v then s = PCS_calcRaw(v) end
+        else
+            s = s .. key
+        end
+        if #s > 100 then s = s:sub(1, 100) end
+        if PCS_CALC_BUF then ffi.copy(PCS_CALC_BUF, s) end
+    elseif a.k == "padtoggle" then
+        St.calcPad = not St.calcPad
+    elseif a.k == "copy" then
+        pcall(imgui.SetClipboardText, tostring(a.id))
+        St._calcCopiedT = os.clock()
+    end
+end
+
+function PCS_calcPanelBody()
+    local V2 = imgui.ImVec2
+    local r, g, b = getAcc()
+    local G = PCS_GUARD
+    local function mark(t) pcall(G.mark, "calc: " .. t) end
+    local function section(tag, fn)
+        mark(tag)
+        local ok, err = G.call(fn)
+        if not ok then
+            St._calcErrN = (St._calcErrN or 0) + 1
+            print("[PC Stats][calc] " .. tag .. ": " .. tostring(err))
+        end
+        return ok
+    end
+
+    if St.calcFrom == nil then St.calcFrom = "az" end
+    if St.calcTo == nil then St.calcTo = {} end
+    if St.calcToAll == nil then St.calcToAll = true end
+    if St.calcPad == nil then St.calcPad = true end
+
+    -- список: виртуалы + все валюты из PCS_CUR; rate = цена 1 единицы в виртах
+    local items = { { id = "sa", name = u8"\xc2\xe8\xf0\xf2\xfb", ic = PCS_IC.sack or "", col = { 0.85, 0.85, 0.92 }, rate = 1 } }
+    for _, c in ipairs(PCS_CUR) do
+        items[#items + 1] = { id = c.id, name = c.name or CUR_AARP_SHORT, ic = PCS_IC[c.ic] or "",
+                              col = c.col or { 0.7, 0.7, 0.7 }, rate = PCS_calcNum(cfg[c.key]) or 0 }
+    end
+
+    local aw = PCS_calcW(imgui.GetContentRegionAvail().x)
+    local exprStr, val = "", nil
+
+    section("header", function()
+        imgui.TextColored(iv4(r, g, b, 1), (PCS_IC.calc or "") .. "  " .. u8"\xca\xe0\xeb\xfc\xea\xf3\xeb\xff\xf2\xee\xf0")
+        imgui.SameLine()
+        local right = imgui.GetContentRegionAvail().x
+        imgui.SetCursorPosX(imgui.GetCursorPosX() + math.max(0, right - S(80)))
+        if imgui.SmallButton("X##calcClose") then St._calcAct = { k = "close" } end
+        imgui.Separator()
+        imgui.Dummy(V2(0, S(4)))
+    end)
+
+    section("input", function()
+        imgui.TextColored(thDim(), u8"\xc2\xe2\xe5\xe4\xe8\xf2\xe5\x20\xf1\xf3\xec\xec\xf3\x20\xe8\xeb\xe8\x20\xef\xf0\xe8\xec\xe5\xf0\x3a")
+        imgui.PushItemWidth(-1)
+        imgui.InputText("##calcIn", PCS_CALC_BUF, 128)
+        imgui.PopItemWidth()
+        exprStr = ffi.string(PCS_CALC_BUF)
+        val = PCS_calcNum(PCS_calcEval(exprStr))
+        if exprStr ~= "" then
+            if val then
+                imgui.TextColored(thGold(), "=  " .. PCS_calcFmt(val))
+            else
+                imgui.TextColored(iv4(1.0, 0.45, 0.45, 1.0), u8"\xcd\xe5\x20\xf3\xe4\xe0\xeb\xee\xf1\xfc\x20\xef\xee\xf1\xf7\xe8\xf2\xe0\xf2\xfc\x20\x2d\x20\xef\xf0\xee\xe2\xe5\xf0\xfc\xf2\xe5\x20\xe7\xe0\xef\xe8\xf1\xfc")
+            end
+        else
+            imgui.TextColored(thDim(), u8"\x6b\x20\x3d\x20\xf2\xfb\xf1\xff\xf7\xe0\x2c\x20\x6b\x6b\x20\x3d\x20\xec\xe8\xeb\xeb\xe8\xee\xed\x2c\x20\x6b\x6b\x6b\x20\x3d\x20\xec\xe8\xeb\xeb\xe8\xe0\xf0\xe4")
+        end
+        imgui.Dummy(V2(0, S(4)))
+    end)
+
+    -- ряд чипов: клик только запоминается (k = "from" / "to")
+    local function chipRow(idp, kind, list, isOn)
+        local gap = S(6)
+        local w = PCS_calcW((aw - gap * 2) / 3)
+        for i, it in ipairs(list) do
+            if (i - 1) % 3 ~= 0 then imgui.SameLine(0, gap) end
+            local col = it.col
+            local lbl = (it.ic or "") .. " " .. tostring(it.name) .. "##" .. idp .. i
+            if PCS_calcBtn(lbl, w, S(30), col[1], col[2], col[3], isOn(it) and 0.80 or 0.16) then
+                St._calcAct = { k = kind, id = it.id }
+            end
+        end
+    end
+
+    section("from", function()
+        imgui.TextColored(thDim(), u8"\xd3\x20\xec\xe5\xed\xff\x20\xe5\xf1\xf2\xfc\x3a")
+        chipRow("cf", "from", items, function(it) return it.id == St.calcFrom end)
+        imgui.Dummy(V2(0, S(4)))
+    end)
+
+    section("to", function()
+        imgui.TextColored(thDim(), u8"\xcf\xee\xea\xe0\xe7\xe0\xf2\xfc\x20\xe2\x3a")
+        local toList = { { id = "all", name = u8"\xc2\xf1\xe5", ic = PCS_IC.list or "", col = { r, g, b } } }
+        for _, it in ipairs(items) do toList[#toList + 1] = it end
+        chipRow("ct", "to", toList, function(it)
+            if it.id == "all" then return St.calcToAll end
+            return (not St.calcToAll) and St.calcTo[it.id] == true
+        end)
+        imgui.Dummy(V2(0, S(6)))
+        imgui.Separator()
+        imgui.Dummy(V2(0, S(6)))
+    end)
+
+    section("results", function()
+        local fromIt
+        for _, it in ipairs(items) do if it.id == St.calcFrom then fromIt = it end end
+        if not fromIt then fromIt = items[2]; St.calcFrom = fromIt.id end
+
+        if val == nil then
+            if exprStr == "" then
+                imgui.TextColored(thDim(), u8"\xc2\xe2\xe5\xe4\xe8\xf2\xe5\x20\xf1\xf3\xec\xec\xf3\x20\x2d\x20\xef\xee\xea\xe0\xe6\xf3\x20\xef\xe5\xf0\xe5\xf1\xf7\xb8\xf2")
+            end
+            return
+        end
+        if fromIt.rate <= 0 then
+            imgui.TextColored(iv4(1.0, 0.45, 0.45, 1.0),
+                u8"\xca\xf3\xf0\xf1\x20" .. tostring(fromIt.name) .. u8"\x20\xed\xe5\x20\xe7\xe0\xe4\xe0\xed\x2e")
+            imgui.TextColored(thDim(), u8"\xd3\xea\xe0\xe6\xe8\xf2\xe5\x20\xe5\xe3\xee\x20\xe2\x20\xed\xe0\xf1\xf2\xf0\xee\xe9\xea\xe0\xf5\x20\xf4\xe8\xed\xe0\xed\xf1\xee\xe2\x2e")
+            return
+        end
+        imgui.TextColored(thDim(), PCS_calcFmt(val) .. " " .. tostring(fromIt.name) .. "  =")
+        imgui.Dummy(V2(0, S(3)))
+        local virts = val * fromIt.rate
+        for idx, it in ipairs(items) do
+            if it.id ~= fromIt.id and (St.calcToAll or St.calcTo[it.id]) then
+                local out = nil
+                if it.rate > 0 then out = PCS_calcNum(virts / it.rate) end
+                imgui.TextColored(iv4(it.col[1], it.col[2], it.col[3], 1.0), (it.ic or "") .. "  " .. tostring(it.name))
+                imgui.SameLine()
+                if out then
+                    imgui.SetCursorPosX(PCS_calcW(aw - S(150)))
+                    imgui.TextColored(thGold(), PCS_calcFmt(out))
+                    imgui.SameLine()
+                    if imgui.SmallButton(u8"\xea\xee\xef\x2e" .. "##calcCp" .. idx) then
+                        St._calcAct = { k = "copy", id = PCS_calcRaw(out) }
+                    end
+                else
+                    imgui.TextColored(thDim(), u8"\xea\xf3\xf0\xf1\x20\xed\xe5\x20\xe7\xe0\xe4\xe0\xed")
+                end
+            end
+        end
+        if St._calcCopiedT and os.clock() - St._calcCopiedT < 1.5 then
+            imgui.TextColored(iv4(0.35, 0.90, 0.50, 1.0), u8"\xd1\xea\xee\xef\xe8\xf0\xee\xe2\xe0\xed\xee")
+        end
+    end)
+
+    section("pad", function()
+        imgui.Dummy(V2(0, S(6)))
+        imgui.Separator()
+        imgui.Dummy(V2(0, S(4)))
+        local padLabel = (St.calcPad and (PCS_IC.chevdown or "v") or (PCS_IC.chevright or ">")) .. "  " .. u8"\xca\xeb\xe0\xe2\xe8\xe0\xf2\xf3\xf0\xe0"
+        if imgui.SmallButton(padLabel .. "##calcPadToggle") then St._calcAct = { k = "padtoggle" } end
+        if not St.calcPad then return end
+        local rows = {
+            { "C", "<", "kk", "/" },
+            { "7", "8", "9", "*" },
+            { "4", "5", "6", "-" },
+            { "1", "2", "3", "+" },
+            { "0", "00", ".", "=" },
+        }
+        local gap = S(6)
+        local bw = PCS_calcW((aw - gap * 3) / 4)
+        imgui.Dummy(V2(0, S(2)))
+        for ri, row in ipairs(rows) do
+            for ci, k in ipairs(row) do
+                if ci > 1 then imgui.SameLine(0, gap) end
+                local br, bg2, bb, al
+                if k == "=" then br, bg2, bb, al = r, g, b, 0.55
+                elseif k == "C" or k == "<" then br, bg2, bb, al = 0.85, 0.35, 0.35, 0.55
+                elseif k == "/" or k == "*" or k == "-" or k == "+" or k == "kk" then br, bg2, bb, al = r * 0.7, g * 0.7, b * 0.7, 0.55
+                else br, bg2, bb, al = 0.55, 0.55, 0.62, 0.30 end
+                if PCS_calcBtn(k .. "##pad" .. ri .. "_" .. ci, bw, S(34), br, bg2, bb, al) then
+                    St._calcAct = { k = "pad", id = k }
+                end
+            end
+        end
+    end)
+end
+
+-- окно панели: выезжает слева, как панель "Курс валют"
+function PCS_drawCalcPanel()
+    if not imgui then return end
+    -- пока телефон занят (CEF/налоги) — панель прячем, как и панель графиков
+    if _phoneOpBusy then
+        St._calcPanelAnim = 0
+        St._calcAct = nil
+        return
+    end
+    -- буфер ввода создаётся один раз; если не вышло - калькулятор отключается, но скрипт живёт
+    if not PCS_CALC_BUF then
+        local okb, buf = pcall(imgui.new, "char[128]", "")
+        if okb and buf then PCS_CALC_BUF = buf else St._calcPanelOpen = false; return end
+    end
+    -- применяем клик из ПРОШЛОГО кадра до любой отрисовки
+    do
+        local a = St._calcAct
+        if a and a.k == "close" then
+            St._calcAct = nil
+            St._calcPanelOpen = false
+        else
+            local okA, errA = pcall(PCS_calcApply)
+            if not okA then
+                St._calcAct = nil
+                print("[PC Stats][calc] apply: " .. tostring(errA))
+            end
+        end
+    end
+
+    local target = (St._calcPanelOpen and St.winOpen) and 1.0 or 0.0
+    local tnow = os.clock()
+    if not St._calcPanelLastT then St._calcPanelLastT = tnow end
+    local dt = tnow - St._calcPanelLastT
+    St._calcPanelLastT = tnow
+    if dt < 0 or dt > 0.5 then dt = 0 end
+    local an = St._calcPanelAnim or 0
+    if an < target then an = math.min(target, an + dt * 7.0)
+    elseif an > target then an = math.max(target, an - dt * 7.0) end
+    St._calcPanelAnim = an
+    if an < 0.01 then return end
+
+    local io = imgui.GetIO()
+    local sw, sh = io.DisplaySize.x, io.DisplaySize.y
+    local panelW = math.min(S(420), sw * 0.42)
+    local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse
+    imgui.SetNextWindowPos(imgui.ImVec2(-panelW + panelW * an, sh * 0.08), imgui.Cond.Always)
+    imgui.SetNextWindowSize(imgui.ImVec2(panelW, sh * 0.84), imgui.Cond.Always)
+    imgui.SetNextWindowBgAlpha(0.94)
+    if not imgui.Begin("###pcsCalcPanel", nil, flags) then
+        imgui.End()
+        return
+    end
+    St._calcErrN = 0
+    local ok, err = PCS_GUARD.call(PCS_calcPanelBody)
+    imgui.End()
+    -- если блоки упорно падают несколько кадров подряд — закрываем панель, а не спамим
+    if not ok or (St._calcErrN or 0) > 0 then
+        St._calcFailFrames = (St._calcFailFrames or 0) + 1
+        if St._calcFailFrames >= 3 then
+            St._calcFailFrames = 0
+            St._calcPanelOpen = false
+            pcall(sampAddChatMessage, "{FF6666}[PC Stats] " .. "\xee\xf8\xe8\xe1\xea\xe0\x20\xea\xe0\xeb\xfc\xea\xf3\xeb\xff\xf2\xee\xf0\xe0\x20\x2d\x20\xef\xe0\xed\xe5\xeb\xfc\x20\xe7\xe0\xea\xf0\xfb\xf2\xe0\x2c\x20\xf1\xec\xee\xf2\xf0\xe8\xf2\xe5\x20\x6d\x6f\x6f\x6e\x6c\x6f\x61\x64\x65\x72\x2e\x6c\x6f\x67", -1)
+        end
+    else
+        St._calcFailFrames = 0
+    end
+end
+
 local function drawTotal(s, h)
     _rowIndex = 0
     imgui.PushStyleColor(imgui.Col.ChildBg, iv4(0,0,0,0))
@@ -8141,7 +11437,14 @@ end
 function forceCloseMenuNow()
     St._closeConfirmOpen = false
     St._settingsTouchedThisSession = false
-    St.winOpen = false; St.activeTab = 1; _sw_win_init = nil
+    St.winOpen = false
+    -- ФИКС: activeTab/_sw_win_init раньше сбрасывались МГНОВЕННО —
+    -- при плавном закрытии это было заметно как рывок (окно прыгало
+    -- в центр экрана и переключалось на первую вкладку прямо во время
+    -- затухания). Откладываем это до полного завершения анимации —
+    -- см. блок "плавное появление главного меню" ниже, где выставляется
+    -- St._winVisible = false ──
+    St._pendingCloseReset = true
     St._financeSettingsOpen = false; St._finShiftAnim = 0.0
     St._finShiftAppliedPx = 0.0; St._finShiftAnchorX = nil
     St._settingsPanelOpen = false
@@ -8448,13 +11751,20 @@ function drawSettingsInner(h, sw, sh)
             {u8"\xc1\xe5\xe6\xe5\xe2\xfb\xe9",          0.85,0.75,0.55, 0.85*0.35,0.75*0.35,0.55*0.35},
             {u8"\xce\xf0\xe0\xed\xe6\xe5\xe2\xfb\xe9",  0.95,0.55,0.15, 0.95*0.35,0.55*0.35,0.15*0.35},
             {u8"\xca\xf0\xe0\xf1\xed\xfb\xe9",          0.90,0.20,0.20, 0.90*0.35,0.20*0.35,0.20*0.35},
+            -- ── по просьбе: готовый пресет с градиентом розовый → голубой,
+            -- как на присланном скриншоте (кнопка "ПРОДОЛЖИТЬ") ──
+            {u8"\xd0\xee\xe7\xee\xe2\xee\x2d\xe3\xee\xeb\xf3\xe1\xee\xe9", 0.85,0.25,0.75, 0.25,0.75,0.95},
+            -- ── по просьбе: ещё один готовый пресет — красный → синий
+            -- (кнопка "ПРОДОЛЖИТЬ" с первого скриншота) ──
+            {u8"\xca\xf0\xe0\xf1\xed\xee\x2d\xf1\xe8\xed\xe8\xe9", 0.80,0.20,0.30, 0.24,0.28,0.58},
         }
         local gap5 = S(6)
         local aw5  = imgui.GetContentRegionAvail().x
-        local n5   = #presets5
+        local n5   = 4   -- кнопок в ряду (пресетов теперь 7 -> два ряда)
         local btnW5 = (aw5 - gap5*(n5-1)) / n5
         for i, cp in ipairs(presets5) do
-            if i > 1 then imgui.SameLine(0, gap5) end
+            if i == n5 + 1 then imgui.Spacing() end
+            if i > 1 and i ~= n5 + 1 then imgui.SameLine(0, gap5) end
             local cName, aR,aG,aB, bR,bG,bB = cp[1],cp[2],cp[3],cp[4],cp[5],cp[6],cp[7]
             local isAct = math.abs((cfg.custR>=0 and cfg.custR or getTheme().acc[1])-aR)<0.01
                       and math.abs((cfg.custG>=0 and cfg.custG or getTheme().acc[2])-aG)<0.01
@@ -8583,6 +11893,12 @@ function drawSettingsInner(h, sw, sh)
     imgui.SameLine(0, S(8))
     imgui.TextColored(iv4(1, 1, 1, 1), u8"\xd1\xf2\xe8\xea\xe5\xf0\xfb \xe2 \xf1\xee\xee\xe1\xf9\xe5\xed\xe8\xff\xf5 \xf7\xe0\xf2\xe0")
 
+    -- ФИКС (по просьбе): тумблеры "Плавное открытие/закрытие меню",
+    -- "Плавный переход по вкладкам" и общий "Отключить все анимации"
+    -- убраны из интерфейса — сами анимации остались (см. cfg.smoothMenuAnim
+    -- / cfg.smoothTabAnim выше по файлу), просто больше не выключаются
+    -- вручную и всегда включены по умолчанию.
+
     imgui.Spacing()
     imgui.TextColored(thDim(), u8"\xd1\xec\xfb\xf1\xeb\xee\xe2\xfb\xe5 \xf6\xe2\xe5\xf2\xe0:")
     imgui.Spacing()
@@ -8682,6 +11998,67 @@ secTitle(u8"\xd1\xeb\xf3\xf7\xe0\xe9\xed\xfb\xe9\x20\xf6\xe2\xe5\xf2")
         imgui.TextColored(iv4(1,1,1,1), u8"\xcf\xee\xea\xe0\xe7\xfb\xe2\xe0\xf2\xfc")
         if isOnMain then
             imgui.Spacing()
+            -- ── по просьбе: выбор персонажа + своя фотография — вместо
+            -- трёх плоских кнопок теперь карточки с иконкой, скруглением
+            -- и явной подсветкой выбранного варианта (тот же визуальный
+            -- язык, что и у карточек-секций в остальном файле: скруглённый
+            -- фон + рамка + цветная полоска слева у активного пункта) ──
+            imgui.TextColored(iv4(0.70,0.82,1.0,1.0), u8"\xcf\xe5\xf0\xf1\xee\xed\xe0\xe6\x3a")
+            do
+                local skinNames = { u8"\xca\xeb\xe0\xf1\xf1\xe8\xf7\xe5\xf1\xea\xe8\xe9", u8"\xd5\xf3\xe4\xe8" }
+                local curSkin = cfg.companionSkin or 1
+                local aw6 = imgui.GetContentRegionAvail().x
+                local gap6 = S(8)
+                local bw6 = (aw6 - gap6) / 2
+                local ch6 = S(52)
+                local r6, g6, b6 = getAcc()
+                local dl6 = imgui.GetWindowDrawList()
+                -- считаем позиции карточек вручную по абсолютным экранным
+                -- координатам (без imgui.SameLine): дальше по коду курсор
+                -- внутри каждой карточки временно переставляется, чтобы
+                -- нарисовать иконку/подпись поверх неё, а SameLine брала бы
+                -- размеры этого текста вместо размеров всей карточки
+                local row6 = imgui.GetCursorScreenPos()
+                for i = 1, 2 do
+                    local act6 = (curSkin == i)
+                    local p6 = imgui.ImVec2(row6.x + (i - 1) * (bw6 + gap6), row6.y)
+                    if act6 then
+                        dl6:AddRectFilled(p6, imgui.ImVec2(p6.x+bw6, p6.y+ch6),
+                            imgui.ColorConvertFloat4ToU32(iv4(r6*0.32,g6*0.32,b6*0.32,1.0)), 8)
+                        dl6:AddRect(p6, imgui.ImVec2(p6.x+bw6, p6.y+ch6),
+                            imgui.ColorConvertFloat4ToU32(iv4(r6,g6,b6,0.95)), 8, 0, 1.6)
+                        dl6:AddRectFilled(imgui.ImVec2(p6.x, p6.y+6), imgui.ImVec2(p6.x+3, p6.y+ch6-6),
+                            imgui.ColorConvertFloat4ToU32(iv4(r6,g6,b6,1.0)), 2)
+                    else
+                        dl6:AddRectFilled(p6, imgui.ImVec2(p6.x+bw6, p6.y+ch6),
+                            imgui.ColorConvertFloat4ToU32(iv4(0.16,0.16,0.19,0.95)), 8)
+                        dl6:AddRect(p6, imgui.ImVec2(p6.x+bw6, p6.y+ch6),
+                            imgui.ColorConvertFloat4ToU32(iv4(0.40,0.40,0.46,0.55)), 8, 0, 1.0)
+                    end
+                    -- иконка + подпись, отрисованы поверх карточки после
+                    -- невидимой кнопки (см. ниже) — порядок вызовов imgui
+                    -- определяет порядок отрисовки, поэтому кнопка ставится
+                    -- первой (ловит клик), а текст/иконка вторыми (видны)
+                    imgui.SetCursorScreenPos(p6)
+                    local clicked6 = imgui.InvisibleButton("##compSkinBtn" .. i, imgui.ImVec2(bw6, ch6))
+                    local iconStr6 = ICON_USER .. "  " .. skinNames[i]
+                    local isz6 = imgui.CalcTextSize(iconStr6)
+                    imgui.SetCursorScreenPos(imgui.ImVec2(p6.x + (bw6 - isz6.x) * 0.5, p6.y + (ch6 - isz6.y) * 0.5))
+                    imgui.TextColored(act6 and iv4(1,1,1,1) or iv4(0.75,0.75,0.80,1.0), iconStr6)
+                    if clicked6 then
+                        cfg.companionSkin = i
+                        PCS_CompanionSel.skin = i
+                        PCS_reloadCompanion()
+                        saveCfg()
+                    end
+                end
+                -- возвращаем курсор под весь ряд карточек и регистрируем
+                -- его высоту (imgui.Dummy) для правильного скролла/отступов
+                imgui.SetCursorScreenPos(row6)
+                imgui.Dummy(imgui.ImVec2(aw6, ch6))
+                imgui.Dummy(imgui.ImVec2(0, S(2)))
+            end
+            imgui.Spacing()
             local alphaBufMain = imgui.new("float[1]", {cfg.companionBgAlpha or 0.35})
             imgui.PushItemWidth(S(180))
             if imgui.SliderFloat(u8"\xcf\xf0\xee\xe7\xf0\xe0\xf7\xed\xee\xf1\xf2\xfc##companionAlphaMain",
@@ -8694,14 +12071,75 @@ secTitle(u8"\xd1\xeb\xf3\xf7\xe0\xe9\xed\xfb\xe9\x20\xf6\xe2\xe5\xf2")
             local ctRm = imgui.new("float[1]", {cfg.companionTintR or 1.0})
             local ctGm = imgui.new("float[1]", {cfg.companionTintG or 1.0})
             local ctBm = imgui.new("float[1]", {cfg.companionTintB or 1.0})
-            drawSimpleColorPicker(u8"\xd6\xe2\xe5\xf2\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0",
-                "companionTintMain", ctRm, ctGm, ctBm,
-                "companionTintR", "companionTintG", "companionTintB",
-                nil, 1.0, 1.0, 1.0)
+            if not cfg.companionRainbow then
+                drawSimpleColorPicker(u8"\xd6\xe2\xe5\xf2\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0",
+                    "companionTintMain", ctRm, ctGm, ctBm,
+                    "companionTintR", "companionTintG", "companionTintB",
+                    nil, 1.0, 1.0, 1.0)
+            end
+
+            imgui.Spacing()
+            -- ── по просьбе: тумблер "радужный (переливающийся) персонаж" —
+            -- прямо во вкладке "Настройки" ──
+            do
+                local rbOnM = cfg.companionRainbow and true or false
+                if drawToggleSwitch("##companionRainbowToggleMain", rbOnM) then
+                    cfg.companionRainbow = not rbOnM
+                    saveCfg()
+                end
+                imgui.SameLine(0, S(8))
+                imgui.TextColored(iv4(0.70,0.82,1.0,1.0), u8"\xd0\xe0\xe4\xf3\xe6\xed\xfb\xe9\x20\x28\xef\xe5\xf0\xe5\xeb\xe8\xe2\xe0\xfe\xf9\xe8\xe9\xf1\xff\x29\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6")
+            end
+
+            imgui.Spacing()
+            -- ── по просьбе: тумблер полного отключения обводки персонажа
+            -- на фоне (не только переливания, а самой обводки целиком) ──
+            do
+                local oeOnM = cfg.companionOutlineEnabled ~= false
+                if drawToggleSwitch("##companionOutlineEnabledToggleMain", oeOnM) then
+                    cfg.companionOutlineEnabled = not oeOnM
+                    saveCfg()
+                end
+                imgui.SameLine(0, S(8))
+                imgui.TextColored(iv4(1,1,1,1), u8"\xce\xe1\xe2\xee\xe4\xea\xe0\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0")
+            end
+
+            if cfg.companionOutlineEnabled ~= false then
+                imgui.Spacing()
+                -- ── по просьбе: тумблер "переливающаяся обводка персонажа" ──
+                do
+                    local obOnM = cfg.companionOutlineRainbow ~= false
+                    if drawToggleSwitch("##companionOutlineRainbowToggleMain", obOnM) then
+                        cfg.companionOutlineRainbow = not obOnM
+                        saveCfg()
+                    end
+                    imgui.SameLine(0, S(8))
+                    imgui.TextColored(iv4(0.70,0.82,1.0,1.0), u8"\xcf\xe5\xf0\xe5\xeb\xe8\xe2\xe0\xfe\xf9\xe0\xff\xf1\xff\x20\xee\xe1\xe2\xee\xe4\xea\xe0\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0")
+                end
+
+                imgui.Spacing()
+                -- ── по просьбе: толщина обводки персонажа ──
+                do
+                    local thBufM = imgui.new("float[1]", {cfg.companionOutlineThickness or 1.0})
+                    imgui.PushItemWidth(S(180))
+                    if imgui.SliderFloat(u8"\xd2\xee\xeb\xf9\xe8\xed\xe0\x20\xee\xe1\xe2\xee\xe4\xea\xe8##companionOutlineThicknessMain",
+                            thBufM, 0.3, 3.0) then
+                        cfg.companionOutlineThickness = thBufM[0]
+                        saveCfg()
+                    end
+                    imgui.PopItemWidth()
+                end
+            end
         end
         imgui.Spacing()
         imgui.Dummy(imgui.ImVec2(0, S(9)))
     end
+
+    -- ── всплывающие уведомления (плашки), перенесены из Market Helper ──
+    secTitle(u8"\xc2\xf1\xef\xeb\xfb\xe2\xe0\xfe\xf9\xe8\xe5 \xf3\xe2\xe5\xe4\xee\xec\xeb\xe5\xed\xe8\xff")
+    pcall(PCS_drawToastSettings)
+    imgui.Spacing()
+    imgui.Dummy(imgui.ImVec2(0, S(9)))
 
     -- ── нижний отступ, чтобы последний блок не прилипал к краю окна ──
     imgui.Dummy(imgui.ImVec2(0, S(40)))
@@ -8804,7 +12242,7 @@ local function drawGlobalSettingsPanel()
         -- видна только пока тумблер "Персонаж на фоне" включён, поэтому
         -- карточка становится выше только в этом случае ──
         local companionOnNow = cfg.companionBgEnabled ~= false
-        local cardH = companionOnNow and S(78 + 56) or S(78)
+        local cardH = companionOnNow and S(78 + 56 + 30 + 26 + 26 + 34) or S(78)
         local dl = imgui.GetWindowDrawList()
         local cp = imgui.GetCursorScreenPos()
         dl:AddRectFilled(
@@ -8862,15 +12300,78 @@ local function drawGlobalSettingsPanel()
                 imgui.PopItemWidth()
             end
 
-            imgui.SetCursorPos(imgui.ImVec2(S(170), S(76)))
+            -- цветовой тон-пикер показывается только пока радужный режим
+            -- выключен — пока он включён, статичный тон всё равно не
+            -- применяется (см. отрисовку ниже), показывать его не нужно
+            if not cfg.companionRainbow then
+                imgui.SetCursorPos(imgui.ImVec2(S(170), S(76)))
+                do
+                    local ctR = imgui.new("float[1]", {cfg.companionTintR or 1.0})
+                    local ctG = imgui.new("float[1]", {cfg.companionTintG or 1.0})
+                    local ctB = imgui.new("float[1]", {cfg.companionTintB or 1.0})
+                    drawSimpleColorPicker(u8"\xd6\xe2\xe5\xf2\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0",
+                        "companionTint", ctR, ctG, ctB,
+                        "companionTintR", "companionTintG", "companionTintB",
+                        nil, 1.0, 1.0, 1.0)
+                end
+            end
+
+            -- ── по просьбе: тумблер "радужный (переливающийся) персонаж" —
+            -- цвет фонового персонажа крутится по HSV-кругу вместо
+            -- статичного тона (та же идея, что и у радужной обводки выше) ──
+            imgui.SetCursorPos(imgui.ImVec2(S(10), S(108)))
             do
-                local ctR = imgui.new("float[1]", {cfg.companionTintR or 1.0})
-                local ctG = imgui.new("float[1]", {cfg.companionTintG or 1.0})
-                local ctB = imgui.new("float[1]", {cfg.companionTintB or 1.0})
-                drawSimpleColorPicker(u8"\xd6\xe2\xe5\xf2\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0",
-                    "companionTint", ctR, ctG, ctB,
-                    "companionTintR", "companionTintG", "companionTintB",
-                    nil, 1.0, 1.0, 1.0)
+                local rbOn2 = cfg.companionRainbow and true or false
+                if drawToggleSwitch("##companionRainbowToggle", rbOn2) then
+                    cfg.companionRainbow = not rbOn2
+                    saveCfg()
+                end
+                imgui.SameLine(0, S(8))
+                imgui.TextColored(iv4(0.70,0.82,1.0,1.0), u8"\xd0\xe0\xe4\xf3\xe6\xed\xfb\xe9\x20\x28\xef\xe5\xf0\xe5\xeb\xe8\xe2\xe0\xfe\xf9\xe8\xe9\xf1\xff\x29\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6")
+            end
+
+            -- ── по просьбе: тумблер полного отключения обводки персонажа
+            -- на фоне (не только переливания — вся обводка целиком) ──
+            imgui.SetCursorPos(imgui.ImVec2(S(10), S(134)))
+            do
+                local oeOn = cfg.companionOutlineEnabled ~= false
+                if drawToggleSwitch("##companionOutlineEnabledToggle", oeOn) then
+                    cfg.companionOutlineEnabled = not oeOn
+                    saveCfg()
+                end
+                imgui.SameLine(0, S(8))
+                imgui.TextColored(iv4(1,1,1,1), u8"\xce\xe1\xe2\xee\xe4\xea\xe0\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0")
+            end
+
+            if cfg.companionOutlineEnabled ~= false then
+                -- ── по просьбе: тумблер "переливающаяся обводка персонажа" —
+                -- отдельно от тона самого персонажа; выключает только
+                -- переливание обводки (см. отрисовку в "ПЕРСОНАЖ-КОМПАНЬОН
+                -- НА ФОНЕ" ниже по файлу) — по умолчанию включена ──
+                imgui.SetCursorPos(imgui.ImVec2(S(10), S(160)))
+                do
+                    local obOn = cfg.companionOutlineRainbow ~= false
+                    if drawToggleSwitch("##companionOutlineRainbowToggle", obOn) then
+                        cfg.companionOutlineRainbow = not obOn
+                        saveCfg()
+                    end
+                    imgui.SameLine(0, S(8))
+                    imgui.TextColored(iv4(0.70,0.82,1.0,1.0), u8"\xcf\xe5\xf0\xe5\xeb\xe8\xe2\xe0\xfe\xf9\xe0\xff\xf1\xff\x20\xee\xe1\xe2\xee\xe4\xea\xe0\x20\xef\xe5\xf0\xf1\xee\xed\xe0\xe6\xe0")
+                end
+
+                -- ── по просьбе: толщина обводки персонажа (множитель к
+                -- базовым отступам "ореола"/"кромки") — диапазон 0.3..3.0 ──
+                imgui.SetCursorPos(imgui.ImVec2(S(10), S(190)))
+                do
+                    local thBuf = imgui.new("float[1]", {cfg.companionOutlineThickness or 1.0})
+                    imgui.PushItemWidth(S(150))
+                    if imgui.SliderFloat(u8"\xd2\xee\xeb\xf9\xe8\xed\xe0\x20\xee\xe1\xe2\xee\xe4\xea\xe8##companionOutlineThickness",
+                            thBuf, 0.3, 3.0) then
+                        cfg.companionOutlineThickness = thBuf[0]
+                        saveCfg()
+                    end
+                    imgui.PopItemWidth()
+                end
             end
         end
         imgui.EndChild()
@@ -9130,6 +12631,10 @@ function PCS_newsFetch(force)
         end)
     end
     if N.loading then return end
+    -- FIX: раньше вкладка "О скрипте"/"История версий" при каждом показе
+    -- сама качала changelog.txt из сети (раз в 10 мин), хотя автопроверка
+    -- обновлений выключена. Теперь сеть только по кнопке (force).
+    if not force then return end
     if not force and os.time() - (N.at or 0) < (N.ok and 600 or 90) then return end
     N.loading = true
     N.at = os.time()
@@ -9404,8 +12909,24 @@ function drawAboutInner(h)
             -- больше не перекрывается с текстом
             if PCS_COMPANION_TEX then
                 local icoSzA = bannerH * 0.60
-                imgui.SetCursorPos(imgui.ImVec2(aw_a - icoSzA - SFtext(16), (bannerH - icoSzA)*0.5))
-                imgui.Image(PCS_COMPANION_TEX, imgui.ImVec2(icoSzA, icoSzA))
+                local icoWA, icoHA = PCS_companionFit(icoSzA, icoSzA)
+                imgui.SetCursorPos(imgui.ImVec2(aw_a - icoWA - SFtext(16), (bannerH - icoHA)*0.5))
+                -- ФИКС КРАША: imgui.Image() здесь раньше вызывался БЕЗ pcall —
+                -- если текстура-компаньон стала невалидной (device reset у
+                -- DirectX, например после сворачивания игры/alt-tab/смены
+                -- разрешения — текстуры, созданные через
+                -- CreateTextureFromFileInMemory, при этом НЕ пересоздаются
+                -- автоматически), вызов кидал ошибку-userdata (НЕ строку!),
+                -- которая пролетала напрямую сквозь весь кадр до внешнего
+                -- pcall и закрывала ВСЁ окно с сообщением "ошибка отрисовки
+                -- окна, окно закрыто: userdata: 0x...". Теперь эта отдельная
+                -- декоративная картинка обёрнута в свой pcall: при ошибке
+                -- персонаж просто не рисуется в этом кадре, а текстуру
+                -- помечаем невалидной, чтобы больше не пытаться её
+                -- использовать (и не спамить ошибку каждый кадр) — см.
+                -- PCS_disableCompanionTex() ниже
+                local okImgA = pcall(imgui.Image, PCS_COMPANION_TEX, imgui.ImVec2(icoWA, icoHA))
+                if not okImgA then PCS_disableCompanionTex() end
             end
             imgui.SetCursorPos(imgui.ImVec2(aw_a*0.5 - sz1.x*0.5, SFtext(14)))
             imgui.TextColored(banTitleCol, title1)
@@ -9500,11 +13021,7 @@ function drawAboutInner(h)
                     -- запасной os.execute('start ...'), который может на
                     -- мгновение показать окно cmd.exe
                     local opened = winOpenUrl(tgUrl)
-                    if not opened then
-                        pcall(function()
-                            opened = os.execute('start "" "' .. tgUrl .. '"') ~= nil
-                        end)
-                    end
+                    -- (запасной запуск через os.execute удалён: он открывал окно cmd.exe)
                     pcall(function()
                         if imgui.SetClipboardText then imgui.SetClipboardText(tgHandle) end
                     end)
@@ -9532,11 +13049,7 @@ function drawAboutInner(h)
                     -- ссылку открываем без консоли (WinAPI), запасной вариант —
                     -- os.execute('start ...'); ссылка ещё и копируется в буфер
                     local opened = winOpenUrl(chUrl)
-                    if not opened then
-                        pcall(function()
-                            opened = os.execute('start "" "' .. chUrl .. '"') ~= nil
-                        end)
-                    end
+                    -- (запасной запуск через os.execute удалён: он открывал окно cmd.exe)
                     pcall(function()
                         if imgui.SetClipboardText then imgui.SetClipboardText(chUrl) end
                     end)
@@ -10068,12 +13581,19 @@ function TX.drawLogRow(e)
         imgui.ColorConvertFloat4ToU32(iv4(bgR,bgG,bgB,pcsRowA(0.98))), 4)
 
     local cols = {
-        { w = 0.16, txt = e.time, col = thDim() },
-        { w = 0.28, txt = e.noTax and "--" or fmtMoney(string.format("%.0f", e.amount or 0)),
+        { w = 0.14, txt = e.time, col = thDim() },
+        { w = 0.22, txt = e.noTax and "--" or fmtMoney(string.format("%.0f", e.amount or 0)),
           col = e.noTax and thDim() or thGold() },
-        { w = 0.28, txt = e.auto and u8"\xe0\xe2\xf2\xee\xec\xe0\xf2\xe8\xf7\xe5\xf1\xea\xe8" or u8"\xe2\xf0\xf3\xf7\xed\xf3\xfe", col = thAcc() },
-        { w = 0.28, txt = e.noTax and u8"\xed\xe0\xeb\xee\xe3\xee\xe2\x20\xed\xe5\x20\xe1\xfb\xeb\xee" or u8"\xf3\xf1\xef\xe5\xf8\xed\xee",
-          col = e.noTax and thGold() or thGreen() },
+        { w = 0.24, txt = (e.noTax and u8"\xed\xe5\xf2 \xed\xe0\xeb\xee\xe3\xee\xe2")
+            or ((e.kind == "family") and u8"\xf1\xe5\xec. \xea\xe2\xe0\xf0\xf2\xe8\xf0\xe0")
+            or ((e.kind == "org") and u8"\xee\xf0\xe3\xe0\xed\xe8\xe7\xe0\xf6\xe8\xff")
+            or u8"\xed\xe0\xeb\xee\xe3\xe8",
+          col = (e.kind == "family" and iv4(0.55,0.75,1.0,1.0))
+            or (e.kind == "org" and iv4(0.95,0.55,0.75,1.0))
+            or (e.noTax and thGold() or thGreen()) },
+        { w = 0.18, txt = e.auto and u8"\xe0\xe2\xf2\xee" or u8"\xe2\xf0\xf3\xf7\xed\xf3\xfe", col = thAcc() },
+        { w = 0.22, txt = e.noTax and "--" or u8"\xf3\xf1\xef\xe5\xf8\xed\xee",
+          col = e.noTax and thDim() or thGreen() },
     }
     local x = p.x + S(8)
     for _, c in ipairs(cols) do
@@ -10880,15 +14400,24 @@ end
 local _mainWinBegan = false
 
 imgui.OnFrame(
-    function() return St.winOpen end,
+    -- ФИКС: раньше кадр вообще переставал вызываться в тот же момент,
+    -- когда St.winOpen становился false — окно исчезало мгновенно, и
+    -- тумблер "плавное открытие/закрытие" на закрытие вообще никак не
+    -- влиял. Теперь кадр продолжает рисоваться, пока идёт анимация
+    -- затухания (St._winVisible), и полностью отключается только когда
+    -- она реально доиграна (см. блок "плавное появление главного меню" ниже)
+    function() return St.winOpen or St._winVisible end,
     function(self)
         St._gMain = PCS_GUARD.snap()
         local _okFrame, _errFrame = pcall(function()
-        if St.winOpen then
+        if St.winOpen or St._winVisible then
         -- FIX: сбрасываем счётчики уникальных ID в начале каждого кадра
         St._metricTileIdx = 0
         St._chipIdx = 0
         St.chipSide = false
+        -- снимок курсов всех валют для графика "Курс валют" (см. CH выше);
+        -- сам троттлится до раза в 3 минуты, поэтому дёшево дёргать каждый кадр
+        pcall(CH.add)
 
         -- ── горячая клавиша открытия/закрытия меню: пока окно скрипта
         -- ОТКРЫТО, mimgui сам активно перехватывает клавиатуру
@@ -11029,6 +14558,68 @@ imgui.OnFrame(
             end
         end
 
+        -- плавное появление/скрытие главного меню (альфа + лёгкий сдвиг) —
+        -- по просьбе: раньше тумблер "Плавное открытие/закрытие меню"
+        -- почти не был заметен (менялась только прозрачность ФОНА окна,
+        -- а весь текст/кнопки появлялись мгновенно на полной яркости, и
+        -- закрытие вообще не анимировалось — окно исчезало в тот же кадр,
+        -- когда St.winOpen становился false, см. imgui.OnFrame выше).
+        -- Теперь: (1) на закрытии кадр продолжает рисоваться, пока анимация
+        -- не доиграна (St._winVisible), (2) заодно с альфой фона плавно
+        -- затухает/появляется ВЕСЬ контент окна (PushStyleVar Alpha ниже,
+        -- см. пару с PopStyleVar перед imgui.End), (3) окно ещё и слегка
+        -- сдвигается вниз при открытии/вверх при закрытии, а не просто
+        -- меняет прозрачность на месте.
+        local menuFadeAlpha = 1.0
+        do
+            local target = St.winOpen and 1.0 or 0.0
+            if cfg.smoothMenuAnim == false then
+                St._menuOpenAnim = target
+            else
+                local tnow = os.clock()
+                if not St._menuOpenAnimT then St._menuOpenAnimT = tnow end
+                local dt = tnow - St._menuOpenAnimT
+                St._menuOpenAnimT = tnow
+                if dt < 0 or dt > 0.5 then dt = 0.016 end
+                local sp = 8.0
+                if (St._menuOpenAnim or 0) < target then
+                    St._menuOpenAnim = math.min(target, (St._menuOpenAnim or 0) + dt * sp)
+                elseif (St._menuOpenAnim or 0) > target then
+                    St._menuOpenAnim = math.max(target, (St._menuOpenAnim or 0) - dt * sp)
+                end
+            end
+            local a = St._menuOpenAnim or 1.0
+            menuFadeAlpha = a
+            if a < 0.999 then
+                pcall(function() imgui.SetNextWindowBgAlpha(0.92 * a) end)
+                -- лёгкий сдвиг по вертикали, привязанный к "домашней"
+                -- позиции окна (тот же анти-дрейф приём, что и у сдвига
+                -- панели "Финансы" выше — якорь берём один раз за цикл
+                -- открытия/закрытия, а не от позиции прошлого кадра)
+                if St._mainWinPos then
+                    if not St._menuSlideAnchor then
+                        St._menuSlideAnchor = { x = St._mainWinPos.x, y = St._mainWinPos.y }
+                    end
+                    local slidePx = S(26) * (1 - a)
+                    imgui.SetNextWindowPos(imgui.ImVec2(St._menuSlideAnchor.x, St._menuSlideAnchor.y + slidePx), imgui.Cond.Always)
+                end
+            else
+                St._menuSlideAnchor = nil
+            end
+            -- закрытие полностью доиграно — теперь можно по-настоящему
+            -- убрать окно из рендера (St._winVisible=false отключит сам
+            -- imgui.OnFrame) и выполнить отложенный сброс activeTab/
+            -- _sw_win_init из forceCloseMenuNow (см. комментарий там)
+            if target < 0.5 and a < 0.01 then
+                if St._pendingCloseReset then
+                    St.activeTab = 1
+                    _sw_win_init = nil
+                    St._pendingCloseReset = false
+                end
+                St._winVisible = false
+            end
+        end
+
         applyStyle()
         -- Š¼Š°Ń�Ń�Ń‚Š°Š± Ń�Ń€ŠøŃ„Ń‚Š°: ŠæŃ€ŠøŠ¼ŠµŠ½Ń¸ŠµŠ¼ Ń‡ŠµŃ€ŠµŠ· SetWindowFontScale ŠæŠ¾Ń�Š»Šµ Begin
         -- Š¯Š° Š�Š� Š¾ŠŗŠ½Š¾ Š¼Š¾Š¶Š½Š¾ Š´Š²ŠøŠ³Š°Ń‚Ń� Šø Š¼ŠµŠ½Ń¸Ń‚Ń� Ń€Š°Š·Š¼ŠµŃ€ Š¼Ń‹Ń�ŠŗŠ¾Š¹ (Š½Š° Š¼Š¾Š±ŠøŠ»Šµ Ń¨Ń‚Š¾
@@ -11038,7 +14629,26 @@ imgui.OnFrame(
         imgui.Begin("###sw", nil, flags)
         _mainWinBegan = true
         PCS_GUARD.mark("frame: Begin ok")
+        -- ФИКС КРАША при смене персонажа: переносим подготовленную новую
+        -- текстуру персонажа в боевую переменную здесь, в самом начале
+        -- кадра, ДО первой отрисовки персонажа на фоне — см. комментарий
+        -- у PCS_COMPANION_TEX_PENDING рядом с loadCompanionTexture()
+        pcall(PCS_applyPendingCompanionTex)
         imgui.SetWindowFontScale(St.UI_SCALE * (cfg.fontSize > 0 and cfg.fontSize or 1.25))
+
+        -- ФИКС: раньше при открытии/закрытии плавно менялась только
+        -- прозрачность ФОНА окна (SetNextWindowBgAlpha выше) — весь текст
+        -- и кнопки внутри оставались полностью непрозрачными с первого же
+        -- кадра, из-за чего тумблер "Плавное открытие/закрытие" был почти
+        -- незаметен. Теперь весь контент окна тоже плавно проявляется —
+        -- обязательно снимается перед imgui.End() ниже (см. _svMenuFade),
+        -- и корректно "размотается" через PCS_GUARD даже при ошибке внутри
+        local _svMenuFade = 0
+        if menuFadeAlpha < 0.999 then
+            if pcall(imgui.PushStyleVar, imgui.StyleVar.Alpha, math.max(0.02, menuFadeAlpha)) then
+                _svMenuFade = 1
+            end
+        end
 
         -- ── ПЕРСОНАЖ-КОМПАНЬОН НА ФОНЕ (по просьбе) — рисуется одним из
         -- первых вызовов кадра, поэтому остаётся визуально "под" всем
@@ -11046,26 +14656,98 @@ imgui.OnFrame(
         -- Тумблер — карточка профиля → "Персонаж на фоне"
         -- (cfg.companionBgEnabled); по умолчанию вкл ──
         if PCS_COMPANION_TEX and cfg.companionBgEnabled ~= false then
-            pcall(function()
+            local okImgBg = pcall(function()
                 local dlBg = imgui.GetWindowDrawList()
                 local wpBg = imgui.GetWindowPos()
                 local wsBg = imgui.GetWindowSize()
-                local sizeBg = math.min(wsBg.x, wsBg.y) * 0.62
+                local sizeBg = math.min(wsBg.x, wsBg.y) * 0.46 -- было 0.62: персонаж стал меньше и влезает в меню
                 local cx = wpBg.x + wsBg.x * 0.5
                 local cy = wpBg.y + wsBg.y * 0.5
                 -- прозрачность и цветовой тон теперь настраиваются
                 -- (cfg.companionBgAlpha / cfg.companionTintR/G/B) —
                 -- см. тумблер "Персонаж на фоне" в панели настроек
                 local cbAlpha = cfg.companionBgAlpha or 0.35
-                local cbTintR = cfg.companionTintR or 1.0
-                local cbTintG = cfg.companionTintG or 1.0
-                local cbTintB = cfg.companionTintB or 1.0
+                local cbTintR, cbTintG, cbTintB
+                if cfg.companionRainbow then
+                    -- та же схема "переливания", что и у радужной обводки
+                    -- (cfg.rainbowBorder) выше по файлу — крутим HSV-круг
+                    -- по os.clock(), период 4 секунды
+                    local hue = (os.clock() % 4.0) / 4.0
+                    cbTintR, cbTintG, cbTintB = hsv2rgb(hue, 0.75, 1.0)
+                else
+                    cbTintR = cfg.companionTintR or 1.0
+                    cbTintG = cfg.companionTintG or 1.0
+                    cbTintB = cfg.companionTintB or 1.0
+                end
+                -- ── по просьбе: обводка ИМЕННО ПО ФОРМЕ самого персонажа
+                -- (а не круг вокруг него) — стандартный приём для 2D-
+                -- спрайтов с прозрачностью: та же текстура рисуется
+                -- несколько раз со сдвигом по кругу, закрашенная цветом
+                -- обводки (цвет полностью перекрывает пиксель, alpha
+                -- берётся из текстуры) — получившийся "ореол" повторяет
+                -- силуэт персонажа. Рисуется ПОД настоящим персонажем,
+                -- поэтому сверху остаётся обычная (тонированная) картинка.
+                -- Тумблер "Переливающаяся обводка персонажа"
+                -- (cfg.companionOutlineRainbow) гасит только переливание —
+                -- обводка остаётся видна статичным акцентным цветом ──
+                -- ── по просьбе: тумблер "Обводка персонажа" —
+                -- (cfg.companionOutlineEnabled) отключает обводку целиком,
+                -- отдельно от переливания и толщины ──
+                local halfBgW, halfBgH = PCS_companionFit(sizeBg, sizeBg)
+                if (PCS_COMPANION_ASPECT or 1) < 1 then
+                    halfBgH = math.min(wsBg.y * 0.64, sizeBg * 1.5) -- высокий персонаж (худи): было 0.92 высоты окна
+                    halfBgW = halfBgH * PCS_COMPANION_ASPECT
+                end
+                halfBgW, halfBgH = halfBgW * 0.5, halfBgH * 0.5
+                if cfg.companionOutlineEnabled ~= false then
+                    local obR, obG, obB
+                    if cfg.companionOutlineRainbow ~= false then
+                        local hue2 = (os.clock() % 5.0) / 5.0
+                        obR, obG, obB = hsv2rgb(hue2, 0.80, 1.0)
+                    else
+                        obR, obG, obB = getAcc()
+                    end
+                    local obAlpha = math.min(1.0, cbAlpha + 0.45)
+                    local outlineU  = imgui.ColorConvertFloat4ToU32(iv4(obR, obG, obB, obAlpha))
+                    local outlineU2 = imgui.ColorConvertFloat4ToU32(iv4(obR, obG, obB, obAlpha * 0.45))
+                    -- ── по просьбе: толщина обводки — множитель к базовым
+                    -- отступам "ореола"/"кромки" (cfg.companionOutlineThickness,
+                    -- 1.0 = как было раньше) ──
+                    local obThick = cfg.companionOutlineThickness or 1.0
+                        local DIRS = 12
+                        -- мягкое внешнее свечение (побольше сдвиг, слабее альфа)
+                        local offGlow = S(6) * obThick
+                        for i = 0, DIRS - 1 do
+                            local rad = (i / DIRS) * math.pi * 2
+                            local dx, dy = math.cos(rad) * offGlow, math.sin(rad) * offGlow
+                            dlBg:AddImage(PCS_COMPANION_TEX,
+                                imgui.ImVec2(cx - halfBgW + dx, cy - halfBgH + dy),
+                                imgui.ImVec2(cx + halfBgW + dx, cy + halfBgH + dy),
+                                imgui.ImVec2(0, 0), imgui.ImVec2(1, 1), outlineU2)
+                        end
+                        -- чёткая тонкая обводка вплотную к силуэту
+                        local offEdge = S(2.5) * obThick
+                        for i = 0, DIRS - 1 do
+                            local rad = (i / DIRS) * math.pi * 2
+                            local dx, dy = math.cos(rad) * offEdge, math.sin(rad) * offEdge
+                            dlBg:AddImage(PCS_COMPANION_TEX,
+                                imgui.ImVec2(cx - halfBgW + dx, cy - halfBgH + dy),
+                                imgui.ImVec2(cx + halfBgW + dx, cy + halfBgH + dy),
+                                imgui.ImVec2(0, 0), imgui.ImVec2(1, 1), outlineU)
+                        end
+                end
+
                 dlBg:AddImage(PCS_COMPANION_TEX,
-                    imgui.ImVec2(cx - sizeBg * 0.5, cy - sizeBg * 0.5),
-                    imgui.ImVec2(cx + sizeBg * 0.5, cy + sizeBg * 0.5),
+                    imgui.ImVec2(cx - halfBgW, cy - halfBgH),
+                    imgui.ImVec2(cx + halfBgW, cy + halfBgH),
                     imgui.ImVec2(0, 0), imgui.ImVec2(1, 1),
                     imgui.ColorConvertFloat4ToU32(iv4(cbTintR, cbTintG, cbTintB, cbAlpha)))
             end)
+            -- ФИКС КРАША: раньше эта ошибка молча проглатывалась и ничего
+            -- не делала — текстура оставалась "мёртвой", и pcall отрабатывал
+            -- вхолостую каждый кадр. Теперь при неудаче явно чистим/пробуем
+            -- перезагрузить текстуру — см. PCS_disableCompanionTex() выше
+            if not okImgBg then PCS_disableCompanionTex() end
         end
 
         -- закрытие главного меню по Esc теперь целиком в onKeyDown() —
@@ -11100,8 +14782,15 @@ imgui.OnFrame(
                 -- персонажа ниже по окну ──
                 if PCS_COMPANION_TEX then
                     local icoSz = th0 - S(4)
-                    imgui.SetCursorPos(imgui.ImVec2(S(6), (th0 - icoSz) * 0.5))
-                    imgui.Image(PCS_COMPANION_TEX, imgui.ImVec2(icoSz, icoSz))
+                    local icoW, icoH = PCS_companionFit(icoSz, icoSz)
+                    imgui.SetCursorPos(imgui.ImVec2(S(6), (th0 - icoH) * 0.5))
+                    -- ФИКС: раньше ошибка здесь тихо проглатывалась внешним
+                    -- pcall без восстановления — мёртвая текстура так и
+                    -- оставалась мёртвой навсегда. Теперь как и в двух
+                    -- других местах отрисовки персонажа: при неудаче зовём
+                    -- PCS_disableCompanionTex()
+                    local okImgTb = pcall(imgui.Image, PCS_COMPANION_TEX, imgui.ImVec2(icoW, icoH))
+                    if not okImgTb then PCS_disableCompanionTex() end
                 end
 
                 local titleStr = u8"  PC Stats  v" .. SCRIPT_VER
@@ -11433,6 +15122,39 @@ local _okSC, _errSC = pcall(function()
         local bottomBarH = (St.activeTab == 5) and (46 + S(50)) or 46
         local contentH = imgui.GetContentRegionAvail().y - bottomBarH - 20
 
+        -- ФИКС: тумблер "Плавный переход по вкладкам" (cfg.smoothTabAnim)
+        -- сохранялся в конфиг и рисовался в Настройках, но НИГДЕ в файле
+        -- больше не читался — переключение вкладок не анимировалось вообще,
+        -- поэтому тумблер визуально ничего не менял. Теперь при смене
+        -- St.activeTab контент вкладки плавно проявляется (Alpha) и слегка
+        -- "всплывает" снизу — то же безопасное PushStyleVar/PopStyleVar
+        -- в паре, что и у затухания меню выше, размотается через PCS_GUARD
+        -- даже если что-то внутри вкладки бросит ошибку.
+        local _svTabFade = 0
+        do
+            if St._tabAnimActiveTab ~= St.activeTab then
+                St._tabAnimActiveTab = St.activeTab
+                St._tabAnimT = 0.0
+            end
+            if cfg.smoothTabAnim == false or cfg.animAllOff == true then
+                St._tabAnimT = 1.0
+            else
+                local tnowTA = os.clock()
+                if not St._tabAnimLastT then St._tabAnimLastT = tnowTA end
+                local dtTA = tnowTA - St._tabAnimLastT
+                St._tabAnimLastT = tnowTA
+                if dtTA < 0 or dtTA > 0.5 then dtTA = 0.016 end
+                St._tabAnimT = math.min(1.0, (St._tabAnimT or 1.0) + dtTA * 6.0)
+            end
+            local taA = St._tabAnimT or 1.0
+            if taA < 0.999 then
+                if pcall(imgui.PushStyleVar, imgui.StyleVar.Alpha, math.max(0.05, taA)) then
+                    _svTabFade = 1
+                end
+                imgui.Dummy(imgui.ImVec2(0, (1 - taA) * S(12)))
+            end
+        end
+
         if St.activeTab == 4 then
             drawSettings(contentH, sw, sh)
         elseif St.activeTab == 5 then
@@ -11441,6 +15163,8 @@ local _okSC, _errSC = pcall(function()
             drawTaxes(contentH)
         elseif St.activeTab == 7 then
             PCS_drawGuardTab(contentH)
+        elseif St.activeTab == 8 then
+            PCS_REM.draw(contentH)
         elseif St.activeTab == 3 and St.statsData then
             drawTotal(St.statsData, contentH)
         elseif not St.statsData then
@@ -11459,6 +15183,11 @@ local _okSC, _errSC = pcall(function()
             elseif St.activeTab == 2 then drawBattle(s, contentH)
             end
         end
+
+        -- снимаем затухание вкладки СРАЗУ после её контента — до конца
+        -- секции ниже (кнопки "Закрыть"/"Обновить" и т.п. уже не мигают
+        -- вместе с контентом, что смотрится аккуратнее)
+        if _svTabFade > 0 then pcall(imgui.PopStyleVar, _svTabFade) end
 
         imgui.Spacing()
         if St.activeTab == 4 then
@@ -11535,6 +15264,10 @@ local _okSC, _errSC = pcall(function()
                         pcall(sampAddChatMessage, "{FFAA00}[Stats] \xe2\x9a\xa0\xef\xb8\x8f \xea\xf3\xf0\xf1\xfb \xe2\xe0\xeb\xfe\xf2 \xf1\xe1\xf0\xee\xf8\xe5\xed\xfb \xea \xe7\xed\xe0\xf7\xe5\xed\xe8\xff\xec \xef\xee \xf3\xec\xee\xeb\xf7\xe0\xed\xe8\xfe", -1)
                     end
                     imgui.PopStyleColor(3)
+                elseif St.activeTab == 8 then
+                    if PCS_gdButton(PCS_IC.trash .. u8"  \xce\xf7\xe8\xf1\xf2\xe8\xf2\xfc \xe2\xfb\xef\xee\xeb\xed\xe5\xed\xed\xfb\xe5##remClearBottom", bw, S(40), { 0.90, 0.50, 0.20 }, 8.0) then
+                        PCS_REM.clearDone()
+                    end
                 elseif St.activeTab == 7 then
                     -- Вкладка "Охранник": обновить список охранников из инвентаря
                     imgui.PushStyleColor(imgui.Col.Button,        iv4(r4*0.18,g4*0.18,b4*0.18,1.0))
@@ -11579,13 +15312,19 @@ end) -- конец pcall для "##sectionContent"
             local okS, s = pcall(imgui.GetWindowSize)
             if okP and okS then St._mainWinPos, St._mainWinSize = p, s end
         end
+        -- снимаем PushStyleVar(Alpha) для затухания контента, поставленный
+        -- сразу после imgui.Begin() выше (см. _svMenuFade) — обязательно
+        -- ДО imgui.End(), иначе стек стилей ImGui останется несбалансирован
+        if _svMenuFade > 0 then pcall(imgui.PopStyleVar, _svMenuFade) end
         imgui.End()
         _mainWinBegan = false
 
         PCS_GUARD.callr(drawFinanceSettingsPanel)
+        PCS_GUARD.callr(PCS_drawChartPanel)
+        PCS_GUARD.callr(PCS_drawCalcPanel) -- по просьбе: калькулятор валют
         PCS_GUARD.callr(drawGlobalSettingsPanel)
         PCS_GUARD.callr(drawProfilePopup) -- п.6/14: тонкая карточка ник/ЗП/сервер/итого
-        PCS_GUARD.callr(drawCloseConfirmPopup) -- п.12: подтверждение закрытия при изменённых настройках
+        PCS_GUARD.callr(drawCloseConfirmPopup) -- п.12: подтверждение закрытия
         -- ФИКС КРАША "оплатил налог → сразу другая вкладка" (усилено):
         -- popup'ы календаря/журнала оплат теперь всегда навещаются здесь,
         -- вне зависимости от того, активна ли сейчас вкладка "Налоги" —
@@ -11607,6 +15346,8 @@ end) -- конец pcall для "##sectionContent"
             -- сбрасываем состояние окна и пересчёт размеров, чтобы при
             -- следующем открытии окно не унаследовало сломанное состояние
             St.winOpen = false
+            St._winVisible = false -- аварийное закрытие: без анимации, сразу
+            St._pendingCloseReset = false
             _sw_win_init = nil
             pcall(sampAddChatMessage,
                 "{FF6666}[PC Stats] \xe2\x9a\xa0\xef\xb8\x8f " ..
@@ -11676,6 +15417,7 @@ local function finalize()
     local raw=table.concat(lines,"\n")
     if raw~="" then
         St.statsData=parseStats(raw)
+        pcall(function() if PCS_SITE and PCS_SITE.onStatsReady then PCS_SITE.onStatsReady() end end)
         St.statusMsg=u8"\xc3\xee\xf2\xee\xe2\xee"
     else
         St.statusMsg=u8"\xcd\xe5\xf2 \xe4\xe0\xed\xed\xfb\xf5"
@@ -11691,9 +15433,18 @@ end
 function sampev.onShowDialog(id, style, title, btn1, btn2, text)
     PCS_GUARD.mark("onShowDialog id=" .. tostring(id))
     -- ── AIS (охоронці): якщо обробили діалог — не йдемо в податки ──
+    -- ФИКС: раньше AIS.onShowDialog вызывалась БЕЗ pcall — необработанная
+    -- ошибка внутри неё (например, при разборе диалога охранников) рвала
+    -- весь sampev.onShowDialog и дальше он не доходил до логики налогов
+    -- ниже по функции. Теперь ошибка внутри AIS-части не мешает остальной
+    -- части обработчика диалогов.
     if AIS and AIS.onShowDialog then
-        local aisRet = AIS.onShowDialog(id, style, title, btn1, btn2, text)
-        if aisRet == false then return false end
+        local aisOk, aisRet = pcall(AIS.onShowDialog, id, style, title, btn1, btn2, text)
+        if not aisOk then
+            print("[PC Stats/guard] onShowDialog(AIS) error: " .. tostring(aisRet))
+        elseif aisRet == false then
+            return false
+        end
     end
     -- ── автоматизация оплаты налогов (см. payTaxesNow) ──
     -- ФИКС (по жалобе "открывает телефон и диалог, но не жмёт Оплатить"):
@@ -12003,6 +15754,7 @@ function sampev.onShowDialog(id, style, title, btn1, btn2, text)
                 -- Ń�ŠŗŃ€Ń‹Š²Š°ŠµŠ¼ Š´ŠøŠ°Š»Š¾Š³ ŠµŃ�Š»Šø Ń�ŠŗŃ€ŠøŠæŃ‚ Ń�Š°Š¼ ŠµŠ³Š¾ Š·Š°ŠæŃ€Š¾Ń�ŠøŠ»
                 if St.waitingStats then isStatsDialog = true end
                 St.statsData       = parseStats(cleaned)
+                pcall(function() if PCS_SITE and PCS_SITE.onStatsReady then PCS_SITE.onStatsReady() end end)
                 St.statusMsg       = u8"\xc3\xee\xf2\xee\xe2\xee"
                 St.waitingStats    = false
                 tdCollector     = {}
@@ -12021,7 +15773,41 @@ end
 -- сумму..." (своя оплата) — нужно, чтобы знать точное время/сумму
 -- последней оплаты налогов, даже если игрок оплатил вручную из игры,
 -- а не через кнопку/автооплату скрипта ──
+-- ФИКС "[Ошибка] У вас открыт мобильный телефон!" (постоянный спам в чат):
+-- раньше скрипт узнавал об этой ошибке только косвенно (по таймаутам),
+-- поэтому после неё почти сразу пробовал снова открыть телефон (автообновление
+-- курса по таймеру / автооплата налогов) — сервер тут же присылал ту же
+-- ошибку снова, и так по кругу, отсюда и "постоянно пишет в чате". Теперь
+-- ловим именно этот ответ сервера напрямую: сбрасываем ВСЕ внутренние
+-- состояния телефона (курсы и налоги), закрываем то, что могло зависнуть
+-- на клиенте, и на несколько секунд ставим St._phoneCooldownUntil — за это
+-- время ни одна из веток скрипта (fetchRatesViaCEF / payTaxesNow) сама
+-- телефон не трогает, см. guard'ы в начале этих функций.
+function pcsHandlePhoneBusyServerError(text)  -- глобальная (см. фикс "200 local variables")
+    local clean = stripColor(tostring(text or ""))
+    local low = cp1251Lower(clean)
+    if not (low:find("\xee\xf8\xe8\xe1\xea", 1, true)) then return false end
+    if not (low:find("\xf2\xe5\xeb\xe5\xf4\xee\xed", 1, true)) then return false end
+    if not (low:find("\xee\xf2\xea\xf0\xfb\xf2", 1, true) or low:find("\xe7\xe0\xed\xff\xf2", 1, true)) then return false end
+
+    _phoneOpBusy      = false
+    St._phoneOpBusySince = nil
+    _cefFetching      = false
+    _phoneFetchState  = false
+    _taxState         = 0
+    _taxExpectedDialogId = nil
+    _taxPhoneAlreadyOpen = false
+
+    St._phoneCooldownUntil = os.time() + 6
+
+    pcall(sampCloseCurrentDialog, -1)
+
+    return true
+end
+
 function sampev.onServerMessage(color, text)
+    pcall(pcsHandlePhoneBusyServerError, text)
+
     -- ── учёт дохода PayDay: копим строки блока в буфер, флашим через 600мс
     -- тишины (см. PD.onLine/PD.flush выше). Работает независимо от
     -- блока оплаты налогов ниже, поэтому вынесено в отдельный pcall ──
@@ -12101,7 +15887,7 @@ function sampev.onServerMessage(color, text)
                     local n = tostring(raw):gsub("%s+", ""):gsub("%.", ""):gsub(",", "")
                     amount = tonumber(n) or 0
                 end
-                if TX and TX.addEntry then TX.addEntry(false, amount, amount <= 0) end
+                if TX and TX.addEntry then TX.addEntry(false, amount, amount <= 0, "family") end
                 if amount > 0 then
                     cfg.taxLastPayAmount = amount
                     cfg.taxLastPayTime = os.time()
@@ -12109,7 +15895,32 @@ function sampev.onServerMessage(color, text)
                 end
                 pcall(sampAddChatMessage, "{00FF88}[PC Stats] Family apt tax log: " .. tostring(amount), -1)
             end
+        
+    -- оплата налогов организации (чат [Organization]/ и т.п.)
+    pcall(function()
+        local t = tostring(text or "")
+        local low = cp1251Lower(stripColor(t))
+        local isOrg = (t:find("%[Org") or t:find("%[ORG") or low:find("\xee\xf0\xe3\xe0\xed\xe8\xe7", 1, true))
+            and (low:find("\xed\xe0\xeb\xee\xe3", 1, true) or low:find("\xee\xef\xeb\xe0\xf2", 1, true))
+        if isOrg then
+            local amount = TX.extractChatAmount(stripColor(t))
+            if amount <= 0 then
+                local raw = t:match("([%d][%d%., ]*[%d])")
+                if raw then
+                    local n = tostring(raw):gsub("%s+", ""):gsub("%.", ""):gsub(",", "")
+                    amount = tonumber(n) or 0
+                end
+            end
+            if TX and TX.addEntry then TX.addEntry(false, amount, amount <= 0, "org") end
+            if amount > 0 then
+                cfg.taxLastPayAmount = amount
+                cfg.taxLastPayTime = os.time()
+                pcall(saveCfg)
+            end
+            pcall(sampAddChatMessage, "{00FF88}[PC Stats] Org tax log: " .. tostring(amount), -1)
         end
+    end)
+end
     end)
 
         if AIS and AIS.onServerMessage then
@@ -12307,6 +16118,7 @@ function main()
             return
         end
         St.winOpen = true
+        St._winVisible = true
         -- по просьбе: с этого момента (первое открытие меню в сессии)
         -- уведомления включаются и остаются включёнными до перезапуска
         -- скрипта, даже после закрытия меню
@@ -12326,7 +16138,14 @@ function main()
             end
         end
         PCS_GUARD.mark("toggleMenuWindow: open")
-        requestStats()
+        -- FIX: раньше при КАЖДОМ открытии меню безусловно слался /stats,
+        -- даже когда тумблер "Авто-обновление" выключен. Теперь: тумблер
+        -- выключен -> запрос только если данных ещё нет вообще (первое
+        -- открытие за сессию), дальше только кнопкой "Обновить".
+        lastAutoTime = now()
+        if cfg.autoRefresh or not St.statsData then
+            requestStats()
+        end
         PCS_GUARD.mark("toggleMenuWindow: requestStats returned")
     end
 
@@ -12355,6 +16174,7 @@ function main()
 
     -- ── команда чата для ручной оплаты налогов (по просьбе) ──
     pcall(sampRegisterChatCommand, "paytax", function() payTaxesThenHotel(false) end)
+    pcall(function() PCS_REM.load(); PCS_REM.registerCmd(); PCS_REM.start() end)
 
     -- ── команда самообновления: "/pcsupdate" — проверить версию на
     -- сервере, "/pcsupdate install" — скачать актуальную версию и
@@ -12366,6 +16186,34 @@ function main()
             pcsInstallUpdate()
         else
             pcsCheckForUpdate(false)
+        end
+    end)
+
+    -- синхронізація з сайтом (pcs_backend.py)
+    pcall(function()
+        if PCS_SITE and PCS_SITE.startLoop then PCS_SITE.startLoop() end
+    end)
+    pcall(sampRegisterChatCommand, "pcsite", function(arg)
+        arg = tostring(arg or ""):lower():gsub("%s+", "")
+        if arg == "off" then
+            cfg.siteSyncEnabled = false
+            pcall(saveCfg)
+            pcall(sampAddChatMessage, "{FFAA00}[PC Stats] site sync OFF", -1)
+        elseif arg == "on" then
+            cfg.siteSyncEnabled = true
+            pcall(saveCfg)
+            pcall(sampAddChatMessage, "{00FF88}[PC Stats] site sync ON", -1)
+        elseif arg == "now" then
+            pcall(function()
+                if PCS_SITE then
+                    PCS_SITE.sendPresence(true)
+                    PCS_SITE.sendMoney(true)
+                    PCS_SITE.sendRates(true)
+                end
+            end)
+            pcall(sampAddChatMessage, "{00FF88}[PC Stats] site sync now", -1)
+        else
+            pcall(sampAddChatMessage, "{66CCFF}[PC Stats] /pcsite on|off|now | " .. tostring(cfg.siteApiUrl or ""), -1)
         end
     end)
 
@@ -12413,6 +16261,7 @@ function main()
     -- (не дефолтная) команда открытия меню — по просьбе: "если игрок
     -- сменил команду и перезашёл, чтобы приходило уведомление в чат"
     if _restoredMenuCmd then
+        PCS_NO_TOAST_ONCE = true
         pcall(sampAddChatMessage, "{00FF88}[PC Stats] \xf0\x9f\x94\x93 " ..
             "\xc2\xee\xf1\xf1\xf2\xe0\xed\xee\xe2\xeb\xe5\xed\xe0\x20\xea\xee\xec\xe0\xed\xe4\xe0\x20\xee\xf2\xea\xf0\xfb\xf2\xe8\xff\x20\xec\xe5\xed\xfe: /" .. tostring(_registeredMenuCmd or cfg.menuOpenCmd), -1)
     end
@@ -12444,8 +16293,15 @@ function main()
                 fetchArzWikiRates(true)
             end
         end)
+        local _startCmd = tostring(_registeredMenuCmd or cfg.menuOpenCmd or "sw")
+        PCS_NO_TOAST_ONCE = true
         pcall(sampAddChatMessage,
-            "{00FF88}[MSW v" .. SCRIPT_VER .. "] {FFFFFF}PC Stats | Cmd: {00FF88}/sw", -1)
+            "{00FF88}[MSW v" .. SCRIPT_VER .. "] {FFFFFF}PC Stats | Cmd: {00FF88}/" .. _startCmd, -1)
+        pcall(function()
+            if type(pcs_notify) == "function" then
+                pcs_notify(u8"\xd1\xea\xf0\xe8\xef\xf2\x20\xf3\xf1\xef\xe5\xf8\xed\xee\x20\xe7\xe0\xef\xf3\xf9\xe5\xed\x21\x20\x20\xca\xee\xec\xe0\xed\xe4\xe0\x3a\x20\x2f" .. _startCmd, "success", 9)
+            end
+        end)
     end)
 
     -- ── оплата при входе: ждём ровно 1 минуту после спавна и сами
@@ -12565,6 +16421,10 @@ function main()
                 end
             end
 
+            if St._cfgDirtyAt and os.clock() - St._cfgDirtyAt > 0.6 then
+                PCS_saveCfgFlush()
+            end
+
             if cfg.autoRefresh and St.winOpen and St.statsData then
                 if now() - lastAutoTime >= cfg.autoInterval then
                     lastAutoTime = now()
@@ -12613,9 +16473,266 @@ function main()
     end
 end
 
+
+
+-- ============================================================
+--  PCS_SITE — відправка даних на сайт (pcs_backend.py)
+-- ============================================================
+PCS_SITE = {
+    lastMoney = 0,
+    lastRates = 0,
+    lastPresence = 0,
+    moneyInterval = 120,
+    ratesInterval = 60,
+    presenceInterval = 180,
+}
+
+function PCS_SITE.baseUrl()
+    if not cfg or cfg.siteSyncEnabled == false then return nil end
+    local u = tostring(cfg.siteApiUrl or ""):gsub("%s+", ""):gsub("/+$", "")
+    if u == "" then return nil end
+    return u
+end
+
+function PCS_SITE.serverName()
+    local name = ""
+    pcall(function()
+        if type(getCurrentServerName) == "function" then
+            name = tostring(getCurrentServerName() or "")
+        end
+    end)
+    if name == "" then
+        pcall(function()
+            if type(sampGetCurrentServerName) == "function" then
+                name = tostring(sampGetCurrentServerName() or "")
+            end
+        end)
+    end
+    if name == "" then name = tostring(cfg and cfg.vcServerName or "Arizona RP") end
+    return name
+end
+
+function PCS_SITE.playerName()
+    local n = ""
+    pcall(function()
+        if St and St.statsData and St.statsData.name and St.statsData.name ~= "" then
+            n = tostring(St.statsData.name)
+        end
+    end)
+    if n == "" then
+        pcall(function()
+            if sampGetPlayerIdByCharHandle and sampGetPlayerNickname and PLAYER_PED then
+                local ok, id = pcall(sampGetPlayerIdByCharHandle, PLAYER_PED)
+                if ok and id then n = tostring(sampGetPlayerNickname(id) or "") end
+            end
+        end)
+    end
+    return n
+end
+
+function PCS_SITE.parseMoney(s)
+    if not s or s == "" then return 0 end
+    local t = tostring(s):gsub("%s+", ""):gsub("%.", ""):gsub(",", "")
+    t = t:gsub("[^%d%-]", "")
+    return tonumber(t) or 0
+end
+
+function PCS_SITE.post(path, payload)
+    local base = PCS_SITE.baseUrl()
+    if not base then return false, "disabled" end
+    local url = base .. path
+    local body
+    if type(encodeJson) == "function" then
+        local okj, jb = pcall(encodeJson, payload)
+        if okj and type(jb) == "string" then body = jb end
+    end
+    if not body then
+        local parts = {}
+        for k, v in pairs(payload) do
+            local vv
+            if type(v) == "string" then
+                vv = string.format("%q", v)
+            elseif type(v) == "boolean" then
+                vv = v and "true" or "false"
+            elseif type(v) == "table" then
+                local arr = {}
+                for _, it in ipairs(v) do
+                    if type(it) == "table" then
+                        local ip = {}
+                        for ik, iv in pairs(it) do
+                            if type(iv) == "string" then
+                                ip[#ip + 1] = string.format("%q:%q", ik, iv)
+                            else
+                                ip[#ip + 1] = string.format("%q:%s", ik, tostring(iv))
+                            end
+                        end
+                        arr[#arr + 1] = "{" .. table.concat(ip, ",") .. "}"
+                    end
+                end
+                vv = "[" .. table.concat(arr, ",") .. "]"
+            else
+                vv = tostring(v)
+            end
+            parts[#parts + 1] = string.format("%q:%s", k, vv)
+        end
+        body = "{" .. table.concat(parts, ",") .. "}"
+    end
+
+    -- ФИКС: раньше здесь был СИНХРОННЫЙ requests.post (до 8 сек) прямо в потоке игры -
+    -- игра замирала, а Windows показывал вращающийся курсор "загрузка" при открытом
+    -- меню (статы приходят -> сразу уходит POST на сайт). Теперь запрос идёт в
+    -- отдельном effil-потоке, а тут только неблокирующее ожидание через wait().
+    local okE, effil = pcall(require, "effil")
+    if okE and type(effil) == "table" and effil.thread then
+        local okS, h = pcall(function()
+            return effil.thread(PCS_SITE.threadBody)(url, body, 8)
+        end)
+        if okS and h then
+            local t0 = os.clock()
+            while true do
+                local st = h:status()
+                if st == "completed" then
+                    local okG, r = pcall(function() return h:get() end)
+                    local code = tonumber(tostring(r):match("CODE (%d+)")) or 0
+                    return (code >= 200 and code < 300), code
+                elseif st == "failed" or st == "canceled" then
+                    return false, "thread " .. tostring(st)
+                end
+                if os.clock() - t0 > 15 then
+                    pcall(function() h:cancel() end)
+                    return false, "timeout"
+                end
+                wait(100)
+            end
+        end
+    end
+    print("[PC Stats][site] effil not available, POST skipped (no blocking) " .. tostring(path))
+    return false, "no_effil"
+end
+
+-- тело effil-потока: БЕЗ upvalue (только глобальные функции)
+function PCS_SITE.threadBody(url, body, timeout)
+    local okR, req = pcall(require, "requests")
+    if not okR or type(req) ~= "table" then okR, req = pcall(require, "lib.requests") end
+    if not okR or type(req) ~= "table" or not req.post then return "ERR no_requests" end
+    local ok, resp = pcall(req.post, url, {
+        data = body,
+        headers = { ["Content-Type"] = "application/json", ["User-Agent"] = "PCStats" },
+        timeout = timeout,
+    })
+    if not ok or type(resp) ~= "table" then return "ERR " .. tostring(resp):sub(1, 80) end
+    return "CODE " .. tostring(tonumber(resp.status_code or resp.status) or 0)
+end
+
+function PCS_SITE.postAsync(path, payload)
+    if not PCS_SITE.baseUrl() then return end
+    lua_thread.create(function()
+        local ok, err = pcall(function()
+            local ok2, info = PCS_SITE.post(path, payload)
+            if not ok2 then
+                print("[PC Stats][site] POST " .. path .. " fail: " .. tostring(info))
+            end
+        end)
+        if not ok then print("[PC Stats][site] " .. tostring(err)) end
+    end)
+end
+
+function PCS_SITE.sendPresence(force)
+    if not cfg or cfg.siteSyncPresence == false then return end
+    local now = os.time()
+    if not force and now - (PCS_SITE.lastPresence or 0) < PCS_SITE.presenceInterval then return end
+    local name = PCS_SITE.playerName()
+    if name == "" then return end
+    PCS_SITE.lastPresence = now
+    PCS_SITE.postAsync("/api/telemetry", {
+        name = name,
+        server = PCS_SITE.serverName(),
+        version = tostring(SCRIPT_VER or "?"),
+        os = "Windows",
+    })
+end
+
+function PCS_SITE.sendMoney(force)
+    if not cfg or cfg.siteSyncMoney == false then return end
+    local now = os.time()
+    if not force and now - (PCS_SITE.lastMoney or 0) < PCS_SITE.moneyInterval then return end
+    local s = St and St.statsData
+    if not s then return end
+    local name = PCS_SITE.playerName()
+    if name == "" then return end
+    local cash = PCS_SITE.parseMoney(s.cashSas or s.cash or "")
+    local bank = PCS_SITE.parseMoney(s.bank or "")
+    local dep  = PCS_SITE.parseMoney(s.moneyDay or s.deposit or "")
+    local azc  = PCS_SITE.parseMoney(s.azCoins or "")
+    local rateAz = tonumber(cfg.rateAZ) or 35000
+    local total = cash + bank + dep + math.floor(azc * rateAz)
+    PCS_SITE.lastMoney = now
+    PCS_SITE.postAsync("/api/leaderboard/update", {
+        name = name,
+        server = PCS_SITE.serverName(),
+        total = total,
+        cash = cash,
+        bank = bank,
+        deposit = dep,
+        azc = azc,
+    })
+end
+
+function PCS_SITE.sendRates(force)
+    if not cfg or cfg.siteSyncRates == false then return end
+    local now = os.time()
+    if not force and now - (PCS_SITE.lastRates or 0) < PCS_SITE.ratesInterval then return end
+    PCS_SITE.lastRates = now
+    local items = {
+        { code = "AZC",  name = "AZ-Coins", buy = tonumber(cfg.rateAZ) or 0, sell = tonumber(cfg.rateAZ) or 0, change_pct = 0 },
+        { code = "VC",   name = "VC$", buy = tonumber(cfg.rateVC) or 0, sell = tonumber(cfg.rateVCSell) or tonumber(cfg.rateVC) or 0, change_pct = 0 },
+        { code = "BTC",  name = "Bitcoin", buy = tonumber(cfg.rateBTC) or 0, sell = tonumber(cfg.rateBTC) or 0, change_pct = 0 },
+        { code = "AARP", name = "AARP", buy = tonumber(cfg.rateEUR) or 0, sell = tonumber(cfg.rateEUR) or 0, change_pct = 0 },
+        { code = "ASC",  name = "ASC", buy = tonumber(cfg.rateASC) or 0, sell = tonumber(cfg.rateASC) or 0, change_pct = 0 },
+    }
+    PCS_SITE.postAsync("/api/rates/set", {
+        server = PCS_SITE.serverName(),
+        source = "PC Stats / gra",
+        rates = items,
+        rateAZ = tonumber(cfg.rateAZ) or 0,
+        rateVC = tonumber(cfg.rateVC) or 0,
+        rateVCSell = tonumber(cfg.rateVCSell) or 0,
+        rateBTC = tonumber(cfg.rateBTC) or 0,
+        rateEUR = tonumber(cfg.rateEUR) or 0,
+        rateASC = tonumber(cfg.rateASC) or 0,
+    })
+end
+
+function PCS_SITE.onStatsReady()
+    pcall(PCS_SITE.sendPresence, true)
+    pcall(PCS_SITE.sendMoney, true)
+end
+
+function PCS_SITE.onRatesReady()
+    pcall(PCS_SITE.sendRates, true)
+end
+
+function PCS_SITE.startLoop()
+    lua_thread.create(function()
+        wait(15000)
+        while true do
+            pcall(PCS_SITE.sendPresence, false)
+            pcall(PCS_SITE.sendMoney, false)
+            pcall(function()
+                if cfg and (tonumber(cfg.rateVC) or 0) > 0 then
+                    PCS_SITE.sendRates(false)
+                end
+            end)
+            wait(60000)
+        end
+    end)
+end
+
+
 function onScriptTerminate(s, q)
     if s == thisScript() then
-        pcall(saveCfg)
+        pcall(PCS_saveCfgNow)
+        pcall(PCS_toastFlush, true)
         pcall(function()
             if PCS_GUARD and PCS_GUARD.tf then
                 pcall(PCS_GUARD.tf.close, PCS_GUARD.tf)
