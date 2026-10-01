@@ -3,11 +3,11 @@ script_description("Statistika personazha | Arizona PC | by Marco_Santiago (PC p
 script_author("Marco_Santiago")
 
 
-local SCRIPT_VER = "1.8.3"
+local SCRIPT_VER = "1.8.4"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
-local PCS_UPDATE_AUTO_SECONDS = 60  -- автопроверка/напоминание об обновлении раз в 1 минут
+local PCS_UPDATE_AUTO_SECONDS = 60  -- автопроверка/напоминание об обновлении раз в 5 минут
 
 -- имя чат-команды, зарегистрированной сейчас (для перерегистрации при смене)
 local _registeredMenuCmd = nil
@@ -586,8 +586,8 @@ pcs_ver.cfg = {
     check_throttle  = 60,    -- сек между тихими проверками
     auto_interval   = 300,   -- автопроверка раз в 5 мин (см. PCS_UPDATE_AUTO_SECONDS)
     notify_interval = 0,     -- каждая автопроверка напоминает, пока не обновились
-    autoCheck       = false, -- автопроверка отключена (тумблер убран), только вручную
-    useGithub       = false, -- true: если в папке игры файла нет, искать ещё и на GitHub (Настройки -> Обновления)
+    autoCheck       = true,  -- автопроверка включена (раз в 5 мин, см. PCS_UPDATE_AUTO_SECONDS)
+    useGithub       = true,  -- true: если в папке игры файла нет, искать и скачивать с GitHub
     channel_url     = "https://t.me/helper_stats",
     channel_short   = "t.me/helper_stats",
 }
@@ -992,7 +992,10 @@ function pcs_ver.getManifest()
     if loc then
         return { version = loc.version, localPath = loc.path, localName = loc.name, required = false }, nil
     end
-    -- GitHub-поиск обновлений отключён (по просьбе): только папка игры
+    -- папка игры пуста — берём manifest.json с GitHub (вызывается из lua_thread)
+    if pcs_ver.cfg.useGithub ~= false then
+        return pcs_ver.fetch_manifest()
+    end
     return nil, "local_none"
 end
 
@@ -4565,7 +4568,7 @@ local cfg = {
     -- igrok byl v proshlyy raz
     lastTab = 1,
     hiddenTabs            = {},    -- скрытые вкладки: [id вкладки] = true (см. Настройки -> Вкладки)
-    updateGithub          = false, -- искать обновления ещё и на GitHub (по умолчанию только папка игры)
+    updateGithub          = true,  -- искать обновления на GitHub (если в папке игры нового файла нет)
 
     -- ── Оплата налогов (вкладка "Налоги") ──
     taxAutoEnabled        = false, -- автооплата по таймеру вкл/выкл
@@ -4582,7 +4585,7 @@ local cfg = {
     smoothMenuAnim        = true,  -- плавное открытие/закрытие главного меню
     smoothTabAnim         = true,  -- плавный переход между вкладками
     animAllOff            = false, -- общий тумблер "отключить все анимации сразу"
-    autoCheckUpdates      = false, -- по просьбе: автопроверка обновлений отключена, тумблер убран
+    autoCheckUpdates      = true,  -- автопроверка обновлений включена
     -- ФИКС/добавлено (по просьбе): если true — сообщения о проверке
     -- версии / доступной новой версии / завершении обновления НЕ
     -- пишутся в обычный чат SA-MP, а показываются только всплывающим
@@ -4810,8 +4813,8 @@ local function applyCfgData(m)
     cfg.financeTwoCol   = toBool(m.financeTwoCol, true)
     cfg.chatStickers    = toBool(m.chatStickers, true)
     cfg.hiddenTabs      = PCS_hiddenTabsFromStr(m.hiddenTabs)
-    cfg.updateGithub    = false  -- GitHub-поиск обновлений отключён
-    pcall(function() if PCS_UPDATE and PCS_UPDATE.cfg then PCS_UPDATE.cfg.useGithub = false end end)
+    cfg.updateGithub    = true   -- GitHub-проверка и скачивание обновлений включены
+    pcall(function() if PCS_UPDATE and PCS_UPDATE.cfg then PCS_UPDATE.cfg.useGithub = true end end)
     -- ── тумблеры категорий "Всего вирты": по умолчанию ВСЕ включены ──
     cfg.incCash = toBool(m.incCash, true)
     cfg.incBank = toBool(m.incBank, true)
@@ -4867,7 +4870,7 @@ local function applyCfgData(m)
     -- в файле настроек). Ручная команда /pcsupdate по-прежнему работает,
     -- если она осталась в скрипте — это отдельное, осознанное действие
     -- игрока, а не автоматика ──
-    cfg.autoCheckUpdates      = false
+    cfg.autoCheckUpdates      = true
     cfg.companionBgEnabled    = toBool(m.companionBgEnabled, true)
     cfg.companionBgAlpha      = clampNum(m.companionBgAlpha, 0.05, 1.0, 0.35)
     cfg.companionTintR        = clampNum(m.companionTintR, 0.0, 1.0, 1.0)
