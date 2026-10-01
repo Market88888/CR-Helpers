@@ -3,7 +3,7 @@ script_description("Statistika personazha | Arizona PC | by Marco_Santiago (PC p
 script_author("Marco_Santiago")
 
 
-local SCRIPT_VER = "1.8.3"
+local SCRIPT_VER = "1.8.4"
 script_version(SCRIPT_VER)
 
 -- интервал автопроверки обновлений (минуты). 1 или 5 — на выбор
@@ -8150,7 +8150,24 @@ end
 -- фиксирует успешную оплату (своей учётки), обновляет время/сумму последней оплаты
 
 -- Полное закрытие телефона после налогов/курса (несколько Esc + снятие фокуса).
+-- ЗАЩИТА (после оплаты налогов): закрываем диалог ТОЛЬКО если он реально открыт.
+-- Закрытие несуществующего диалога через SAMPFUNCS — нативный вылет, который pcall не ловит.
+function PCS_safeCloseDialog()
+    local active = false
+    pcall(function()
+        if sampIsDialogActive and sampIsDialogActive() then active = true end
+    end)
+    if not active then return false end
+    if type(sampCloseCurrentDialog) ~= 'function' then return false end
+    return (pcall(sampCloseCurrentDialog, -1))
+end
+
 local function closePhoneFully(maxAttempts, delayMs)
+    -- ЗАЩИТА: не запускаем второй параллельный поток закрытия (двойной вызов
+    -- после оплаты раньше снимал замок телефона у уже идущей очистки)
+    if St._closePhoneRunning and os.clock() - (St._closePhoneAt or 0) < 8 then return end
+    St._closePhoneRunning = true
+    St._closePhoneAt = os.clock()
     maxAttempts = tonumber(maxAttempts) or 3
     delayMs = tonumber(delayMs) or (cfg and tonumber(cfg.phoneCloseDelayMs)) or 300
     if delayMs < 100 then delayMs = 100 end
@@ -8169,7 +8186,7 @@ local function closePhoneFully(maxAttempts, delayMs)
                 pcall(function()
                     if sampIsDialogActive and sampIsDialogActive() then active = true end
                 end)
-                pcall(sampCloseCurrentDialog, -1)
+                PCS_safeCloseDialog()
                 wait(delayMs)
                 if not active then
                     local still = false
@@ -8179,14 +8196,10 @@ local function closePhoneFully(maxAttempts, delayMs)
                     if not still then break end
                 end
             end
-            pcall(function()
-                if sampIsChatInputActive and sampIsChatInputActive() then
-                    pcall(sampSendChat, "")
-                end
-            end)
         end)
         if not ok then print("[PC Stats] closePhoneFully: " .. tostring(err)) end
         PCS_TR("tax: closePhoneFully end ok=" .. tostring(ok))
+        St._closePhoneRunning = false
         _phoneOpBusy = false
     end)
 end
@@ -8197,6 +8210,13 @@ local function onTaxPaymentSuccess(isAuto, amount)
     -- подтверждения, и таймаутом ожидания этого диалога)
     if _taxFinalizeDone then return end
     _taxFinalizeDone = true
+    -- ЗАЩИТА: amount может прийти строкой/nil/NaN — сравнение "string > number" это ошибка
+    amount = tonumber(amount) or 0
+    if amount ~= amount or amount < 0 or amount == math.huge then amount = 0 end
+    -- состояние сбрасываем сразу, чтобы любая ошибка ниже не оставила его залипшим
+    _taxState = 0
+    _taxExpectedDialogId = nil
+    _taxPhoneAlreadyOpen = false
     PCS_TR("tax: onTaxPaymentSuccess begin amount=" .. tostring(amount))
     -- сумма: то, что передали; если 0 — то, что успело прийти из чата
     -- ("Вы оплатили все налоги на сумму: ...") пока шла оплата
@@ -8211,7 +8231,7 @@ local function onTaxPaymentSuccess(isAuto, amount)
         -- могла показать, сколько денег в итоге ушло на оплату
         cfg.taxTotalPaid = (tonumber(cfg.taxTotalPaid) or 0) + amount
     end
-    saveCfg()
+    pcall(saveCfg)
     -- ── по просьбе: красивее оформленное сообщение об оплате в чат — рамка
     -- из символов + сумма отдельной строкой золотым цветом + способ оплаты ──
     pcall(sampAddChatMessage, "{00FF88}==============", -1)
@@ -8239,7 +8259,10 @@ local function onTaxPaymentSuccess(isAuto, amount)
     _taxState = 0
     _taxExpectedDialogId = nil
     _taxPhoneAlreadyOpen = false
-    TX.addEntry(isAuto, (amount and amount > 0) and amount or 0)
+    do
+        local okTx, errTx = pcall(TX.addEntry, isAuto, (amount and amount > 0) and amount or 0)
+        if not okTx then print("[PC Stats][tax] TX.addEntry error: " .. tostring(errTx)) end
+    end
     -- ФИКС "крашит игру, если сразу после оплаты налогов делать что-то с
     -- криптой": раньше _phoneOpBusy сбрасывался в false СРАЗУ здесь, а
     -- реальная очистка телефона (программный Esc/закрытие диалога) шла
@@ -8257,6 +8280,24 @@ local function onTaxPaymentSuccess(isAuto, amount)
     -- т.к. игра может ещё показывать экран-подтверждение оплаты) ──
     PCS_TR("tax: onTaxPaymentSuccess end")
     closePhoneFully(3, (cfg and cfg.phoneCloseDelayMs) or 300)
+end
+
+-- ЗАЩИТА: вызов onTaxPaymentSuccess ИЗ ХУКОВ (onServerMessage / onShowDialog) —
+-- не делаем синхронно (там же sampAddChatMessage, запись на диск, тосты, что внутри
+-- хука рискованно), а откладываем в отдельный поток с pcall.
+function PCS_taxSuccessDeferred(isAuto, amount)
+    lua_thread.create(function()
+        wait(80)
+        local ok, err = pcall(onTaxPaymentSuccess, isAuto, amount)
+        if not ok then
+            print("[PC Stats][tax] onTaxPaymentSuccess error: " .. tostring(err))
+            _taxState = 0
+            _taxExpectedDialogId = nil
+            _taxPhoneAlreadyOpen = false
+            _phoneOpBusy = false
+            St._closePhoneRunning = false
+        end
+    end)
 end
 
 -- запускает оплату: открывает телефон/приложение и переводит state-машину
@@ -18364,6 +18405,7 @@ function sampev.onShowDialog(id, style, title, btn1, btn2, text)
                             -- подтверждение ("Успешно"/OK), см. блок _taxState==3
                             -- ниже и комментарий у объявления _taxState выше
                             _taxState = 3
+                            St._taxState3At = os.clock()
                             _taxExpectedDialogId = nil
                             wait(_TAX_POST_PAY_WAIT_MS)
                             if _taxState == 3 then
@@ -18392,6 +18434,7 @@ function sampev.onShowDialog(id, style, title, btn1, btn2, text)
                         wait(TAX_STEP_DELAY)
                         pcall(sampSendDialogResponse, curDialog, 1, 0, "")
                         _taxState = 3
+                        St._taxState3At = os.clock()
                         _taxExpectedDialogId = nil
                         wait(_TAX_POST_PAY_WAIT_MS)
                         if _taxState == 3 then
@@ -18433,8 +18476,13 @@ function sampev.onShowDialog(id, style, title, btn1, btn2, text)
             -- сразу завершаем оплату (без ожидания таймаута) —
             -- _taxFinalizeDone гарантирует, что это не задвоится с
             -- параллельным таймаутом ожидания в потоке выше.
-            if _taxState == 3 then
-                pcall(sampSendDialogResponse, id, 1, 0, "")
+            if _taxState == 3 and os.clock() - (St._taxState3At or os.clock()) < 5 then
+                -- ответ на доп. диалог шлём из потока (не из самого хука)
+                local _confId = id
+                lua_thread.create(function()
+                    wait(60)
+                    pcall(sampSendDialogResponse, _confId, 1, 0, "")
+                end)
                 local wasAuto = _taxIsAuto
                 -- на случай, если сумму не удалось вытащить из первого диалога —
                 -- пробуем ещё раз из этого (доп. диалог-подтверждение иногда тоже
@@ -18442,13 +18490,7 @@ function sampev.onShowDialog(id, style, title, btn1, btn2, text)
                 if not (_taxPendingAmount and _taxPendingAmount > 0) then
                     _taxPendingAmount = extractTaxAmount(text)
                 end
-                local okSucc = pcall(onTaxPaymentSuccess, wasAuto, _taxPendingAmount)
-                if not okSucc then
-                    _taxState = 0
-                    _taxExpectedDialogId = nil
-                    _phoneOpBusy = false
-                    pcall(sampCloseCurrentDialog, -1)
-                end
+                PCS_taxSuccessDeferred(wasAuto, _taxPendingAmount)
                 handledTax = true
             end
         end)
@@ -18617,7 +18659,8 @@ function sampev.onServerMessage(color, text)
                 if amount > 0 then _taxPendingAmount = amount end
                 return
             end
-            local sinceLast = (cfg.taxLastPayTime ~= 0) and (os.time() - cfg.taxLastPayTime) or math.huge
+            local _lastT = tonumber(cfg.taxLastPayTime) or 0
+            local sinceLast = (_lastT ~= 0) and (os.time() - _lastT) or math.huge
             if _taxFinalizeDone and sinceLast <= 15 then
                 -- скрипт только что записал оплату (возможно, с нулевой
                 -- суммой) — дописываем сумму из чата в лог/статистику
@@ -18626,7 +18669,7 @@ function sampev.onServerMessage(color, text)
                     cfg.taxLastPayAmount = amount
                 end
                 cfg.taxLastPayTime = os.time()
-                saveCfg()
+                pcall(saveCfg)
                 return
             end
             -- игрок оплатил вручную ИЗ ИГРЫ (не через кнопку скрипта) —
@@ -18634,7 +18677,7 @@ function sampev.onServerMessage(color, text)
             -- остаётся true после предыдущей оплаты скриптом и раньше
             -- молча блокировал onTaxPaymentSuccess для ручных оплат
             _taxFinalizeDone = false
-            onTaxPaymentSuccess(false, amount)
+            PCS_taxSuccessDeferred(false, amount)
             return
         end
     end)
