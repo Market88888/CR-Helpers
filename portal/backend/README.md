@@ -2,7 +2,7 @@
 
 The Cloudflare Worker serves the static portal and a small D1-backed API. The online list is opt-in: the client must send `consent: true` on every heartbeat. Online rows expire after two minutes. `/api/optout` removes the user's active row and rate reports. Public APIs never return the internal hashed client ID.
 
-The client companion is `PCStatsSiteLink.lua`. It is off by default. A player must type `/pcstatsshare on`; `/pcstatsshare off` removes the entry. It sends only the current nickname and server address. Crash logs, chat messages, credentials, and visit history are not uploaded. The client ID is a random local value used only to refresh and delete the opted-in row; the backend stores only its SHA-256 digest.
+The client companion is `PCStatsSiteLink.lua`. It is off by default. A player must type `/pcstatsshare on`; `/pcstatsshare off` removes the entry. It sends the current nickname, server address, and five saved course values read from `settings.ini`. It does not read or upload crash logs, chat messages, credentials, balance, or visit history. The client ID is a random local value used only to refresh and delete the opted-in row; the backend stores only its SHA-256 digest.
 
 ## Deploy
 
@@ -35,5 +35,5 @@ The client companion is `PCStatsSiteLink.lua`. It is off by default. A player mu
 - `POST /api/optout` — deletes this client's online row and rate reports.
 - `GET /api/rates` — returns the median of recent reports by server, with the number of reporting clients.
 
-Rate reports are retained for up to 24 hours and are only accepted with an opted-in heartbeat. Online rows are removed by the minute cleanup job or when the player opts out. The current client sends presence only; rate fields are an API extension for a later client integration.
+Rate reports are retained for up to 24 hours and are only accepted with an opted-in heartbeat. Online rows are removed by the minute cleanup job or when the player opts out. The worker groups recent reports by server and returns the median, reducing the effect of one incorrect report.
 
