@@ -2,18 +2,13 @@ name = "pcstats-portal"
 main = "./worker.js"
 compatibility_date = "2026-11-19"
 
-[assets]
-directory = "../site"
-binding = "ASSETS"
-run_worker_first = ["/api/*"]
-
 [[d1_databases]]
 binding = "DB"
 database_name = "pcstats-presence"
-database_id = "REPLACE_WITH_ID_FROM_WRANGLER_D1_CREATE"
+database_id = "54262e9d-ee7a-4cdf-ad9b-9455cab7f180"
 
 [vars]
-SITE_ORIGIN = "*"
+SITE_ORIGIN = "https://pcstats-site.arizonam30.workers.dev"
 
 [triggers]
 crons = ["*/1 * * * *"]
