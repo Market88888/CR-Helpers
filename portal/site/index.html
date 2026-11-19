@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131d">
+  <meta name="description" content="PC Stats — онлайн-список по желанию игроков, курсы валют и обновления скрипта Arizona RP.">
+  <meta name="api-base" content="https://pcstats-portal.arizonam30.workers.dev">
+  <title>PC Stats — Arizona RP</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="ambient ambient-a"></div><div class="ambient ambient-b"></div>
+  <header class="topbar wrap">
+    <a class="brand" href="#home" aria-label="PC Stats">
+      <span class="brand-mark">PC</span><span>PC <b>STATS</b><small>ARIZONA ROLE PLAY</small></span>
+    </a>
+    <nav class="nav" aria-label="Навигация">
+      <button class="nav-link active" data-page="home">Обзор</button>
+      <button class="nav-link" data-page="players">Игроки</button>
+      <button class="nav-link" data-page="rates">Курсы</button>
+      <button class="nav-link" data-page="updates">Обновления</button>
+    </nav>
+    <a class="github-link" href="https://github.com/Market88888/CR-Helpers" target="_blank" rel="noopener">GitHub <span>↗</span></a>
+  </header>
+
+  <main id="home" class="wrap">
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow"><i></i> ПОМОЩНИК ДЛЯ ARIZONA RP</div>
+        <h1>Всё важное<br><span>под рукой.</span></h1>
+        <p>PC Stats помогает следить за персонажем, финансами, курсами и игровыми таймерами.</p>
+        <div class="hero-actions"><button class="button primary" data-go="updates">О скрипте <span>→</span></button><button class="button quiet" data-go="players">Кто сейчас в игре</button></div>
+        <p class="privacy-note"><span class="lock">⌑</span> Онлайн-список показывает только игроков, включивших публикацию в скрипте.</p>
+      </div>
+      <div class="hero-card">
+        <div class="hero-card-top"><span>СЕЙЧАС В ИГРЕ</span><span class="live-dot">● LIVE</span></div>
+        <div class="hero-number" id="hero-count">—</div>
+        <div class="hero-caption">участников выбрали показывать статус</div>
+        <div class="mini-bars"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <div class="hero-card-bottom"><span>Публичный статус</span><span id="updated-at">Загрузка…</span></div>
+      </div>
+    </section>
+
+    <section class="stat-row">
+      <article class="stat-card"><div class="stat-icon violet">◈</div><div><span class="stat-label">ОНЛАЙН ИГРОКИ</span><strong id="stat-online">—</strong><small>с добровольной публикацией</small></div></article>
+      <article class="stat-card"><div class="stat-icon cyan">⌖</div><div><span class="stat-label">СЕРВЕРОВ</span><strong id="stat-servers">—</strong><small>представлено сейчас</small></div></article>
+      <article class="stat-card"><div class="stat-icon amber">◷</div><div><span class="stat-label">ПОСЛЕДНЕЕ ОБНОВЛЕНИЕ</span><strong id="stat-version">—</strong><small>из GitHub репозитория</small></div></article>
+    </section>
+
+    <section class="section-head"><div><div class="eyebrow">АКТИВНОСТЬ</div><h2>Игроки онлайн</h2></div><button class="text-button" data-go="players">Все игроки <span>→</span></button></section>
+    <section class="panel player-panel">
+      <div class="panel-head"><div><h3>Сейчас на серверах</h3><p>Ник и сервер видны, только если игрок сам включил статус.</p></div><span class="pill"><i></i><span id="online-pill">Обновление…</span></span></div>
+      <div id="player-preview" class="player-grid"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></div>
+      <div id="player-error" class="empty hidden"></div>
+    </section>
+
+    <section class="section-head rates-head"><div><div class="eyebrow">РЫНОК</div><h2>Последние курсы</h2></div><button class="text-button" data-go="rates">Все курсы <span>→</span></button></section>
+    <section class="panel rates-panel"><div class="table-scroll"><table><thead><tr><th>СЕРВЕР</th><th>VC$</th><th>BTC</th><th>AZ-COIN</th><th>AARP</th><th>ОБНОВЛЕНО</th></tr></thead><tbody id="rates-preview"><tr><td colspan="6" class="muted">Загрузка курсов…</td></tr></tbody></table></div></section>
+
+    <section class="bottom-cta"><div><div class="eyebrow">PC STATS</div><h2>Следи за игрой<br>в одном месте.</h2><p>Загрузи последнюю версию скрипта из официального репозитория.</p></div><a class="button primary" href="https://github.com/Market88888/CR-Helpers" target="_blank" rel="noopener">Открыть GitHub <span>↗</span></a></section>
+    <footer><span>© <span id="year"></span> PC Stats · Неофициальный инструмент для Arizona RP</span><span>Статус игроков публикуется добровольно</span></footer>
+  </main>
+
+  <section id="players" class="wrap page hidden">
+    <div class="page-heading"><div class="eyebrow">ОНЛАЙН</div><h1>Игроки <span>сейчас</span></h1><p>В списке только участники, включившие показ статуса в настройках скрипта. Статус автоматически исчезает после выхода.</p></div>
+    <div class="toolbar"><div class="search-box"><span>⌕</span><input id="player-search" type="search" placeholder="Найти ник или сервер" autocomplete="off"></div><button id="refresh-players" class="button quiet">Обновить <span>↻</span></button></div>
+    <section class="panel"><div class="panel-head"><div><h3>Список серверов</h3><p id="players-summary">Получаем текущий список…</p></div><span class="pill"><i></i><span id="players-live">LIVE</span></span></div><div id="players-list" class="player-grid"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></div><div id="players-empty" class="empty hidden"></div></section>
+    <p class="privacy-note page-note"><span class="lock">⌑</span> Выключение статуса в скрипте удаляет игрока из списка. Список не содержит уникальных ключей или истории входов.</p>
+  </section>
+
+  <section id="rates" class="wrap page hidden">
+    <div class="page-heading"><div class="eyebrow">РЫНОК ARIZONA RP</div><h1>Курсы <span>валют</span></h1><p>Последние значения, опубликованные скриптами PC Stats по серверам.</p></div>
+    <div class="toolbar"><div class="search-box"><span>⌕</span><input id="rate-search" type="search" placeholder="Найти сервер" autocomplete="off"></div><button id="refresh-rates" class="button quiet">Обновить <span>↻</span></button></div>
+    <section class="panel rates-panel"><div class="table-scroll"><table><thead><tr><th>СЕРВЕР</th><th>VC$</th><th>BTC</th><th>AZ-COIN</th><th>AARP</th><th>ASC</th><th>ОБНОВЛЕНО</th></tr></thead><tbody id="rates-list"><tr><td colspan="7" class="muted">Загрузка курсов…</td></tr></tbody></table></div><div id="rates-empty" class="empty hidden"></div></section>
+    <p class="privacy-note page-note">Значения курсов относятся к игровому рынку и могут меняться. Сверяй цену перед сделкой.</p>
+  </section>
+
+  <section id="updates" class="wrap page hidden">
+    <div class="page-heading"><div class="eyebrow">ОФИЦИАЛЬНЫЙ РЕПОЗИТОРИЙ</div><h1>Обновления <span>PC Stats</span></h1><p>Версии и изменения публикуются в GitHub. Скачивай файлы только из официального репозитория.</p></div>
+    <section class="release-card panel"><div class="release-icon">↗</div><div><div class="eyebrow">ПОСЛЕДНЯЯ ВЕРСИЯ</div><h2 id="release-version">Проверяем GitHub…</h2><p id="release-description">Загружаем манифест версии.</p><a class="text-button" href="https://github.com/Market88888/CR-Helpers/releases" target="_blank" rel="noopener">Открыть версии <span>↗</span></a></div></section>
+    <section class="panel repo-panel"><h3>Исходный код и история</h3><p>Проверка версии показывает, что опубликовано в репозитории. Скрипт не блокируется при изменении пользователем; изменение файла не отправляет на сайт персональные данные.</p><a class="button primary" href="https://github.com/Market88888/CR-Helpers" target="_blank" rel="noopener">Перейти в репозиторий <span>↗</span></a></section>
+    <footer><span>© <span class="year"></span> PC Stats</span><span>Прозрачная публикация · без скрытой отправки логов</span></footer>
+  </section>
+  <script src="app.js" defer></script>
+</body>
+</html>
+
