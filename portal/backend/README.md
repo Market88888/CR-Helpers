@@ -1,32 +1,24 @@
 # PC Stats portal backend
 
-The Cloudflare Worker serves the static portal and a small D1-backed API. The online list is opt-in: the client must send `consent: true` on every heartbeat. Online rows expire after two minutes. `/api/optout` removes the user's active row and rate reports. Public APIs never return the internal hashed client ID.
+The `pcstats-portal` Cloudflare Worker provides the D1-backed API. Static files are deployed separately as `pcstats-site`. The online list is opt-in: the client must send `consent: true` on every heartbeat. Online rows expire after two minutes. `/api/optout` removes the user's active row and rate reports. Public APIs never return the internal hashed client ID.
 
 The client companion is `PCStatsSiteLink.lua`. It is off by default. A player must type `/pcstatsshare on`; `/pcstatsshare off` removes the entry. It sends the current nickname, server address, and five saved course values read from `settings.ini`. It does not read or upload crash logs, chat messages, credentials, balance, or visit history. The client ID is a random local value used only to refresh and delete the opted-in row; the backend stores only its SHA-256 digest.
 
 ## Deploy
 
-1. Install Node.js and Wrangler, then run `npx wrangler login`.
-2. From this directory, create the database:
+1. Create the D1 database `pcstats-presence` and run `schema.sql` from its Console.
+2. Bind it to Worker `pcstats-portal` as `DB`, set `SITE_ORIGIN` to `https://pcstats-site.arizonam30.workers.dev`, and add cron `*/1 * * * *`.
+3. Upload the contents of `site/` as static site Worker `pcstats-site`.
+4. Install `PCStatsSiteLink.lua` next to `PCStats.lua`. Sharing is off until `/pcstatsshare on`.
 
-   ```sh
-   npx wrangler d1 create pcstats-presence
-   ```
+For command-line deployments, install Node.js and Wrangler, then run `npx wrangler login`. The database ID is already in `wrangler.toml`:
 
-3. Put the returned database ID into `wrangler.toml` in place of `REPLACE_WITH_ID_FROM_WRANGLER_D1_CREATE`.
-4. Create the tables:
+```sh
+npx wrangler d1 execute pcstats-presence --remote --file=./schema.sql
+npx wrangler deploy
+```
 
-   ```sh
-   npx wrangler d1 execute pcstats-presence --remote --file=./schema.sql
-   ```
-
-5. Deploy the site and API:
-
-   ```sh
-   npx wrangler deploy
-   ```
-
-6. Replace `API_BASE` near the top of `PCStatsSiteLink.lua` with the resulting `https://pcstats-portal.<account-subdomain>.workers.dev` URL, then publish that client file with the PC Stats release.
+Deploy `site/` separately with Cloudflare Workers static assets or Pages.
 
 ## Endpoints
 
