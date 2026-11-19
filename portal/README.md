@@ -12,9 +12,9 @@ Responsive website for PC Stats with an opt-in online list, per-server rates, an
 
 ## Deploy
 
-The site and API run together as a Cloudflare Worker; it serves only the files in `site/`, with data in Cloudflare D1. Follow [backend deployment instructions](backend/README.md). Once deployed, replace the example Worker URL in `PCStatsSiteLink.lua` with the actual `workers.dev` address.
+The portal is deployed as a static-assets Worker at `https://pcstats-site.arizonam30.workers.dev`. Its API runs in `pcstats-portal` and stores opted-in presence and rate reports in Cloudflare D1 (`pcstats-presence`). The website calls the API through the `api-base` setting in `site/index.html`.
 
-The client helper is a separate MoonLoader file in this draft. Install it beside `PCStats.lua` after configuring the Worker URL. The website shows no names until a player opts in and the helper is installed.
+The client helper is a separate MoonLoader file. Install it beside `PCStats.lua`; sharing stays off until a player types `/pcstatsshare on`. The website shows no names until a player opts in and the helper is installed.
 
 ## What's connected
 
