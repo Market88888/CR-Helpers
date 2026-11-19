@@ -31,9 +31,8 @@ local function encode(value)
 end
 
 local function newClientId()
-    math.randomseed(os.time() + math.floor(os.clock() * 100000))
-    local out = {}
-    for i = 1, 32 do out[i] = string.format('%x', math.random(0, 15)) end
+    local out = { string.format('%08x%08x', os.time() % 4294967296, math.floor(os.clock() * 1000000) % 4294967296) }
+    for i = 1, 16 do out[#out + 1] = string.format('%x', math.random(0, 15)) end
     return table.concat(out)
 end
 
@@ -78,7 +77,8 @@ local function request(method, path, payload)
 end
 
 local function playerInfo()
-    if not sampIsAvailable or not sampIsAvailable() then return nil end
+    local okAvailable, available = pcall(function() return type(sampIsAvailable) == 'function' and sampIsAvailable() end)
+    if not okAvailable or not available then return nil end
     local okId, a, b = pcall(sampGetPlayerIdByCharHandle, PLAYER_PED)
     if not okId then return nil end
     local id = (type(a) == 'number' and a) or ((a == true and type(b) == 'number') and b) or nil
@@ -99,6 +99,28 @@ local function playerInfo()
     return nickname, server
 end
 
+local function readRates()
+    local f = io.open('moonloader/config/PCStats/settings.ini', 'rb')
+    if not f then return nil end
+    local body = f:read('*a') or ''
+    f:close()
+    local found = {}
+    for key, value in body:gmatch('([%w_]+)%s*=%s*([%d%.]+)') do
+        found[key] = tonumber(value)
+    end
+    local rates = {
+        vc = found.rateVC,
+        btc = found.rateBTC,
+        az = found.rateAZ,
+        aarp = found.rateEUR,
+        asc = found.rateASC,
+    }
+    for _, value in pairs(rates) do
+        if not value or value <= 0 or value > 1000000000000 then return nil end
+    end
+    return rates
+end
+
 local function heartbeat()
     if not state.enabled or busy then return end
     local nickname, server = playerInfo()
@@ -109,6 +131,7 @@ local function heartbeat()
         clientId = state.clientId,
         nickname = nickname,
         server = server,
+        rates = readRates(),
     })
     busy = false
     lastSend = os.clock()
@@ -123,7 +146,7 @@ local function setSharing(enabled)
         if state.clientId == '' or #state.clientId < 24 then state.clientId = newClientId() end
         state.enabled = true
         saveState()
-        say('Публикация включена: сайт получает ваш ник и сервер, пока вы в игре. Логи и история входов не отправляются. Отключить: /pcstatsshare off')
+        say('Публикация включена: сайт получает ваш ник, сервер и текущие курсы валют, пока вы в игре. Логи и история входов не отправляются. Отключить: /pcstatsshare off')
         heartbeat()
         return
     end
@@ -137,7 +160,7 @@ local function setSharing(enabled)
             if not ok then print('[PC Stats Site Link] opt-out cleanup failed: ' .. tostring(err)) end
         end)
     end
-    say('Публикация выключена; запись удаляется с сайта. Для повторного включения: /pcstatsshare on')
+    say('Публикация выключена; отправляю запрос на удаление записи. Для повторного включения: /pcstatsshare on')
 end
 
 function main()
