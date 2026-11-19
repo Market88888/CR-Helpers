@@ -2,7 +2,7 @@ script_name('PC Stats Site Link')
 script_author('PC Stats')
 script_version('1.0')
 
-local API_BASE = 'https://pcstats-portal.YOUR-SUBDOMAIN.workers.dev'
+local API_BASE = 'https://pcstats-portal.arizonam30.workers.dev'
 local STATE_FILE = 'moonloader/config/PCStats/site_share.json'
 local state = { enabled = false, clientId = '' }
 local http = nil
